@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=KomiraQuake
+Name[zh_CN]=KomiraQuake 地震预警
+GenericName=Earthquake Early Warning
+GenericName[zh_CN]=地震预警
+Comment=Earthquake early warning and monitoring client
+Comment[zh_CN]=地震预警与实时地震监测客户端
+Exec=komiraquake
+Icon=komiraquake
+Terminal=false
+Categories=Utility;Science;Geology;
+Keywords=earthquake;seismic;warning;地震;预警;
+StartupWMClass=KomiraQuake

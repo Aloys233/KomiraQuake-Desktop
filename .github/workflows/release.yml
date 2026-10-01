@@ -1,0 +1,195 @@
+name: Release
+
+# 推送 vX.Y.Z 形式的 tag 时触发：构建 Linux(deb + AppImage) 与 Windows(NSIS 安装包)，
+# 并把产物挂到对应的 GitHub Release 上。
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag '${GITHUB_REF_NAME}' 不是 vX.Y.Z 形式，中止" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "打包版本：$version"
+
+  linux:
+    name: Linux (deb + AppImage)
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: linux_gcc_64
+          modules: 'qtmultimedia qtspeech qtwebsockets'
+          cache: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xkb1 \
+            libxcb-xinerama0 \
+            libspeechd2
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DBUILD_TESTING=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Stage install tree (AppDir)
+        run: DESTDIR="$PWD/AppDir" cmake --install build
+
+      - name: Bundle Qt and build AppImage
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          # 工具放子目录，避免产物 AppImage 与工具本身混淆
+          mkdir -p tools dist
+          wget -q -O tools/linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q -O tools/linuxdeploy-plugin-qt \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x tools/linuxdeploy tools/linuxdeploy-plugin-qt
+          export PATH="$PWD/tools:$PATH"
+          export QMAKE="$(command -v qmake6 || command -v qmake)"
+          # 不给这个变量，linuxdeploy-plugin-qt 不会收集 QtQuick/QtQuick.Controls 等 QML 运行时模块
+          export QML_SOURCES_PATHS="$PWD/qml"
+          tools/linuxdeploy --appdir AppDir --plugin qt --output appimage
+          mv ./*.AppImage "dist/komiraquake_${VERSION}_amd64.AppImage"
+          ls -lh dist/
+
+      # deb 由 AppDir 打包：Qt 依赖已随 linuxdeploy 收进 /opt/komiraquake，
+      # 因此不依赖发行版 Qt 版本（项目要求 Qt >= 6.5，各 LTS 发行版都还没提供）。
+      - name: Build .deb
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          root="$PWD/pkgroot"
+          rm -rf "$root"
+          mkdir -p "$root/DEBIAN" \
+                   "$root/usr/bin" \
+                   "$root/usr/share/applications" \
+                   "$root/usr/share/icons/hicolor/scalable/apps" \
+                   "$root/opt/komiraquake"
+          cp -a AppDir/usr/. "$root/opt/komiraquake/"
+          install -m644 komiraquake.desktop "$root/usr/share/applications/komiraquake.desktop"
+          install -m644 assets/komiraquake.svg "$root/usr/share/icons/hicolor/scalable/apps/komiraquake.svg"
+          ln -sf /opt/komiraquake/bin/komiraquake "$root/usr/bin/komiraquake"
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: komiraquake
+          Version: ${VERSION}
+          Architecture: amd64
+          Maintainer: KomiraQuake <Aloys233@users.noreply.github.com>
+          Section: science
+          Priority: optional
+          Depends: libc6, libstdc++6, libfontconfig1, libfreetype6, libx11-6, libxcb1, libxcb-cursor0, libxkbcommon0, libgl1, libglib2.0-0 | libglib2.0-0t64
+          Installed-Size: $(du -sk "$root" | cut -f1)
+          Homepage: https://github.com/Aloys233/KomiraQuake-Desktop
+          Description: Earthquake early warning and monitoring client
+           KomiraQuake is a desktop client for earthquake early warning (EEW)
+           and real-time seismic monitoring, built with Qt 6 and QML.
+          EOF
+          mkdir -p dist
+          dpkg-deb --build --root-owner-group "$root" "dist/komiraquake_${VERSION}_amd64.deb"
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+          if-no-files-found: error
+
+  windows:
+    name: Windows (NSIS installer)
+    needs: version
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: win64_msvc2022_64
+          modules: 'qtmultimedia qtspeech qtwebsockets'
+          cache: true
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+          -DCPACK_PACKAGE_VERSION="${{ needs.version.outputs.version }}"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Build installer
+        working-directory: build
+        run: cpack -G NSIS
+
+      - name: Collect installer
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Move-Item build\*.exe dist\
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: dist/*.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: false

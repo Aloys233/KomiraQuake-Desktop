@@ -1,0 +1,35 @@
+# Build output
+build/
+cmake-build-*/
+dist/
+AppDir/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# Qt / IDE
+.qt/
+*.user
+*.user.*
+.vscode/
+.idea/
+
+# Packaging output
+*.AppImage
+*.deb
+*.rpm
+*.dmg
+*.msi
+*.exe
+
+# Nix
+result
+result-*
+
+# OS junk
+.DS_Store
+Thumbs.db
