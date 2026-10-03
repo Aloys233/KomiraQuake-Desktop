@@ -193,3 +193,6 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           draft: false
+          # 用 PAT 创建 Release，才能触发 notify-nix.yml 的 release: published
+          # （GITHUB_TOKEN 创建的事件不会触发新 workflow）。
+          token: ${{ secrets.DISPATCH_TOKEN }}

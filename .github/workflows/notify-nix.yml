@@ -1,9 +1,9 @@
 name: "Notify nix-packages on Release"
 
+# Release 发布后再通知 nix-packages 更新：tag 一推就发会早于安装包上传完成，
+# 等 Release published 更稳妥。注意：Release 必须用 PAT 创建，GITHUB_TOKEN
+# 创建的事件不会触发本 workflow（见 release.yml 的 token 设置）。
 on:
-  push:
-    tags:
-      - "v*.*.*"
   release:
     types: [ published ]
   workflow_dispatch:
@@ -22,10 +22,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "release" ]; then
-            echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
           else
-            echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+            echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
           fi
 
       - name: Trigger nix-packages update
