@@ -6,9 +6,12 @@ import QtQuick.Effects
 // the separate alpha mask supplies real rounded clipping (Item.clip is rectangular).
 Item {
     id: root
+    objectName: "backdropBlur"
     required property Item sourceItem
     property real cornerRadius: 16
-    property real padding: 24
+    readonly property int blurRadius: 64
+    // Keep the sample margin at least as wide as the full blur kernel.
+    readonly property real padding: blurRadius
     clip: true
 
     // mapToItem() itself has no QML dependency notifications. Read each chain's
@@ -74,8 +77,8 @@ Item {
         source: sample
         autoPaddingEnabled: false
         blurEnabled: true
-        blurMax: 16
-        blur: 0.85
+        blurMax: root.blurRadius
+        blur: 1.0
         maskEnabled: true
         maskSource: mask
         maskThresholdMin: 0.0

@@ -8,7 +8,9 @@ QtObject {
     readonly property bool backgroundBlur: app && app.settings ? app.settings.backgroundBlur : true
     readonly property int motionDuration: reduceMotion ? 0 : 150
     readonly property string fontFamily: "Noto Sans CJK SC"
-    readonly property string numberFamily: "monospace"
+    // 数字与正文同族：字体默认就是等宽数字（tabular figures），无需换成 monospace，
+    // 否则「M 5.6」这类数字会与旁边的说明文字不同字体、看起来不对齐。
+    readonly property string numberFamily: Qt.application.font.family
 
     readonly property color normalLight: "#006874"
     readonly property color normalDark: "#4DDAD7"
@@ -42,11 +44,11 @@ QtObject {
     readonly property color glassHeader: surfaceContainerLow
     readonly property color glassInput: dark ? "#10191B" : "#F1F5F6"
     readonly property color glassShadow: dark ? "#50000000" : "#160C252A"
-    readonly property color backdropTint: dark ? "#C4141D20" : "#C4F8FCFC"
+    readonly property color backdropTint: dark ? "#99141D20" : "#ADF8FCFC"
     readonly property color backdropFallback: surfaceContainerLow
     readonly property color accent: dark ? "#4DDAD7" : "#006874"
     readonly property color accentHover: dark ? "#7BE5E2" : "#005763"
-    readonly property color onAccent: dark ? "#073637" : "#FFFFFF"
+    readonly property color accentForeground: dark ? "#073637" : "#FFFFFF"
     readonly property color accentContainer: dark ? "#213F42" : "#DDEFF0"
     readonly property color accentBorder: dark ? "#3C797D" : "#98C6CA"
 

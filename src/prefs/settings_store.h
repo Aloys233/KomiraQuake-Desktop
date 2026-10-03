@@ -15,6 +15,7 @@ class SettingsStore : public QObject {
     Q_PROPERTY(int intensityStandard READ intensityStandard WRITE setIntensityStandard NOTIFY changed)
     Q_PROPERTY(double minWarningMagnitude READ minWarningMagnitude WRITE setMinWarningMagnitude NOTIFY changed)
     Q_PROPERTY(double minWarningIntensity READ minWarningIntensity WRITE setMinWarningIntensity NOTIFY changed)
+    Q_PROPERTY(double localIntensityFilter READ localIntensityFilter WRITE setLocalIntensityFilter NOTIFY changed)
     Q_PROPERTY(bool enableFullScreenWarning READ enableFullScreenWarning WRITE setEnableFullScreenWarning NOTIFY changed)
     Q_PROPERTY(bool enableSoundAlert READ enableSoundAlert WRITE setEnableSoundAlert NOTIFY changed)
     Q_PROPERTY(bool reduceMotion READ reduceMotion WRITE setReduceMotion NOTIFY changed)
@@ -50,6 +51,10 @@ public:
 
     double minWarningIntensity() const { return s_.value("minWarningIntensity", 2.0).toDouble(); }
     void setMinWarningIntensity(double v) { set("minWarningIntensity", v); }
+
+    /// 本地烈度过滤：仅当本地预估烈度达到该值时才提醒；0 表示不作筛选。
+    double localIntensityFilter() const { return s_.value("localIntensityFilter", 0.0).toDouble(); }
+    void setLocalIntensityFilter(double v) { set("localIntensityFilter", v); }
 
     bool enableFullScreenWarning() const { return s_.value("enableFullScreenWarning", true).toBool(); }
     void setEnableFullScreenWarning(bool v) { set("enableFullScreenWarning", v); }
@@ -90,7 +95,7 @@ public:
     bool enableNtpSync() const { return s_.value("enableNtpSync", true).toBool(); }
     void setEnableNtpSync(bool v) { set("enableNtpSync", v); }
 
-    bool darkMode() const { return s_.value("darkMode", true).toBool(); }
+    bool darkMode() const { return s_.value("darkMode", false).toBool(); }
     void setDarkMode(bool v) { set("darkMode", v); }
 
     Q_INVOKABLE void resetToDefaults();

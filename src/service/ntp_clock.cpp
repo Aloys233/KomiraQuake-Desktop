@@ -44,7 +44,6 @@ struct HttpSource {
 const std::vector<HttpSource>& httpSources() {
     static const std::vector<HttpSource> sources = {
         {"https://api.wolfx.jp/ntp.json", "api.wolfx.jp", "timestamp"},
-        {"https://api.fanstudio.tech/tool/ntp.php", "api.fanstudio.tech", "unixtime_ms"},
     };
     return sources;
 }

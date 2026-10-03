@@ -62,6 +62,9 @@ int main() {
               IntensityCalculator::rawCsis(3.0, 100.0, 10.0),
           "CSIS grows with magnitude");
     check(near(IntensityCalculator::rawCsis(0.0, 10.0, 10.0), 0.0), "CSIS zero for M0");
+    // CEA-CSIS 衰减关系（kanameishi calcCsis）固定值。
+    check(near(IntensityCalculator::rawCsis(6.0, 100.0, 10.0), 4.2749, 1e-3), "CSIS M6 @100km");
+    check(near(IntensityCalculator::rawCsis(7.0, 0.0, 10.0), 9.3048, 1e-3), "CSIS M7 at epicenter");
     check(IntensityCalculator::formatCsis(4.2) == "IV", "CSIS roman IV");
     check(IntensityCalculator::formatCsis(20.0) == "XII", "CSIS roman clamp XII");
     check(IntensityCalculator::formatJma(9.0, 1.0, 1.0) == "7", "JMA band 7");

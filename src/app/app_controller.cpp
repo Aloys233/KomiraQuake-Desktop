@@ -10,6 +10,7 @@
 
 #include "core/coordinate_transform.h"
 #include "core/intensity_calculator.h"
+#include "core/ip_geo_lookup.h"
 #include "core/quake_calculator.h"
 #include "core/travel_time_service.h"
 #include "prefs/settings_store.h"
@@ -30,7 +31,7 @@ namespace {
 /// 校时时钟固定显示时区：UTC+8。《NATIVE_PORT_SPEC》 §12。
 constexpr int kClockUtc8OffsetSeconds = 8 * 3600;
 
-QVariantMap toMap(const EarthquakeEvent& e) {
+QVariantMap toMap(const EarthquakeEvent& e, IntensityStandard standard = IntensityStandard::Csis) {
     QVariantMap m;
     m["id"] = QString::fromStdString(e.identity());
     m["magnitude"] = e.magnitude;
@@ -53,7 +54,7 @@ QVariantMap toMap(const EarthquakeEvent& e) {
     m["distance"] = hasDistance ? e.distanceKm : -1.0;
     m["distanceText"] = hasDistance ? QString::number(e.distanceKm, 'f', 0) : QStringLiteral("--");
     m["hasDistance"] = hasDistance;
-    // 烈度：有定位用本地预估，否则退回数据源报的最大烈度
+    // 烈度：有定位用本地预估，否则退回数据源报的最大烈度（HUD / 全屏预警 / 语音沿用本组字段）。
     const QString localText = QString::fromStdString(e.estimatedIntensity);
     const QString maxText = QString::fromStdString(e.maxIntensityText);
     const bool hasLocalIntensity =
@@ -70,6 +71,21 @@ QVariantMap toMap(const EarthquakeEvent& e) {
     m["maxIntensity"] = maxText;
     m["rawIntensity"] = e.rawIntensity;
     m["maxIntensityRaw"] = e.maxIntensityRaw;
+
+    // 列表徽章：固定展示「震源最大烈度」（震中当地量），不随定位变化；
+    // 源报缺失时在震中（距离 0）按衰减关系估算，保证列表总有可读烈度。
+    double listRaw = e.maxIntensityRaw;
+    QString listText = maxText;
+    if (!hasMaxIntensity) {
+        listRaw = IntensityCalculator::rawCsis(e.magnitude, 0.0, e.depth);
+        listText = standard == IntensityStandard::Jma
+                       ? QString::fromStdString(
+                             IntensityCalculator::formatJma(e.magnitude, 0.0, e.depth))
+                       : QString::fromStdString(IntensityCalculator::formatCsis(listRaw));
+    }
+    m["listIntensity"] = listText.isEmpty() ? QStringLiteral("--") : listText;
+    m["listIntensityLabel"] = QStringLiteral("最大烈度");
+    m["listIntensityColor"] = SeismicColors::intensityColor(listRaw).name();
     m["levelTag"] = QString::fromLatin1(warningTag(e.warningLevel));
     m["levelCode"] = warningCode(e.warningLevel);
     m["reportNum"] = e.reportNum;
@@ -98,8 +114,10 @@ AppController::AppController(QObject* parent, bool startServices)
         assetRoot = QDir(QCoreApplication::applicationDirPath()).absoluteFilePath("../share/komiraquake/assets");
 
     TravelTimeService::instance().loadFromFile(assetRoot + "/travel_times.json");
+    CityCoordTable::instance().loadFromFile(assetRoot + "/china_cities.json");
     qInfo() << "[app] asset root:" << assetRoot
-            << "| travel times:" << (TravelTimeService::instance().isLoaded() ? "loaded" : "MISSING");
+            << "| travel times:" << (TravelTimeService::instance().isLoaded() ? "loaded" : "MISSING")
+            << "| city coords:" << (CityCoordTable::instance().isLoaded() ? "loaded" : "MISSING");
 
     settings_ = new SettingsStore(this);
     darkMode_ = settings_->darkMode();
@@ -199,13 +217,16 @@ void AppController::wire() {
         rebuildHistory();
     }
 
+    // 恢复上次定位（手动或 IP）；有记录就不再自动 IP，避免覆盖用户基准地。
+    location_->restore();
+
     // 数据源与定位解耦：先连数据源，定位并行获取；校时并行后台进行。
     source_->setStandard(settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis);
     if (startServices_) {
         if (settings_->enabledWolfx()) source_->start();
         clock_->setEnabled(settings_->enableNtpSync());
         clock_->start();
-        location_->requestCurrentPosition();
+        if (!location_->hasLocation()) location_->requestCurrentPosition();
     }
 }
 
@@ -300,8 +321,10 @@ QVariantList AppController::eventList() const {
         return false;
     };
     QVariantList out;
-    auto push = [&out](const EarthquakeEvent& e, bool active) {
-        QVariantMap m = toMap(e);
+    const IntensityStandard standard =
+        settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis;
+    auto push = [&out, standard](const EarthquakeEvent& e, bool active) {
+        QVariantMap m = toMap(e, standard);
         m["isActive"] = active;
         out.push_back(m);
     };

@@ -1,10 +1,11 @@
 #include "service/location_service.h"
 
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QUrl>
+#include <optional>
+
+#include "core/ip_geo_lookup.h"
 
 namespace komira {
 
@@ -31,41 +32,51 @@ void LocationService::apply(double latitude, double longitude, const QString& na
     sourceName_ = source;
     hasLocation_ = true;
     statusText_ = name;
+    settings_.setValue(QStringLiteral("location/latitude"), latitude_);
+    settings_.setValue(QStringLiteral("location/longitude"), longitude_);
+    settings_.setValue(QStringLiteral("location/name"), locationName_);
+    settings_.setValue(QStringLiteral("location/source"), sourceName_);
+    settings_.sync();
+    emit changed();
+}
+
+void LocationService::restore() {
+    if (!settings_.contains(QStringLiteral("location/latitude")) ||
+        !settings_.contains(QStringLiteral("location/longitude")))
+        return;
+    latitude_ = settings_.value(QStringLiteral("location/latitude")).toDouble();
+    longitude_ = settings_.value(QStringLiteral("location/longitude")).toDouble();
+    locationName_ = settings_.value(QStringLiteral("location/name"), locationName_).toString();
+    sourceName_ = settings_.value(QStringLiteral("location/source"), sourceName_).toString();
+    statusText_ = locationName_;
+    hasLocation_ = true;
     emit changed();
 }
 
 void LocationService::requestIp() {
-    QNetworkRequest request{QUrl(QStringLiteral("https://api.fanstudio.tech/tool/geo_ip.php"))};
-    request.setHeader(QNetworkRequest::UserAgentHeader,
-                      QStringLiteral("komiraquake/2.0 (+https://api.fanstudio.tech/)"));
+    QNetworkRequest request{QUrl(QStringLiteral("https://api.aloys23.link/api/v1/network/location"))};
+    request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("komiraquake/2.0"));
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setTransferTimeout(5000);
     QNetworkReply* reply = net_.get(request);
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
         reply->deleteLater();
-        if (reply->error() != QNetworkReply::NoError) {
+        const QByteArray body = reply->readAll();
+        const auto region = reply->error() == QNetworkReply::NoError
+                                ? parseIpGeoResponse(body)
+                                : std::nullopt;
+        const auto coord = region ? CityCoordTable::instance().resolve(region->province, region->city)
+                                  : std::nullopt;
+        if (!coord) {
+            // 失败不覆盖既有定位，也不落盘。
             statusText_ = QStringLiteral("定位失败");
             emit changed();
             return;
         }
-        const QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
-        if (!doc.isObject()) {
-            statusText_ = QStringLiteral("定位失败");
-            emit changed();
-            return;
-        }
-        const QJsonObject obj = doc.object();
-        const double lat = obj.value("latitude").toDouble(qQNaN());
-        const double lon = obj.value("longitude").toDouble(qQNaN());
-        if (qIsNaN(lat) || qIsNaN(lon)) {
-            statusText_ = QStringLiteral("定位失败");
-            emit changed();
-            return;
-        }
-        const QString region = obj.value("province").toString() +
-                               obj.value("city").toString() +
-                               obj.value("district").toString();
-        const QString name = region.isEmpty() ? QStringLiteral("IP 定位 (城市级)")
-                                              : QStringLiteral("IP 定位 · %1").arg(region);
-        apply(lat, lon, name, QStringLiteral("ipFallback"));
+        QString label = region->province + region->city;
+        if (label.isEmpty()) label = QStringLiteral("城市级");
+        apply(coord->first, coord->second, QStringLiteral("IP 定位 · %1").arg(label),
+              QStringLiteral("ipFallback"));
     });
 }
 

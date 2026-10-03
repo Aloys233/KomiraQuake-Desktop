@@ -13,6 +13,7 @@
 #include <cmath>
 #include <functional>
 
+#include "core/ip_geo_lookup.h"
 #include "core/travel_time_service.h"
 #include "core/warning_session.h"
 #include "model/data_source_info.h"
@@ -255,6 +256,62 @@ private slots:
         QVERIFY(settings.enabledWolfx());
         QVERIFY(!settings.isMuted());
         QCOMPARE(settings.intensityStandard(), 0);
+    }
+
+    void themeDefaultsAndPersistence() {
+        QSettings().clear();
+        {
+            SettingsStore settings;
+            QVERIFY(!settings.darkMode());
+            settings.setDarkMode(true);
+        }
+        {
+            SettingsStore reloaded;
+            QVERIFY(reloaded.darkMode());
+            reloaded.setDarkMode(false);
+        }
+        SettingsStore settings;
+        QVERIFY(!settings.darkMode());
+        settings.setDarkMode(true);
+        settings.resetToDefaults();
+        QVERIFY(!settings.darkMode());
+        QVERIFY(!QSettings().contains("darkMode"));
+    }
+
+    void cityCoordTableResolvesWithFallbacks() {
+        const QByteArray asset = R"({
+            "provinces": {"四川": [30.65, 104.07], "北京": [39.9, 116.4]},
+            "cities": {"四川|广安": [30.45, 106.63]},
+            "cities_unique": {"广安": [30.45, 106.63]}
+        })";
+        QVERIFY(CityCoordTable::instance().loadFromString(asset));
+        QVERIFY(CityCoordTable::instance().isLoaded());
+        // 省市精确（两侧都归一化后缀）。
+        const auto exact = CityCoordTable::instance().resolve(QStringLiteral("四川省"), QStringLiteral("广安市"));
+        QVERIFY(exact.has_value());
+        QCOMPARE(exact->first, 30.45);
+        QCOMPARE(exact->second, 106.63);
+        // 市名命中但省份不同 → 唯一市名回退。
+        const auto byCity = CityCoordTable::instance().resolve(QStringLiteral("未知省"), QStringLiteral("广安市"));
+        QVERIFY(byCity.has_value());
+        QCOMPARE(byCity->first, 30.45);
+        // 市查不到 → 省级中心回退（直辖市走这条）。
+        const auto byProvince = CityCoordTable::instance().resolve(QStringLiteral("北京市"), QStringLiteral("北京市"));
+        QVERIFY(byProvince.has_value());
+        QCOMPARE(byProvince->first, 39.9);
+        // 完全无匹配。
+        QVERIFY(!CityCoordTable::instance().resolve(QStringLiteral("不存在省"), QStringLiteral("不存在市")).has_value());
+    }
+
+    void ipGeoResponseParsesProvinceAndCity() {
+        const auto cn = parseIpGeoResponse(QByteArrayLiteral(
+            R"({"ip":"1.2.3.4","location":{"country":"中国","province":"四川省","city":"广安市"}})"));
+        QVERIFY(cn.has_value());
+        QCOMPARE(cn->province, QStringLiteral("四川省"));
+        QCOMPARE(cn->city, QStringLiteral("广安市"));
+        // anycast / 非 CN：无 location 字段。
+        QVERIFY(!parseIpGeoResponse(QByteArrayLiteral(R"({"ip":"1.1.1.1","asn":{"number":13335}})")).has_value());
+        QVERIFY(!parseIpGeoResponse(QByteArrayLiteral("not json")).has_value());
     }
 
     void disabledSourceIgnoresQueuedMessage() {

@@ -21,6 +21,21 @@
 
 using namespace komira;
 
+// Repeater delegates and popup content belong to the visual tree, not necessarily
+// the window's QObject tree. Hit-test the same items the user can see.
+static QList<QQuickItem*> visualItems(QQuickItem* root) {
+    QList<QQuickItem*> items{root};
+    for (qsizetype index = 0; index < items.size(); ++index)
+        items.append(items[index]->childItems());
+    return items;
+}
+
+static QQuickItem* findVisualItem(QQuickWindow* window, const QString& name) {
+    for (auto* item : visualItems(window->contentItem()))
+        if (item->objectName() == name) return item;
+    return nullptr;
+}
+
 static QString evidenceDirectory(QQuickWindow* window) {
     const bool software = window->rendererInterface()->graphicsApi() == QSGRendererInterface::Software;
     const QString backend = software ? "software"
@@ -51,17 +66,20 @@ private slots:
         controller.nowProvider_ = [&] { return now; };
         controller.settings()->setEnableSoundAlert(false);
         controller.settings()->setEnableSpeech(false);
-        controller.settings()->setMinWarningMagnitude(4);
-        controller.settings()->setMinWarningIntensity(0);
+        controller.settings()->setLocalIntensityFilter(2.0);
         EarthquakeEvent e;
         e.id = e.eventId = "GUI-A";
         e.sourceProvider = "Test"; e.sourceAgency = "TEST";
         e.timestamp = now; e.latitude = 30.6; e.longitude = 104;
         e.magnitude = 3; e.location = "演练事件（仅测试）";
+        e.distanceKm = 100; e.rawIntensity = 1.0;
+        QVERIFY(!controller.announcer_->eligible(e)); // 烈度低于过滤阈值，被拦截
+        e.rawIntensity = 2.5;
+        QVERIFY(controller.announcer_->eligible(e)); // 烈度达到过滤阈值，通过
+        controller.settings()->setLocalIntensityFilter(0.0);
         e.distanceKm = -1;
-        QVERIFY(!controller.announcer_->eligible(e)); // Unknown is not local intensity zero.
-        controller.settings()->setMinWarningIntensity(2);
         controller.settings()->setMinListenMagnitude(4);
+        e.magnitude = 3;
         controller.handleEvent(e, false, false);
         QVERIFY(!controller.hasWarning());
         e.magnitude = 5.6;
@@ -103,7 +121,7 @@ private slots:
             return window->grabWindow().save(evidence + "/" + name + ".png");
         };
         auto clickText = [&](const QString& text) {
-            for (auto* item : window->findChildren<QQuickItem*>()) {
+            for (auto* item : visualItems(window->contentItem())) {
                 // 图标化按钮没有可见 text，回退到 accessibleName 匹配。
                 const bool matches = item->property("text").toString() == text
                                   || item->property("accessibleName").toString() == text;
@@ -225,11 +243,10 @@ private slots:
             QVERIFY(screenshot(dark ? "07-map-dark-blur-on" : "07-map-light-blur-on"));
             QVERIFY(clickText("设置"));
             QVERIFY(screenshot(dark ? "08-settings-dark" : "08-settings-light"));
-            auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
-            QVERIFY(scroll);
-            scroll->setProperty("contentY", 600);
+            QVERIFY(clickText("定位与基准地"));
+            QVERIFY(screenshot(dark ? "08-location-dark" : "08-location-light"));
+            QVERIFY(clickText("界面与地图"));
             QVERIFY(screenshot(dark ? "09-appearance-dark" : "09-appearance-light"));
-            scroll->setProperty("contentY", 0);
             QVERIFY(clickText("返回地图"));
         }
         window->resize(390, 720);
@@ -239,17 +256,184 @@ private slots:
         QVERIFY(screenshot("10-settings-narrow"));
         auto* settingsPage = window->findChild<QQuickItem*>("settingsPage");
         QVERIFY(settingsPage);
-        for (auto* item : settingsPage->findChildren<QQuickItem*>()) {
-            if (!item->isVisible() || item->width() == 0 || item->height() == 0) continue;
-            if (item->metaObject()->indexOfSignal("clicked()") < 0 && item->objectName() != "manualLatitude" && item->objectName() != "manualLongitude") continue;
-            const auto rect = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
-            QVERIFY2(rect.left() >= 0 && rect.right() <= window->width() + 1, qPrintable(item->property("text").toString()));
+        for (int section = 0; section < 5; ++section) {
+            settingsPage->setProperty("currentSection", section);
+            QTest::qWait(30);
+            for (auto* item : visualItems(settingsPage)) {
+                if (!item->isVisible() || item->width() == 0 || item->height() == 0) continue;
+                if (item->metaObject()->indexOfSignal("clicked()") < 0 && item->objectName() != "manualLatitude" && item->objectName() != "manualLongitude") continue;
+                const auto rect = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
+                QVERIFY2(rect.left() >= 0 && rect.right() <= window->width() + 1, qPrintable(item->property("text").toString()));
+            }
         }
-        auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
-        scroll->setProperty("contentY", 820);
+        settingsPage->setProperty("currentSection", 0);
         QVERIFY(screenshot("11-appearance-narrow"));
         // Every combo has exactly one indicator, and controls remain native/focusable.
         QVERIFY(!window->findChildren<QQuickItem*>("comboIndicator").isEmpty());
+    }
+
+    void settingsNavigationAndTheme() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("SettingsNavigationTest");
+        AppController controller(nullptr, false);
+        QVERIFY(!controller.darkMode());
+        QSignalSpy themeChanges(&controller, &AppController::darkModeChanged);
+        QQmlApplicationEngine engine;
+        QStringList qmlErrors;
+        connect(&engine, &QQmlEngine::warnings, this, [&](const QList<QQmlError>& warnings) {
+            for (const auto& warning : warnings) {
+                const auto message = warning.toString();
+                if (message.contains("SettingsPage.qml") || message.contains("TypeError")
+                    || message.contains("ReferenceError") || message.contains("Binding loop"))
+                    qmlErrors.append(message);
+            }
+        });
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showSettings", true);
+        auto* page = window->findChild<QQuickItem*>("settingsPage");
+        auto* sidebar = window->findChild<QQuickItem*>("settingsSidebar");
+        auto* background = window->findChild<QQuickItem*>("settingsBackground");
+        auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
+        auto* light = findVisualItem(window, "lightThemeButton");
+        auto* dark = findVisualItem(window, "darkThemeButton");
+        QVERIFY(page && sidebar && background && scroll && light && dark);
+        QTest::qWait(100);
+        QVERIFY(sidebar->isVisible());
+        QCOMPARE(page->property("currentSection").toInt(), 0);
+        QVERIFY(light->property("checked").toBool());
+        QVERIFY(!dark->property("checked").toBool());
+        const QColor lightBackground = background->property("color").value<QColor>();
+        QCOMPARE(lightBackground, QColor("#F4F7F7"));
+        QCOMPARE(window->color(), lightBackground);
+        auto* theme = page->property("theme").value<QObject*>();
+        auto* pickLocation = findVisualItem(window, "pickLocationButton");
+        QVERIFY(theme && pickLocation);
+        QCOMPARE(theme->property("accentForeground").value<QColor>(), QColor("#FFFFFF"));
+        QCOMPARE(pickLocation->property("foregroundColor").value<QColor>(), QColor("#FFFFFF"));
+        const QString evidence = evidenceDirectory(window);
+        auto capture = [&](const QString& name) {
+            QTest::qWait(80);
+            return window->grabWindow().save(evidence + "/" + name + ".png");
+        };
+        auto click = [&](const QString& name) {
+            QTest::qWait(30); // Let category changes polish their new layout before hit testing.
+            auto* item = findVisualItem(window, name);
+            if (!item || !item->isVisible() || !item->isEnabled()) return false;
+            const QPoint position = item->mapToScene(QPointF(item->width()/2, item->height()/2)).toPoint();
+            if (!QRect(QPoint(0, 0), window->size()).contains(position)) return false;
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, position);
+            return true;
+        };
+        QVERIFY(capture("settings-default-light"));
+        // Click the real QML controls: calling the C++ setter here would miss the original bug.
+        QVERIFY(click("darkThemeButton"));
+        QTRY_VERIFY(controller.darkMode());
+        QCOMPARE(themeChanges.count(), 1);
+        QVERIFY(controller.settings()->darkMode());
+        QVERIFY(dark->property("checked").toBool());
+        QVERIFY(!light->property("checked").toBool());
+        QCOMPARE(background->property("color").value<QColor>(), QColor("#101719"));
+        QCOMPARE(window->color(), background->property("color").value<QColor>());
+        QCOMPARE(theme->property("accentForeground").value<QColor>(), QColor("#073637"));
+        QCOMPARE(pickLocation->property("foregroundColor").value<QColor>(), QColor("#073637"));
+        SettingsStore persisted;
+        QVERIFY(persisted.darkMode());
+        {
+            AppController reloaded(nullptr, false);
+            QVERIFY(reloaded.darkMode());
+        }
+        QVERIFY(capture("settings-selected-dark"));
+        QVERIFY(click("darkThemeButton"));
+        QVERIFY(dark->property("checked").toBool());
+        QCOMPARE(themeChanges.count(), 1);
+        light->forceActiveFocus(Qt::TabFocusReason);
+        QTest::keyClick(window, Qt::Key_Space);
+        QTRY_VERIFY(!controller.darkMode());
+        QCOMPARE(themeChanges.count(), 2);
+        QVERIFY(!persisted.darkMode());
+        QCOMPARE(background->property("color").value<QColor>(), lightBackground);
+        QVERIFY(capture("settings-selected-light"));
+
+        const QStringList categories = {"appearance", "location", "warning", "audio", "source"};
+        for (int index = 0; index < categories.size(); ++index) {
+            QVERIFY(click("settingsNav-" + categories[index]));
+            QTRY_COMPARE(page->property("currentSection").toInt(), index);
+            QTRY_COMPARE(scroll->property("contentY").toReal(), 0.0);
+            for (int other = 0; other < categories.size(); ++other) {
+                auto* panel = window->findChild<QQuickItem*>("settingsPanel-" + categories[other]);
+                QVERIFY(panel);
+                QCOMPARE(panel->isVisible(), other == index);
+            }
+            scroll->setProperty("contentY", 100);
+        }
+        QVERIFY(click("settingsNav-location"));
+        QVERIFY(capture("settings-location"));
+        QVERIFY(click("pickLocationButton"));
+        QTRY_VERIFY(!window->property("showSettings").toBool());
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(map && map->property("pickingLocation").toBool());
+        map->setProperty("pickingLocation", false);
+        window->setProperty("showSettings", true);
+        QVERIFY(click("settingsNav-appearance"));
+        QVERIFY(click("darkThemeButton"));
+        QTRY_VERIFY(controller.darkMode());
+        controller.settings()->setReduceMotion(true);
+        QVERIFY(click("resetSettingsButton"));
+        auto* dialog = window->findChild<QObject*>("resetSettingsDialog");
+        QVERIFY(dialog);
+        QTRY_VERIFY(dialog->property("opened").toBool());
+        QVERIFY(capture("settings-reset-confirmation"));
+        QVERIFY(click("cancelResetButton"));
+        QTRY_VERIFY(!dialog->property("visible").toBool());
+        QVERIFY(controller.darkMode());
+        QVERIFY(controller.settings()->reduceMotion());
+        QVERIFY(click("resetSettingsButton"));
+        QTRY_VERIFY(dialog->property("opened").toBool());
+        QVERIFY(click("confirmResetButton"));
+        QTRY_VERIFY(!dialog->property("visible").toBool());
+        QVERIFY(!controller.darkMode());
+        QVERIFY(!controller.settings()->reduceMotion());
+        QVERIFY(light->property("checked").toBool());
+        QVERIFY(!dark->property("checked").toBool());
+        QCOMPARE(background->property("color").value<QColor>(), lightBackground);
+
+        window->resize(360, 520);
+        QTRY_VERIFY(!sidebar->isVisible());
+        auto* combo = window->findChild<QQuickItem*>("settingsCategoryCombo");
+        QVERIFY(combo && combo->isVisible());
+        combo->forceActiveFocus(Qt::TabFocusReason);
+        QTest::keyClick(window, Qt::Key_Down);
+        QTRY_COMPARE(page->property("currentSection").toInt(), 1);
+        QTest::keyClick(window, Qt::Key_Up);
+        QTRY_COMPARE(page->property("currentSection").toInt(), 0);
+        QTest::qWait(50);
+        QVERIFY(click("darkThemeButton"));
+        QTRY_VERIFY(controller.darkMode());
+        QVERIFY(capture("settings-narrow-dark"));
+        QVERIFY(click("lightThemeButton"));
+        QTRY_VERIFY(!controller.darkMode());
+        QVERIFY(capture("settings-narrow-light"));
+        const QPointF sidebarOrigin = sidebar->position();
+        scroll->setProperty("contentY", 180);
+        window->resize(1280, 800);
+        QTRY_VERIFY(sidebar->isVisible());
+        QCOMPARE(sidebar->position(), sidebarOrigin);
+        QVERIFY(click("settingsNav-audio"));
+        QTRY_COMPARE(scroll->property("contentY").toReal(), 0.0);
+        page->forceActiveFocus();
+        QTest::keyClick(window, Qt::Key_Escape);
+        QTRY_VERIFY(!window->property("showSettings").toBool());
+        QVERIFY2(qmlErrors.isEmpty(), qPrintable(qmlErrors.join('\n')));
     }
 
     void iconsAndPersistence() {
@@ -320,38 +504,96 @@ private slots:
             QCOMPARE(card->property("color").value<QColor>().alpha(), 255);
         } else {
             QVERIFY(sample);
+            auto* blur = window->findChild<QQuickItem*>("backdropBlur");
+            QVERIFY(blur);
+            const qreal padding = blur->property("padding").toReal();
+            QVERIFY(padding >= blur->property("blurRadius").toReal());
             auto rect = [&] { return sample->property("sourceRect").toRectF(); };
-            QCOMPARE(rect().topLeft(), QPointF(76, 66));
+            QCOMPARE(rect().topLeft(), QPointF(100 - padding, 90 - padding));
             card->setX(120);
-            QTRY_COMPARE(rect().x(), 116.0);
+            QTRY_COMPARE(rect().x(), 140 - padding);
             parent->setY(40);
-            QTRY_COMPARE(rect().y(), 86.0);
+            QTRY_COMPARE(rect().y(), 110 - padding);
             source->setX(10);
-            QTRY_COMPARE(rect().x(), 106.0);
+            QCOMPARE(source->x(), 10.0);
+            QTRY_COMPARE(rect().x(), 130 - padding);
             source->setTransformOrigin(QQuickItem::TopLeft);
             source->setScale(2);
-            QTRY_COMPARE(rect().width(), 164.0);
+            QTRY_COMPARE(rect().width(), (card->width() + 2 * padding) / 2);
             source->setScale(1); source->setX(0); parent->setY(20); card->setX(80);
-            QTest::qWait(150);
+            QTRY_COMPARE(rect().topLeft(), QPointF(100 - padding, 90 - padding));
             QVERIFY(!sample->property("recursive").toBool());
             QCOMPARE(sample->property("sourceItem").value<QQuickItem*>(), source);
         }
         const QString evidence = evidenceDirectory(window);
-        QTest::qWait(150);
-        const auto blurred = window->grabWindow();
-        QVERIFY(blurred.save(evidence + "/12-material-blur.png"));
-        controller.settings()->setBackgroundBlur(false);
-        QTest::qWait(150);
-        QVERIFY(!card->property("blurActive").toBool());
-        const auto opaque = window->grabWindow();
-        QVERIFY(opaque.save(evidence + "/13-material-opaque.png"));
-        if (!software) {
-            // At the panel corner the source is untouched; in the center the blur
-            // mixes alternating 4px stripes. Foreground text is never captured.
+        auto capture = [&] {
+            QTest::qWait(150);
+            const auto image = window->grabWindow();
+            // Keep sample coordinates in logical pixels on high-DPI displays.
+            return image.size() == window->size() ? image
+                : image.scaled(window->size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        };
+        auto colorDistance = [](const QColor& a, const QColor& b) {
+            return (std::abs(a.red() - b.red()) + std::abs(a.green() - b.green())
+                    + std::abs(a.blue() - b.blue())) / 3.0;
+        };
+        auto stripeEnergy = [&](const QImage& image) {
+            double sum = 0;
+            int count = 0;
+            for (int y = 120; y < 144; ++y) for (int x = 140; x < 204; ++x) {
+                sum += colorDistance(image.pixelColor(x, y), image.pixelColor(x + 1, y));
+                ++count;
+            }
+            return sum / count;
+        };
+        const auto* crisp = window->findChild<QQuickItem*>("crispText");
+        const auto* mark = window->findChild<QQuickItem*>("crispMark");
+        QVERIFY(crisp && crisp->parentItem() == card);
+        QVERIFY(mark && mark->parentItem() == card);
+        const QPoint markCenter = mark->mapToScene(QPointF(mark->width() / 2, mark->height() / 2)).toPoint();
+        for (bool dark : {false, true}) {
+            controller.setDarkMode(dark);
+            controller.settings()->setBackgroundBlur(true);
+            const QString theme = dark ? "dark" : "light";
+            const auto blurred = capture();
+            QVERIFY(!blurred.isNull());
+            QVERIFY(blurred.save(evidence + "/12-material-" + theme + "-blur.png"));
+            QCOMPARE(card->property("blurActive").toBool(), !software);
+            QCOMPARE(blurred.pixelColor(markCenter), mark->property("color").value<QColor>());
+            if (!software) {
+                auto* effect = window->findChild<QQuickItem*>("backdropEffect");
+                QVERIFY(effect);
+                const QColor tint = card->property("color").value<QColor>();
+                QVERIFY(tint.alphaF() > 0.0 && tint.alphaF() < 0.75);
+                // Same translucent tint, but no shader: transparency alone must not pass.
+                effect->setVisible(false);
+                const auto tintOnly = capture();
+                QVERIFY(!tintOnly.isNull());
+                QVERIFY(tintOnly.save(evidence + "/12-material-" + theme + "-tint-only.png"));
+                QCOMPARE(card->property("color").value<QColor>(), tint);
+                const double unfilteredEnergy = stripeEnergy(tintOnly);
+                const double blurredEnergy = stripeEnergy(blurred);
+                QVERIFY(unfilteredEnergy > 5.0);
+                QVERIFY2(blurredEnergy < unfilteredEnergy * 0.25,
+                         qPrintable(QStringLiteral("Backdrop stripes: blurred %1, tint-only %2")
+                                    .arg(blurredEnergy).arg(unfilteredEnergy)));
+                // The orange swatch must survive: an opaque or empty capture is not blur.
+                QVERIFY(colorDistance(blurred.pixelColor(180, 120), blurred.pixelColor(300, 120)) > 12.0);
+                QCOMPARE(blurred.pixelColor(102, 92), tintOnly.pixelColor(102, 92));
+                QCOMPARE(blurred.pixelColor(markCenter), tintOnly.pixelColor(markCenter));
+                effect->setVisible(true);
+            }
+            controller.settings()->setBackgroundBlur(false);
+            const auto opaque = capture();
+            QVERIFY(!opaque.isNull());
+            QVERIFY(opaque.save(evidence + "/13-material-" + theme + "-opaque.png"));
+            QVERIFY(!card->property("blurActive").toBool());
+            QCOMPARE(card->property("color").value<QColor>().alpha(), 255);
+            QVERIFY(!window->findChild<QQuickItem*>("backdropSample"));
+            QCOMPARE(opaque.pixelColor(markCenter), blurred.pixelColor(markCenter));
+            QCOMPARE(opaque.pixelColor(180, 120), opaque.pixelColor(300, 120));
             QCOMPARE(blurred.pixelColor(102, 92), opaque.pixelColor(102, 92));
-            QVERIFY(blurred.pixelColor(200, 120) != opaque.pixelColor(200, 120));
-            const auto* crisp = window->findChild<QQuickItem*>("crispText");
-            QVERIFY(crisp && crisp->parentItem() == card);
+            if (software) QCOMPARE(blurred, opaque);
         }
     }
 };

@@ -18,6 +18,7 @@ qt_add_executable(komiraquake
     src/core/quake_calculator.cpp
     src/core/intensity_calculator.cpp
     src/core/coordinate_transform.cpp
+    src/core/ip_geo_lookup.cpp
     src/core/travel_table.cpp
     src/core/travel_time_service.cpp
     src/core/event_gate.cpp
@@ -141,6 +142,7 @@ if(BUILD_TESTING)
     qt_add_executable(qt_business_test tests/qt_business_test.cpp
         src/core/coordinate_transform.cpp src/core/event_gate.cpp
         src/core/intensity_calculator.cpp src/core/quake_calculator.cpp
+        src/core/ip_geo_lookup.cpp src/service/location_service.cpp
         src/core/travel_table.cpp src/core/travel_time_service.cpp
         src/source/eew_parser.cpp src/source/wolfx_source.cpp
         src/store/history_store.cpp src/prefs/settings_store.cpp)

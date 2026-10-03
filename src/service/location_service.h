@@ -2,11 +2,14 @@
 
 #include <QNetworkAccessManager>
 #include <QObject>
+#include <QSettings>
 #include <QString>
 
 namespace komira {
 
 /// 桌面定位：无 GPS，走 IP 回退 + 手动输入。《NATIVE_PORT_SPEC》 §11。
+/// 定位结果持久化：手动与 IP 定位都落盘，启动时由 AppController 调 restore() 恢复，
+/// 有记录就不再自动 IP，避免覆盖用户基准地。
 class LocationService : public QObject {
     Q_OBJECT
     Q_PROPERTY(bool hasLocation READ hasLocation NOTIFY changed)
@@ -27,6 +30,8 @@ public:
 
     void requestCurrentPosition();
     void setManual(double latitude, double longitude, const QString& label = QString());
+    /// 启动时恢复上次定位（手动或 IP）；有记录则 emit changed()。
+    void restore();
 
 signals:
     void changed();
@@ -36,6 +41,7 @@ private:
     void apply(double latitude, double longitude, const QString& name, const QString& source);
 
     QNetworkAccessManager net_;
+    QSettings settings_;
     bool hasLocation_ = false;
     double latitude_ = 0.0;
     double longitude_ = 0.0;

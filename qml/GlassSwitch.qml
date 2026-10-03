@@ -23,7 +23,7 @@ Switch {
             width: 18; height: 18; radius: 9
             y: 4
             x: root.checked ? track.width - width - 4 : 4
-            color: root.checked ? root.theme.onAccent : root.theme.outline
+            color: root.checked ? root.theme.accentForeground : root.theme.outline
             Behavior on x { NumberAnimation { duration: root.theme.motionDuration; easing.type: Easing.OutCubic } }
         }
     }

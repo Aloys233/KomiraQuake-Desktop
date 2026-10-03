@@ -2,7 +2,8 @@ import QtQuick
 
 // 烈度徽章。《NATIVE_PORT_SPEC》 §12。外观对齐 kanameishi 的 .intensity 构成块：
 // 顶部标题 + 底部大数字；JMA 修饰值首位数字特大、修饰字（弱/强）较小；罗马数字按长度收缩。
-// 数字区域由锚点显式限定高度并贴底对齐，避免 CJK 字体行距把标题与数字挤在一起。
+// CJK 字体的行高（ascent/descent）远大于字面，直接堆叠文本框会留出巨大间隙。这里改按
+// FontMetrics 的墨迹边界排版：标题墨迹底与数字墨迹顶保持固定间隙，整块墨迹在徽章内垂直居中。
 Rectangle {
     id: root
     property color badgeColor: "#9F9F9F"
@@ -17,15 +18,39 @@ Rectangle {
 
     // JMA 细分震度（如 5弱 / 5强 / 5- / 5+）走首位放大的排版。
     readonly property bool modifierValue: /^[0-9]+[弱强+\-]$/.test(value)
-    readonly property real pad: badgeSize * 0.08
     readonly property real valueSize: {
-        if (modifierValue) return badgeSize * 0.60;
+        if (modifierValue) return badgeSize * 0.56;
         const n = value.length;
-        if (n <= 2) return badgeSize * 0.60;
-        if (n === 3) return badgeSize * 0.52;
+        if (n <= 2) return badgeSize * 0.55;
+        if (n === 3) return badgeSize * 0.50;
         return badgeSize * 0.46;
     }
+    readonly property real modifierSize: valueSize * 0.72
     readonly property real labelSize: Math.max(9, Math.min(14, badgeSize * 0.17))
+    // 标题墨迹底与数字墨迹顶之间的目标间隙。
+    readonly property real inkGap: badgeSize * 0.06
+
+    FontMetrics { id: labelFm; font: labelText.font }
+    FontMetrics { id: valueFm; font: valueText.font }
+    FontMetrics { id: modifierFm; font: modifierChar.font }
+
+    // 各段文字的墨迹（相对基线）。
+    readonly property rect labelInk: labelFm.tightBoundingRect(root.label)
+    readonly property rect valueInk: valueFm.tightBoundingRect(root.value)
+    readonly property rect firstInk: valueFm.tightBoundingRect(root.value.charAt(0))
+    readonly property rect modifierInk: modifierFm.tightBoundingRect(root.value.substring(1))
+    // 修饰行内两字顶对齐但基线不同，分别换算成相对行顶的墨迹位置。
+    readonly property real firstInkTop: firstChar.baselineOffset + firstInk.y
+    readonly property real firstInkBottom: firstChar.baselineOffset + firstInk.y + firstInk.height
+    readonly property real modifierInkTop: modifierChar.baselineOffset + modifierInk.y
+    readonly property real modifierInkBottom: modifierChar.baselineOffset + modifierInk.y + modifierInk.height
+    readonly property real valueInkHeight: modifierValue
+        ? Math.max(firstInkBottom, modifierInkBottom) - Math.min(firstInkTop, modifierInkTop)
+        : valueInk.height
+
+    readonly property real blockHeight: labelInk.height + inkGap + valueInkHeight
+    readonly property real labelInkTop: (badgeSize - blockHeight) / 2
+    readonly property real valueInkTop: labelInkTop + labelInk.height + inkGap
 
     width: badgeSize
     height: badgeSize
@@ -33,71 +58,50 @@ Rectangle {
     color: badgeColor
 
     Text {
-        id: titleText
+        id: labelText
         visible: root.showLabel
-        anchors.top: parent.top
-        anchors.topMargin: root.pad
         anchors.horizontalCenter: parent.horizontalCenter
+        y: root.labelInkTop - root.labelInk.y - baselineOffset
         text: root.label
         color: root.textColor
         font.pixelSize: root.labelSize
         font.weight: Font.Normal
-        lineHeight: root.labelSize
-        lineHeightMode: Text.FixedHeight
     }
 
-    // 数字区域：标题之下到底部，数字贴底居中。
-    Item {
-        id: valueArea
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: root.showLabel ? titleText.bottom : parent.top
-        anchors.bottom: parent.bottom
-        anchors.topMargin: root.pad * 0.3
-        anchors.bottomMargin: root.pad
+    // 单字符或罗马数字。
+    Text {
+        id: valueText
+        visible: !root.modifierValue
+        anchors.horizontalCenter: parent.horizontalCenter
+        y: root.valueInkTop - root.valueInk.y - baselineOffset
+        text: root.value
+        color: root.textColor
+        font.pixelSize: root.valueSize
+        font.weight: Font.DemiBold
+        font.letterSpacing: root.value.length >= 3 ? -root.valueSize * 0.08 : 0
+    }
 
-        // 单字符或罗马数字：整体贴底。
+    // JMA 修饰值：首位数字特大，修饰字较小并顶对齐。
+    Row {
+        id: modifierRow
+        visible: root.modifierValue
+        anchors.horizontalCenter: parent.horizontalCenter
+        y: root.valueInkTop - Math.min(root.firstInkTop, root.modifierInkTop)
+        spacing: 0
+
         Text {
-            visible: !root.modifierValue
-            anchors.bottom: parent.bottom
-            anchors.horizontalCenter: parent.horizontalCenter
-            height: parent.height
-            verticalAlignment: Text.AlignBottom
-            horizontalAlignment: Text.AlignHCenter
-            text: root.value
+            id: firstChar
+            text: root.value.charAt(0)
             color: root.textColor
             font.pixelSize: root.valueSize
             font.weight: Font.DemiBold
-            font.letterSpacing: root.value.length >= 3 ? -root.valueSize * 0.08 : 0
-            lineHeight: root.valueSize
-            lineHeightMode: Text.FixedHeight
         }
-
-        // JMA 修饰值：首位数字特大，修饰字较小并顶对齐。
-        Row {
-            anchors.bottom: parent.bottom
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: 0
-            visible: root.modifierValue
-
-            Text {
-                id: firstChar
-                text: root.value.charAt(0)
-                color: root.textColor
-                font.pixelSize: root.valueSize
-                font.weight: Font.DemiBold
-                lineHeight: root.valueSize
-                lineHeightMode: Text.FixedHeight
-            }
-            Text {
-                id: modifierChar
-                text: root.value.substring(1)
-                color: root.textColor
-                font.pixelSize: root.valueSize * 0.72
-                font.weight: Font.DemiBold
-                lineHeight: root.valueSize * 0.72
-                lineHeightMode: Text.FixedHeight
-            }
+        Text {
+            id: modifierChar
+            text: root.value.substring(1)
+            color: root.textColor
+            font.pixelSize: root.modifierSize
+            font.weight: Font.DemiBold
         }
     }
 }

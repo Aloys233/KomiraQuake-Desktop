@@ -10,7 +10,7 @@ AbstractButton {
     property string iconName: ""
     property string accessibleName: text
     property int customRadius: 10
-    readonly property color foregroundColor: !enabled ? theme.outline : primary ? theme.onAccent
+    readonly property color foregroundColor: !enabled ? theme.outline : primary ? theme.accentForeground
                                               : danger ? theme.severity("CRITICAL") : theme.textPrimary
     readonly property color backgroundColor: !enabled ? theme.surfaceContainer : primary ? (hovered || down ? theme.accentHover : theme.accent)
                                               : down ? theme.glassCardPressed : hovered ? theme.glassCardHover

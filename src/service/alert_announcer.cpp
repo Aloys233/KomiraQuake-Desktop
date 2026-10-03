@@ -23,9 +23,11 @@ AlertAnnouncer::EventState& AlertAnnouncer::stateFor(const EarthquakeEvent& even
 }
 
 bool AlertAnnouncer::eligible(const EarthquakeEvent& event) const {
-    return !event.isCanceled &&
-        ((event.magnitude >= settings_->minWarningMagnitude()) ||
-         (event.distanceKm >= 0 && event.rawIntensity >= settings_->minWarningIntensity()));
+    if (event.isCanceled) return false;
+    // 本地烈度过滤：仅当本地预估烈度达到阈值时才提醒；0 表示不作筛选，无定位时无法判定故放行。
+    const double filter = settings_->localIntensityFilter();
+    if (filter > 0.0 && event.distanceKm >= 0.0 && event.rawIntensity < filter) return false;
+    return true;
 }
 
 void AlertAnnouncer::stopOutput() {

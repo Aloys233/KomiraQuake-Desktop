@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "core/quake_calculator.h"
+
 namespace komira {
 
 namespace {
@@ -10,14 +12,28 @@ const char* const kRoman[] = {
     "0", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII",
 };
 constexpr int kRomanCount = 13;
+
+/// 中国大陆 CEA 烈度衰减关系（对齐参考实现 kanameishi 的 calcCeaCsis）。
+double ceaCsis(double magnitude, double distanceKm) {
+    return 1.297 * magnitude - 4.368 * std::log10(distanceKm + 15.0) + 5.363;
+}
 } // namespace
 
 double IntensityCalculator::rawCsis(double magnitude, double distanceKm, double depthKm) {
     if (magnitude <= 0.0) return 0.0;
-    const double r = std::sqrt(distanceKm * distanceKm + depthKm * depthKm);
-    const double safeR = std::max(1.0, r);
-    const double i = 0.92 + 1.63 * magnitude - 3.49 * std::log10(safeR + 7.0);
-    return std::max(0.0, i);
+    if (distanceKm > 10000.0) return 0.0;
+    // 震源到观测点的直线距离（含地球曲率与深度）。深度过浅按 10 km 计，避免近场烈度虚高。
+    const double radius = QuakeCalculator::kEarthRadiusKm;
+    const double depth = std::max(depthKm, 10.0);
+    const double theta = distanceKm / radius;
+    const double vertical = radius - depth;
+    const double lineDistance =
+        std::sqrt(vertical * vertical + radius * radius - 2.0 * vertical * radius * std::cos(theta));
+    // 破裂尺度：把有限断层等效为一个可忽略的近场距离，取其与震中距的较大衰减。
+    const double rupture = std::pow(10.0, (magnitude - 3.821) / 1.86);
+    const double hypoDistance = std::max({lineDistance - 10.0 - rupture, distanceKm - rupture,
+                                          0.2 * (lineDistance - 10.0), 0.0});
+    return std::max(0.0, (ceaCsis(magnitude, distanceKm) + ceaCsis(magnitude, hypoDistance)) / 2.0);
 }
 
 std::string IntensityCalculator::formatCsis(double raw) {
