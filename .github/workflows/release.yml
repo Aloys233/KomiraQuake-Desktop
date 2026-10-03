@@ -82,6 +82,11 @@ jobs:
           export QMAKE="$(command -v qmake6 || command -v qmake)"
           # 不给这个变量，linuxdeploy-plugin-qt 不会收集 QtQuick/QtQuick.Controls 等 QML 运行时模块
           export QML_SOURCES_PATHS="$PWD/qml"
+          # 本项目只用 QSQLITE，但 linuxdeploy-plugin-qt 会把所有 SQL 驱动一并收进来：
+          # libqsqlmimer.so 依赖不随 Qt 分发的私有库 libmimerapi.so，会导致依赖解析失败而打包中断。
+          # 只保留 sqlite 驱动，删除其余（mimer/mysql/odbc/psql）。
+          QT_SQLDRIVERS="$("$QMAKE" -query QT_INSTALL_PLUGINS)/sqldrivers"
+          find "$QT_SQLDRIVERS" -maxdepth 1 -type f -name 'libqsql*.so' ! -name 'libqsqlite.so' -delete
           tools/linuxdeploy --appdir AppDir --plugin qt --output appimage
           mv ./*.AppImage "dist/komiraquake_${VERSION}_amd64.AppImage"
           ls -lh dist/
