@@ -1,0 +1,37 @@
+name: "Notify nix-packages on Release"
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to trigger (e.g. v2.0.0)'
+        required: true
+        default: 'v2.0.0'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Trigger nix-packages update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.DISPATCH_TOKEN }}
+          repository: Aloys233/nix-packages
+          event-type: update-komiraquake
+          client-payload: '{"version": "${{ steps.tag.outputs.version }}"}'
