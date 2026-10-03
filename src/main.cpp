@@ -16,10 +16,14 @@
 
 namespace {
 
-/// 高德瓦片 CDN 会在 HTTP/2 连接中途回 GOAWAY，导致 QML Image 瓦片成片失败
-/// （日志：stream error "Received GOAWAY" / "Remote host signaled shutdown"）。
-/// HTTP/1.1 没有 GOAWAY 帧，且 Qt 每主机连接池天然限流，因此 QML 侧统一降到 1.1；
-/// 同时补上 User-Agent（部分瓦片 CDN 依据它放行）。
+/// 瓦片网络请求的调优：
+/// - 高德瓦片 CDN 会在 HTTP/2 连接中途回 GOAWAY，导致 QML Image 瓦片成片失败
+///   （日志：stream error "Received GOAWAY"）。HTTP/1.1 没有 GOAWAY 帧，且 Qt 每主机
+///   连接池天然限流，因此 QML 侧统一降到 1.1；同时补 User-Agent（部分 CDN 据此放行）。
+/// - 强制 Accept-Encoding: identity。Qt 对需要解压的响应（Content-Encoding: gzip/br）
+///   会跳过磁盘缓存：QNetworkDiskCache::prepare 已生成有效元数据，但 completeCacheSave
+///   从不 insert，于是瓦片永远不入缓存 —— 每次缩放换 z 即新 URL，全部重新下载并闪白。
+///   瓦片本身是已压缩位图，关闭传输压缩几乎无损，却让磁盘缓存恢复正常。
 class TileNetworkAccessManager : public QNetworkAccessManager {
 public:
     using QNetworkAccessManager::QNetworkAccessManager;
@@ -29,6 +33,7 @@ protected:
                                  QIODevice* outgoingData = nullptr) override {
         QNetworkRequest tuned = request;
         tuned.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+        tuned.setRawHeader(QByteArrayLiteral("Accept-Encoding"), QByteArrayLiteral("identity"));
         if (!tuned.hasRawHeader(QByteArrayLiteral("User-Agent"))) {
             tuned.setHeader(QNetworkRequest::UserAgentHeader,
                             QStringLiteral("komiraquake/2.0 (+https://api.wolfx.jp/)"));
@@ -37,26 +42,23 @@ protected:
     }
 };
 
+/// QML 栅格瓦片由 QQuickPixmap 经 **工厂新建的** QNetworkAccessManager 加载
+/// （QQmlTypeLoader::createNetworkAccessManager → factory->create()），而不是
+/// engine.networkAccessManager()。因此磁盘缓存必须在工厂里挂到每个新建的 NAM 上，
+/// 否则瓦片根本不入缓存：每次缩放换 z 即新 URL，全部重新下载并闪白。
+/// `setCache` 会接管 cache 的所有权，故每个 NAM 各配一个 QNetworkDiskCache。
 class TileNetworkAccessManagerFactory : public QQmlNetworkAccessManagerFactory {
 public:
     QNetworkAccessManager* create(QObject* parent) override {
-        return new TileNetworkAccessManager(parent);
+        auto* nam = new TileNetworkAccessManager(parent);
+        auto* cache = new QNetworkDiskCache(nam);
+        cache->setCacheDirectory(
+            QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/tiles"));
+        cache->setMaximumCacheSize(64LL * 1024 * 1024);
+        nam->setCache(cache);
+        return nam;
     }
 };
-
-/// 给 QML Image 用的网络管理器：强制 HTTP/1.1 + User-Agent，并挂上磁盘缓存
-/// （瓦片重复区域/重启后不再重新下载）。Image 走引擎的 QNetworkAccessManager。
-/// 注意：工厂必须在首次 networkAccessManager() 之前设置，引擎才会用它创建 NAM。
-void installNetworkAccessManager(QQmlApplicationEngine& engine) {
-    engine.setNetworkAccessManagerFactory(new TileNetworkAccessManagerFactory);
-    QNetworkAccessManager* nam = engine.networkAccessManager();
-    if (!nam) return;
-    auto* cache = new QNetworkDiskCache(&engine);
-    cache->setCacheDirectory(
-        QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/tiles"));
-    cache->setMaximumCacheSize(64LL * 1024 * 1024);
-    nam->setCache(cache);
-}
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -72,7 +74,7 @@ int main(int argc, char* argv[]) {
     QQmlApplicationEngine engine;
     komira::configureNativeUi(engine);
     engine.rootContext()->setContextProperty(QStringLiteral("app"), &controller);
-    installNetworkAccessManager(engine);
+    engine.setNetworkAccessManagerFactory(new TileNetworkAccessManagerFactory);
 
     QObject::connect(
         &engine, &QQmlApplicationEngine::objectCreationFailed, &app,

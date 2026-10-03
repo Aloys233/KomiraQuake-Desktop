@@ -90,7 +90,7 @@ Item {
                 Item { Layout.fillHeight: true }
                 Rectangle { Layout.fillWidth: true; Layout.margins: 12; height: 1; color: root.theme.glassBorder }
                 Text { Layout.leftMargin: 12; text: "KomiraQuake"; color: root.theme.textPrimary; font.pixelSize: 12; font.weight: Font.Medium }
-                Text { Layout.leftMargin: 12; Layout.bottomMargin: 8; text: "2.0 · 原生桌面版"; color: root.theme.outline; font.pixelSize: 11 }
+                Text { Layout.leftMargin: 12; Layout.bottomMargin: 8; text: "v1.0.1"; color: root.theme.outline; font.pixelSize: 11 }
             }
         }
         ColumnLayout {
@@ -183,9 +183,9 @@ Item {
                                 GlassComboBox {
                                     objectName: "basemapCombo"
                                     width: parent.width; theme: root.theme; Accessible.name: "底图"
-                                    model: ["高德标准 · GCJ-02", "高德卫星 · GCJ-02", "OpenStreetMap · WGS-84", "自定义底图"]
-                                    currentIndex: Math.max(0, ["amap_vector","amap_satellite","osm","custom"].indexOf(app.settings.basemapId))
-                                    onActivated: index => app.settings.basemapId = ["amap_vector","amap_satellite","osm","custom"][index]
+                                    model: ["高德标准 · GCJ-02", "高德卫星 · GCJ-02", "Petal · GCJ-02", "OpenStreetMap · WGS-84", "自定义底图"]
+                                    currentIndex: Math.max(0, ["amap_vector","amap_satellite","petal","osm","custom"].indexOf(app.settings.basemapId))
+                                    onActivated: index => app.settings.basemapId = ["amap_vector","amap_satellite","petal","osm","custom"][index]
                                 }
                             }
                             Column {

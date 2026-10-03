@@ -30,6 +30,7 @@ Item {
     property real hudInset: 0
     readonly property string basemap: app.settings.basemapId
     readonly property bool gcjDatum: basemap === "amap_vector" || basemap === "amap_satellite" ||
+                                     basemap === "petal" ||
                                      (basemap === "custom" && app.settings.customBasemapDatum === 1)
     property bool previousGcjDatum: gcjDatum
 
@@ -220,16 +221,19 @@ Item {
     property int tileModelZoom: -1
     /// 过渡期保留的旧层级别；-1 表示没有底衬。
     property int underlayZ: -1
+    /// 顶层瓦片状态表：key "tz:tx:ty" -> Image.status，用于判断新层是否已加载完成。
+    property var tileStatus: ({})
+    /// 底衬兜底上限：顶层若始终未就绪（持续失败/超时），也不无限保留底衬。
     Timer {
-        id: retireTimer
-        interval: 1400
+        id: underlayMaxTimer
+        interval: 8000
         onTriggered: root.retireUnderlay()
     }
     onTileZoomChanged: {
         // 旧顶层降级为底衬；更早的底衬在 syncTiles 里被丢弃，最多保留两层。
         root.underlayZ = root.tileModelZoom < 0 ? -1 : root.tileModelZoom;
         root.tileModelZoom = root.tileZoom;
-        retireTimer.restart();
+        if (root.underlayZ >= 0) underlayMaxTimer.restart();
         Qt.callLater(syncTiles);
     }
     // 用 Qt.callLater 合并：缩放一帧内 originX/scaledTile 等绑定会分多趟生效，
@@ -246,12 +250,36 @@ Item {
     }
 
     function retireUnderlay() {
+        underlayMaxTimer.stop();
         const u = root.underlayZ;
         if (u < 0) return;
         for (let i = tileModel.count - 1; i >= 0; --i) {
             if (tileModel.get(i).tz === u) tileModel.remove(i);
         }
         root.underlayZ = -1;
+    }
+
+    function noteTileStatus(tz, tx, ty, status) {
+        tileStatus[tz + ":" + tx + ":" + ty] = status;
+        refreshTopLayerState();
+    }
+    function forgetTileStatus(tz, tx, ty) {
+        delete tileStatus[tz + ":" + tx + ":" + ty];
+    }
+    /// 顶层瓦片全部结算（Ready/Error，无 Loading/Null）才撤掉底衬，
+    /// 避免冷瓦片（如 Petal 高层）加载慢时被固定计时器提前撤走而露白。
+    function refreshTopLayerState() {
+        if (underlayZ < 0) return;
+        const z = tileModelZoom;
+        let total = 0, loading = 0;
+        for (let i = 0; i < tileModel.count; ++i) {
+            const e = tileModel.get(i);
+            if (e.tz !== z) continue;
+            total++;
+            const st = tileStatus[e.tz + ":" + e.tx + ":" + e.ty];
+            if (st === undefined || st === Image.Null || st === Image.Loading) loading++;
+        }
+        if (total > 0 && loading === 0) retireUnderlay();
     }
 
     /// 让 ListModel 与当前可视瓦片范围保持一致。只增删差集，保留已有瓦片与过渡底衬。
@@ -285,6 +313,7 @@ Item {
             const parts = key.split(":");
             tileModel.append({ tx: parseInt(parts[1]), ty: parseInt(parts[2]), tz: z });
         }
+        refreshTopLayerState();
     }
 
     function shiftCoord(lat, lon) {
@@ -337,6 +366,7 @@ Item {
         let templateUrl = tileUrlTemplate;
         if (basemap === "osm") templateUrl = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
         else if (basemap === "amap_satellite") templateUrl = "https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}";
+        else if (basemap === "petal") templateUrl = "https://tilemap.aloys23.link/petal/{z}/{x}/{y}";
         else if (basemap === "custom") templateUrl = app.settings.customBasemapUrl;
         let url = templateUrl.replace("{x}", x).replace("{y}", y).replace("{z}", z);
         if (url.indexOf("{s}") >= 0) {
@@ -370,6 +400,7 @@ Item {
             y: ty * size - root.originY
             width: size + 1
             height: size + 1
+            Component.onDestruction: root.forgetTileStatus(tileCell.tz, tileCell.tx, tileCell.ty)
             Image {
                 anchors.fill: parent
                 source: root.tileUrl(root.wrapTile(tileCell.tx, tileCell.side), tileCell.ty, tileCell.tz)
@@ -378,6 +409,7 @@ Item {
                 asynchronous: true
                 cache: true
                 smooth: true
+                onStatusChanged: root.noteTileStatus(tileCell.tz, tileCell.tx, tileCell.ty, status)
             }
         }
     }
@@ -568,7 +600,7 @@ Item {
             GlassButton {
                 theme: root.theme; iconName: "layers"; accessibleName: "切换底图"; flat: true
                 onClicked: {
-                    const list = ["amap_vector", "amap_satellite", "osm"];
+                    const list = ["amap_vector", "amap_satellite", "petal", "osm"];
                     app.settings.basemapId = list[(list.indexOf(root.basemap) + 1) % list.length];
                 }
             }
