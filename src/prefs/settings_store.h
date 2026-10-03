@@ -30,6 +30,8 @@ class SettingsStore : public QObject {
     Q_PROPERTY(double speechRate READ speechRate WRITE setSpeechRate NOTIFY changed)
     Q_PROPERTY(bool enableNtpSync READ enableNtpSync WRITE setEnableNtpSync NOTIFY changed)
     Q_PROPERTY(bool darkMode READ darkMode WRITE setDarkMode NOTIFY changed)
+    Q_PROPERTY(bool silentStart READ silentStart WRITE setSilentStart NOTIFY changed)
+    Q_PROPERTY(bool autoCheckUpdates READ autoCheckUpdates WRITE setAutoCheckUpdates NOTIFY changed)
 
 public:
     explicit SettingsStore(QObject* parent = nullptr);
@@ -97,6 +99,14 @@ public:
 
     bool darkMode() const { return s_.value("darkMode", false).toBool(); }
     void setDarkMode(bool v) { set("darkMode", v); }
+
+    /// 静默启动：启动时不显示主窗口，仅保留托盘（等同「关闭窗口」）。
+    bool silentStart() const { return s_.value("silentStart", false).toBool(); }
+    void setSilentStart(bool v) { set("silentStart", v); }
+
+    /// 启动时后台自动检查一次新版本。
+    bool autoCheckUpdates() const { return s_.value("autoCheckUpdates", true).toBool(); }
+    void setAutoCheckUpdates(bool v) { set("autoCheckUpdates", v); }
 
     Q_INVOKABLE void resetToDefaults();
 

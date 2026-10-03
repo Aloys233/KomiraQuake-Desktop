@@ -15,6 +15,7 @@
 
 #include "core/ip_geo_lookup.h"
 #include "core/travel_time_service.h"
+#include "core/version_compare.h"
 #include "core/warning_session.h"
 #include "model/data_source_info.h"
 #include "prefs/settings_store.h"
@@ -276,6 +277,18 @@ private slots:
         settings.resetToDefaults();
         QVERIFY(!settings.darkMode());
         QVERIFY(!QSettings().contains("darkMode"));
+    }
+
+    void versionCompare() {
+        // 点分数值比较；忽略 v 前缀与预发布后缀。
+        QVERIFY(isNewerVersion("1.0.0", "1.0.1"));
+        QVERIFY(isNewerVersion("1.0.0", "v1.1.0"));
+        QVERIFY(isNewerVersion("1.0.1", "1.1.0-rc2"));
+        QVERIFY(isNewerVersion("1.0", "1.0.1"));
+        QVERIFY(isNewerVersion("1.0.0", "2.0"));
+        QVERIFY(!isNewerVersion("1.0.1", "1.0.1"));
+        QVERIFY(!isNewerVersion("1.2.0", "1.1.9"));
+        QVERIFY(!isNewerVersion("1.0.1", "1.0.1-rc1")); // 同版本预发布不算更新
     }
 
     void cityCoordTableResolvesWithFallbacks() {

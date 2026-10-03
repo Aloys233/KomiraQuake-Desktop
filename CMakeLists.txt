@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(KomiraQuake VERSION 1.0.1 LANGUAGES CXX)
+project(KomiraQuake VERSION 1.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,12 +39,17 @@ qt_add_executable(komiraquake
     src/service/speech_service.cpp
     src/service/alert_announcer.cpp
     src/service/tray_controller.cpp
+    src/service/autostart.cpp
+    src/service/update_service.cpp
 
     # app
     src/app/app_controller.cpp
 )
 
 target_include_directories(komiraquake PRIVATE src)
+
+# 供 C++ 与 QML 展示的版本号，唯一来源是 project() 的 VERSION。
+target_compile_definitions(komiraquake PRIVATE KOMIRA_VERSION="${PROJECT_VERSION}")
 
 target_link_libraries(komiraquake PRIVATE
     Qt6::Core
@@ -153,7 +158,8 @@ if(BUILD_TESTING)
     list(FILTER GUI_TEST_SOURCES EXCLUDE REGEX "/main.cpp$")
     qt_add_executable(gui_test tests/gui_test.cpp ${GUI_TEST_SOURCES})
     target_include_directories(gui_test PRIVATE src)
-    target_compile_definitions(gui_test PRIVATE KOMIRA_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_definitions(gui_test PRIVATE KOMIRA_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        KOMIRA_VERSION="${PROJECT_VERSION}")
     target_link_libraries(gui_test PRIVATE Qt6::Test Qt6::Core Qt6::Gui Qt6::Widgets
         Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::WebSockets Qt6::Sql
         Qt6::Multimedia Qt6::TextToSpeech Qt6::Svg)

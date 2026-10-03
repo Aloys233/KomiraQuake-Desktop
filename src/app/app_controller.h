@@ -13,6 +13,8 @@
 #include "core/event_gate.h"
 #include "model/earthquake_event.h"
 #include "prefs/settings_store.h"
+#include "service/autostart.h"
+#include "service/update_service.h"
 
 namespace komira {
 class LocationService;
@@ -27,6 +29,12 @@ class NtpClock;
 class AppController : public QObject {
     Q_OBJECT
     Q_PROPERTY(komira::SettingsStore* settings READ settings CONSTANT)
+    /// 开机自启开关（读写操作系统状态）。
+    Q_PROPERTY(komira::AutoStartService* autoStart READ autoStart CONSTANT)
+    /// 版本与更新检查。
+    Q_PROPERTY(komira::UpdateService* updater READ updater CONSTANT)
+    /// 本次启动是否应隐藏主窗口（静默启动）。常量：只取启动时读到的设置。
+    Q_PROPERTY(bool startHidden READ startHidden CONSTANT)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusChanged)
     Q_PROPERTY(QString statusLevelTag READ statusLevelTag NOTIFY statusChanged)
     Q_PROPERTY(bool hasLocation READ hasLocation NOTIFY locationChanged)
@@ -62,6 +70,9 @@ public:
     ~AppController() override;
 
     SettingsStore* settings() const { return settings_; }
+    AutoStartService* autoStart() const { return autoStart_; }
+    UpdateService* updater() const { return updater_; }
+    bool startHidden() const;
 
     QString statusText() const;
     QString statusLevelTag() const;
@@ -152,6 +163,8 @@ private:
     /// 焦点事件"还年轻"（发震时刻在窗口内）时跑 100ms 波前定时器，否则停。
     void updateWaveTimer();
     void updateWaveRadii();
+    /// 开启自动检查时，本次会话安排一次静默检查更新（只做一次）。
+    void maybeAutoCheckUpdates();
     /// 同一地震的跨链路/跨报次标识（用于合并 WS 预警与 HTTP 目录）。
     static QString identityOf(const EarthquakeEvent& event);
     /// 两条报次是否描述同一次地震（发震时刻接近且震中邻近）。
@@ -169,6 +182,10 @@ private:
     AlertAnnouncer* announcer_ = nullptr;
     /// 网络授时：所有地震时间语义的唯一时间基准。《NATIVE_PORT_SPEC》 §13。
     NtpClock* clock_ = nullptr;
+    AutoStartService* autoStart_ = nullptr;
+    UpdateService* updater_ = nullptr;
+    /// 自动检查更新每次会话只跑一次。
+    bool autoUpdateChecked_ = false;
 
     EventGate gate_;
     QHash<QString, QString> identityToId_;

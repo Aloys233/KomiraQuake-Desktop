@@ -16,9 +16,11 @@
 #include "prefs/settings_store.h"
 #include "service/alert_announcer.h"
 #include "service/alert_sound_service.h"
+#include "service/autostart.h"
 #include "service/location_service.h"
 #include "service/ntp_clock.h"
 #include "service/speech_service.h"
+#include "service/update_service.h"
 #include "source/eew_parser.h"
 #include "source/wolfx_source.h"
 #include "store/history_store.h"
@@ -135,6 +137,8 @@ AppController::AppController(QObject* parent, bool startServices)
 
     source_ = new WolfxSource(this);
     clock_ = new NtpClock(this);
+    autoStart_ = new AutoStartService(this);
+    updater_ = new UpdateService(this);
 
     historyStore_ = new HistoryStore();
     const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
@@ -200,6 +204,7 @@ void AppController::wire() {
         announcer_->onMuteChanged();
         recomputeEvents();
         emit statusChanged();
+        maybeAutoCheckUpdates();
     });
 
     // 启动时应用一次设置
@@ -228,6 +233,18 @@ void AppController::wire() {
         clock_->start();
         if (!location_->hasLocation()) location_->requestCurrentPosition();
     }
+    maybeAutoCheckUpdates();
+}
+
+bool AppController::startHidden() const {
+    return settings_ && settings_->silentStart();
+}
+
+void AppController::maybeAutoCheckUpdates() {
+    if (!startServices_ || autoUpdateChecked_ || !settings_->autoCheckUpdates()) return;
+    autoUpdateChecked_ = true;
+    // 延后到界面与数据源就绪后再联网，避免与启动风暴抢带宽。
+    QTimer::singleShot(4000, this, [this]() { updater_->check(true); });
 }
 
 QString AppController::statusText() const {

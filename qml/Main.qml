@@ -4,7 +4,8 @@ import QtQuick.Layouts
 
 ApplicationWindow {
     id: window
-    visible: true
+    // 静默启动：设置开启时本次启动直接进入托盘，不显示主窗口（等同「关闭窗口」）。
+    visible: !app.startHidden
     width: 1280; height: 800
     minimumWidth: 360; minimumHeight: 520
     title: "KomiraQuake - 地震预警"
@@ -48,7 +49,19 @@ ApplicationWindow {
             initialLocationApplied = true;
         }
     }
-    Component.onCompleted: applyDefaultView()
+    // 默认位置交给窗口管理器时，Windows / 部分 X11 环境会按左上角或层叠摆放。
+    // 首次显示前显式把窗口对齐到所在屏幕中心（Wayland 下由合成器决定，此设置会被忽略）。
+    // 注意：这里只改位置、不改尺寸 —— 在 Component.onCompleted 里 resize 会让场景图
+    // 在子树尚未稳定时重排（离屏/软件后端会崩），屏幕小于默认尺寸时窗口溢出即可。
+    function centerOnScreen() {
+        const screenW = Screen.width
+        const screenH = Screen.height
+        if (screenW <= 0 || screenH <= 0) return
+        // 屏幕比窗口小时不要居中成负坐标（会顶掉标题栏），贴住屏幕左上即可。
+        window.x = Math.round(Math.max(Screen.virtualX, Screen.virtualX + (screenW - window.width) / 2))
+        window.y = Math.round(Math.max(Screen.virtualY, Screen.virtualY + (screenH - window.height) / 2))
+    }
+    Component.onCompleted: { centerOnScreen(); applyDefaultView() }
     Connections {
         target: app
         function onLocationChanged() { window.applyDefaultView(); }

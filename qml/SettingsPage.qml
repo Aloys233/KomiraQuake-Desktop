@@ -13,7 +13,8 @@ Item {
         { key: "location", title: "定位与基准地", icon: "map-pin", description: "设置用于估算本地烈度、距离与预计到时的位置。" },
         { key: "warning", title: "预警策略", icon: "shield", description: "决定何时提醒，以及如何显示本地预警。" },
         { key: "audio", title: "音效与语音", icon: "volume-2", description: "管理警报声音、音量与语音播报。" },
-        { key: "source", title: "数据源与授时", icon: "radio", description: "查看实时预警连接与网络校时状态。" }
+        { key: "source", title: "数据源与授时", icon: "radio", description: "查看实时预警连接与网络校时状态。" },
+        { key: "about", title: "自启与更新", icon: "refresh-cw", description: "管理开机自启与静默启动，检查新版本。" }
     ]
     signal back()
     signal pickLocationRequested()
@@ -90,7 +91,7 @@ Item {
                 Item { Layout.fillHeight: true }
                 Rectangle { Layout.fillWidth: true; Layout.margins: 12; height: 1; color: root.theme.glassBorder }
                 Text { Layout.leftMargin: 12; text: "KomiraQuake"; color: root.theme.textPrimary; font.pixelSize: 12; font.weight: Font.Medium }
-                Text { Layout.leftMargin: 12; Layout.bottomMargin: 8; text: "v1.0.1"; color: root.theme.outline; font.pixelSize: 11 }
+                Text { Layout.leftMargin: 12; Layout.bottomMargin: 8; text: "v" + app.updater.currentVersion; color: root.theme.outline; font.pixelSize: 11 }
             }
         }
         ColumnLayout {
@@ -294,6 +295,57 @@ Item {
                         Text { width: parent.width; text: app.sourceInfo.description; color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4 }
                         GlassSwitch { width: parent.width; theme: root.theme; text: "网络时间校准"; description: "使用 SNTP，失败时回退 HTTP。校正本机时间偏差，改善到时估算。"; checked: app.settings.enableNtpSync; onToggled: app.settings.enableNtpSync = checked }
                         Text { width: parent.width; text: "校时状态 · " + app.clockInfo.state + "\n" + app.clockInfo.detail; color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.5 }
+                    }
+                    SettingsSection {
+                        objectName: "settingsPanel-about"
+                        width: parent.width; theme: root.theme; title: "启动与更新"; iconName: "refresh-cw"; visible: root.currentSection === 5
+                        GlassSwitch {
+                            objectName: "autoStartSwitch"
+                            width: parent.width; theme: root.theme; text: "开机自启"
+                            description: "登录系统后自动启动 KomiraQuake，保持预警连接。"
+                            checked: app.autoStart.enabled
+                            onToggled: app.autoStart.enabled = checked
+                        }
+                        GlassSwitch {
+                            objectName: "silentStartSwitch"
+                            width: parent.width; theme: root.theme; text: "静默启动"
+                            description: "启动时不显示主窗口，只保留托盘图标；可从托盘菜单随时打开（等同于关闭窗口）。"
+                            checked: app.settings.silentStart
+                            onToggled: app.settings.silentStart = checked
+                        }
+                        Column {
+                            width: parent.width; spacing: 6
+                            RowLayout {
+                                width: parent.width; spacing: 12
+                                Text { Layout.fillWidth: true; text: "当前版本 v" + app.updater.currentVersion; color: root.theme.textPrimary; font.pixelSize: 14; font.family: root.theme.numberFamily }
+                                GlassButton {
+                                    objectName: "checkUpdatesButton"
+                                    theme: root.theme; text: "检查更新"; iconName: "refresh-cw"
+                                    enabled: app.updater.state !== "checking"
+                                    onClicked: app.updater.check(false)
+                                }
+                                GlassButton {
+                                    objectName: "openReleaseButton"
+                                    visible: app.updater.state === "updateAvailable"
+                                    theme: root.theme; text: "打开下载页"; iconName: "external-link"; primary: true
+                                    onClicked: app.updater.openReleasePage()
+                                }
+                            }
+                            Text {
+                                width: parent.width; visible: app.updater.message !== ""
+                                text: app.updater.message; wrapMode: Text.Wrap; font.pixelSize: 12
+                                color: app.updater.state === "updateAvailable" ? root.theme.accent
+                                     : app.updater.state === "error" ? root.theme.severity("WARNING")
+                                     : root.theme.outline
+                            }
+                        }
+                        GlassSwitch {
+                            objectName: "autoCheckUpdatesSwitch"
+                            width: parent.width; theme: root.theme; text: "自动检查更新"
+                            description: "启动时在后台静默检查一次新版本，发现更新后在此提示。"
+                            checked: app.settings.autoCheckUpdates
+                            onToggled: app.settings.autoCheckUpdates = checked
+                        }
                     }
                 }
             }

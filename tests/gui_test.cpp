@@ -256,7 +256,7 @@ private slots:
         QVERIFY(screenshot("10-settings-narrow"));
         auto* settingsPage = window->findChild<QQuickItem*>("settingsPage");
         QVERIFY(settingsPage);
-        for (int section = 0; section < 5; ++section) {
+        for (int section = 0; section < 6; ++section) {
             settingsPage->setProperty("currentSection", section);
             QTest::qWait(30);
             for (auto* item : visualItems(settingsPage)) {
@@ -364,7 +364,7 @@ private slots:
         QCOMPARE(background->property("color").value<QColor>(), lightBackground);
         QVERIFY(capture("settings-selected-light"));
 
-        const QStringList categories = {"appearance", "location", "warning", "audio", "source"};
+        const QStringList categories = {"appearance", "location", "warning", "audio", "source", "about"};
         for (int index = 0; index < categories.size(); ++index) {
             QVERIFY(click("settingsNav-" + categories[index]));
             QTRY_COMPARE(page->property("currentSection").toInt(), index);

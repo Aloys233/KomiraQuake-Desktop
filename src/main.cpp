@@ -11,6 +11,7 @@
 #include <QStandardPaths>
 
 #include "app/app_controller.h"
+#include "app/version.h"
 #include "service/tray_controller.h"
 #include "theme/native_ui.h"
 
@@ -67,6 +68,7 @@ int main(int argc, char* argv[]) {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
     QCoreApplication::setOrganizationName(QStringLiteral("KomiraQuake"));
     QCoreApplication::setApplicationName(QStringLiteral("KomiraQuake"));
+    QCoreApplication::setApplicationVersion(QStringLiteral(KOMIRA_VERSION));
     QGuiApplication::setApplicationDisplayName(QStringLiteral("KomiraQuake - 地震预警"));
 
     komira::AppController controller;
