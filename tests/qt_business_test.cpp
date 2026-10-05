@@ -20,6 +20,8 @@
 #include "model/data_source_info.h"
 #include "prefs/settings_store.h"
 #include "source/eew_parser.h"
+#include "source/pancakes_parser.h"
+#include "source/pancakes_protocol.h"
 #include "store/history_store.h"
 
 // No production clock/network seam exists for message injection. Restrict access
@@ -366,10 +368,107 @@ private slots:
         QCOMPARE(source.info().directoryStatus, ConnectionStatus::Disconnected);
     }
 
+    void pancakesRealtimeMapping() {
+        auto envelope = [](const QString& source, const QString& action, const QJsonObject& payload) {
+            return QJsonObject{{"source", source}, {"type", QStringLiteral("earthquake")},
+                               {"action", action}, {"timestampMs", static_cast<double>(origin)},
+                               {"payload", payload}};
+        };
+        {
+            auto parsed = PancakesParser::parseRealtime(
+                envelope("usgs", "update",
+                         {{"eventId", "us7000abcd"}, {"placeName", "Somewhere"}, {"latitude", -12.5},
+                          {"longitude", 166.25}, {"depth", 35.0}, {"magnitude", 5.8},
+                          {"originTimeMs", static_cast<double>(origin)},
+                          {"updatedTimeMs", static_cast<double>(origin + 5000)},
+                          {"infoType", "Reviewed"}}),
+                std::nullopt, IntensityStandard::Csis, origin);
+            QVERIFY(parsed.has_value());
+            QCOMPARE(parsed->kind, PancakesKind::Live);
+            QCOMPARE(parsed->event.eventId, std::string("usgs:us7000abcd"));
+            QCOMPARE(parsed->event.sourceProvider, std::string("Pancakes"));
+            QCOMPARE(parsed->event.sourceAgency, std::string("USGS"));
+            QVERIFY(parsed->event.isFinal);
+            QCOMPARE(parsed->event.reportTime, origin + 5000);
+        }
+        {
+            auto parsed = PancakesParser::parseRealtime(
+                envelope("gq", "archived",
+                         {{"id", "abc"}, {"latitude", 35.0}, {"longitude", 140.0}, {"depth", 10.0},
+                          {"magnitude", 6.5}, {"originTimeMs", static_cast<double>(origin)},
+                          {"region", "関東"}, {"revisionId", 3},
+                          {"lastUpdateMs", static_cast<double>(origin + 500)}, {"intensity", "VIII"}}),
+                std::nullopt, IntensityStandard::Csis, origin);
+            QVERIFY(parsed.has_value());
+            QVERIFY(parsed->event.isFinal);
+            QCOMPARE(parsed->event.reportNum, 4);
+            QCOMPARE(QString::fromStdString(parsed->event.maxIntensityText), QStringLiteral("VIII"));
+        }
+        {
+            auto parsed = PancakesParser::parseRealtime(
+                envelope("gq", "cancelled", {{"id", "abc"}}),
+                std::nullopt, IntensityStandard::Csis, origin);
+            QVERIFY(parsed.has_value());
+            QVERIFY(parsed->event.isCanceled);
+            QCOMPARE(parsed->event.reportNum, PancakesProtocol::kCancelReportNum);
+        }
+        {
+            auto parsed = PancakesParser::parseRealtime(
+                envelope("jma_eew", "update",
+                         {{"EventID", "20231114221320"}, {"Serial", 4},
+                          {"AnnouncedTime", "2023-11-14T22:13:30+09:00"},
+                          {"OriginTime", "2023-11-14T22:13:20+09:00"}, {"Hypocenter", "東京湾"},
+                          {"Latitude", 35.5}, {"Longitude", 139.8}, {"Magunitude", 6.1},
+                          {"Depth", 20.0}, {"MaxIntensity", "5+"}, {"isFinal", false},
+                          {"isCancel", false}}),
+                std::nullopt, IntensityStandard::Jma, origin);
+            QVERIFY(parsed.has_value());
+            QCOMPARE(parsed->kind, PancakesKind::Live);
+            QCOMPARE(parsed->event.eventId, std::string("jma_eew:20231114221320"));
+            QCOMPARE(parsed->event.reportNum, 4);
+            QCOMPARE(parsed->event.maxIntensityRaw, 5.5);
+        }
+        {
+            auto parsed = PancakesParser::parseRealtime(
+                envelope("jma_eqlist", "update",
+                         {{"eventId", "20231114221320"},
+                          {"originTime", "2023-11-14T22:13:20+09:00"}, {"placeName", "東京湾"},
+                          {"latitude", 35.5}, {"longitude", 139.8}, {"depth", 20.0},
+                          {"magnitude", 4.5}, {"maxIntensity", "3"}, {"serial", 1},
+                          {"reportTime", "2023-11-14T22:21:00+09:00"}}),
+                std::nullopt, IntensityStandard::Csis, origin);
+            QVERIFY(parsed.has_value());
+            QCOMPARE(parsed->kind, PancakesKind::Directory);
+            QVERIFY(parsed->event.isFinal);
+        }
+        {
+            auto parsed = PancakesParser::parseRealtime(
+                envelope("cma", "update", {{"id", "x"}, {"latitude", 1.0}, {"longitude", 2.0}}),
+                std::nullopt, IntensityStandard::Csis, origin);
+            QVERIFY(!parsed.has_value());
+        }
+    }
+
+    void pancakesListMapping() {
+        const QJsonObject item{{"source", "usgs"}, {"eventId", "us7000abcd"}, {"status", "active"},
+                               {"revision", static_cast<double>(origin)},
+                               {"originTime", "2026-10-05T11:19:29.04Z"}, {"magnitude", 4.9},
+                               {"depthKm", 10.0}, {"place", "Somewhere"}, {"latitude", 38.8},
+                               {"longitude", -122.8}};
+        auto event = PancakesParser::parseListItem(item, std::nullopt, IntensityStandard::Csis, origin);
+        QVERIFY(event.has_value());
+        QCOMPARE(event->eventId, std::string("usgs:us7000abcd"));
+        QCOMPARE(event->sourceAgency, std::string("USGS"));
+        QCOMPARE(event->timestamp,
+                 QDateTime::fromString(QStringLiteral("2026-10-05T11:19:29.04Z"), Qt::ISODate)
+                     .toMSecsSinceEpoch());
+        QCOMPARE(event->reportTime, origin);
+        QVERIFY(!event->isCanceled);
+    }
+
     // QWebSocket 传输失败会同时发 errorOccurred 与 disconnected：一次连接尝试只应调度
     // 一次重连，否则 retryCount_ 被翻倍、退避瞬间顶到 15s 上限。
-    void reconnectScheduledOncePerAttempt() {
-        WolfxSource source;
+    void reconnectScheduledOncePerAttempt() {        WolfxSource source;
         source.running_ = true;
         source.generation_ = 1;
 

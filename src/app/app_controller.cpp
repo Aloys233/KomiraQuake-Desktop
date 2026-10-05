@@ -5,8 +5,12 @@
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
+#include <QList>
 #include <QStandardPaths>
+#include <QStringList>
 #include <QTimeZone>
+
+#include <algorithm>
 
 #include "core/coordinate_transform.h"
 #include "core/intensity_calculator.h"
@@ -22,6 +26,7 @@
 #include "service/speech_service.h"
 #include "service/update_service.h"
 #include "source/eew_parser.h"
+#include "source/pancakes_source.h"
 #include "source/wolfx_source.h"
 #include "store/history_store.h"
 #include "theme/seismic_colors.h"
@@ -107,6 +112,60 @@ WarningLevel levelFromTag(const QString& tag) {
     return WarningLevel::Normal;
 }
 
+int statusRank(ConnectionStatus s) {
+    switch (s) {
+    case ConnectionStatus::Connected: return 3;
+    case ConnectionStatus::Connecting: return 2;
+    case ConnectionStatus::Error: return 1;
+    case ConnectionStatus::Disconnected: return 0;
+    }
+    return 0;
+}
+
+/// 聚合多数据源的链路状态：任一启用源在线即视为在线（状态栏单条展示）。
+DataSourceInfo combineSources(const QList<DataSourceInfo>& all, const QStringList& enabledIds) {
+    QList<DataSourceInfo> list;
+    for (const auto& info : all)
+        if (enabledIds.contains(info.id)) list << info;
+    if (list.isEmpty()) {
+        DataSourceInfo none;
+        none.id = "none";
+        none.name = "无启用数据源";
+        none.region = "全球";
+        return none;
+    }
+    DataSourceInfo out = list.first();
+    QStringList names;
+    QStringList descriptions;
+    for (const auto& info : list) {
+        names << info.name;
+        if (!info.description.isEmpty()) descriptions << info.description;
+        if (statusRank(info.status) > statusRank(out.status)) out.status = info.status;
+        if (statusRank(info.directoryStatus) > statusRank(out.directoryStatus))
+            out.directoryStatus = info.directoryStatus;
+        if (info.directoryLatencyMs >= 0
+            && (out.directoryLatencyMs < 0 || info.directoryLatencyMs < out.directoryLatencyMs))
+            out.directoryLatencyMs = info.directoryLatencyMs;
+        if (info.directoryLastSuccess > out.directoryLastSuccess)
+            out.directoryLastSuccess = info.directoryLastSuccess;
+        if (out.directoryError.isEmpty() && !info.directoryError.isEmpty())
+            out.directoryError = info.directoryError;
+        if (info.lastHeartbeat > out.lastHeartbeat) out.lastHeartbeat = info.lastHeartbeat;
+    }
+    QStringList ids;
+    for (const auto& info : list) ids << info.id;
+    out.id = ids.join("+");
+    out.name = names.join(QStringLiteral(" · "));
+    out.description = descriptions.join("；");
+    out.latencyMs = -1;
+    for (const auto& info : list) {
+        if (info.status == ConnectionStatus::Connected && info.latencyMs >= 0
+            && (out.latencyMs < 0 || info.latencyMs < out.latencyMs))
+            out.latencyMs = info.latencyMs;
+    }
+    return out;
+}
+
 } // namespace
 
 AppController::AppController(QObject* parent, bool startServices)
@@ -136,6 +195,7 @@ AppController::AppController(QObject* parent, bool startServices)
     announcer_ = new AlertAnnouncer(settings_, sound_, speech_, this);
 
     source_ = new WolfxSource(this);
+    pancakes_ = new PancakesSource(this);
     clock_ = new NtpClock(this);
     autoStart_ = new AutoStartService(this);
     updater_ = new UpdateService(this);
@@ -173,6 +233,8 @@ void AppController::wire() {
     // 校时：数据源与告警编排都走 clock_ 的时间基准。《NATIVE_PORT_SPEC》 §13。
     source_->setNowProvider([this]() { return nowMs(); });
     source_->setMonoProvider([this]() { return clock_->elapsedMs(); });
+    pancakes_->setNowProvider([this]() { return nowMs(); });
+    pancakes_->setMonoProvider([this]() { return clock_->elapsedMs(); });
     connect(clock_, &NtpClock::changed, this, &AppController::clockChanged);
 
     connect(source_, &WolfxSource::eventReceived, this,
@@ -180,26 +242,38 @@ void AppController::wire() {
                 handleEvent(e, false, kind == WolfxEventKind::Directory);
             });
     connect(source_, &WolfxSource::infoChanged, this, &AppController::statusChanged);
+    connect(pancakes_, &PancakesSource::eventReceived, this,
+            [this](const EarthquakeEvent& e, PancakesKind kind) {
+                handleEvent(e, false, kind == PancakesKind::Directory);
+            });
+    connect(pancakes_, &PancakesSource::infoChanged, this, &AppController::statusChanged);
 
     // 定位只影响"本地烈度/倒计时/全屏预警"，不影响数据源连接。
     connect(location_, &LocationService::changed, this, [this]() {
         emit locationChanged();
-        if (location_->hasLocation())
+        if (location_->hasLocation()) {
             source_->setUserLocation(location_->latitude(), location_->longitude());
-        else source_->clearUserLocation();
+            pancakes_->setUserLocation(location_->latitude(), location_->longitude());
+        } else {
+            source_->clearUserLocation();
+            pancakes_->clearUserLocation();
+        }
         recomputeEvents();
     });
 
     connect(settings_, &SettingsStore::changed, this, [this]() {
-        source_->setStandard(settings_->intensityStandard() == 1 ? IntensityStandard::Jma
-                                                                 : IntensityStandard::Csis);
+        const IntensityStandard standard = settings_->intensityStandard() == 1
+            ? IntensityStandard::Jma : IntensityStandard::Csis;
+        source_->setStandard(standard);
+        pancakes_->setStandard(standard);
         speech_->setEnabled(settings_->enableSpeech());
         speech_->setRate(settings_->speechRate());
         speech_->setVolume(settings_->alertVolume());
         sound_->setEnabled(settings_->enableSoundAlert());
         sound_->setVolume(settings_->alertVolume());
-        if (startServices_ && settings_->enabledWolfx()) source_->start();
-        else source_->stop();
+        if (startServices_ && settings_->enabledWolfx()) source_->start(); else source_->stop();
+        if (startServices_ && settings_->enabledPancakes()) pancakes_->start(); else pancakes_->stop();
+        clock_->setCustomServer(settings_->customNtpServer());
         clock_->setEnabled(startServices_ && settings_->enableNtpSync());
         announcer_->onMuteChanged();
         recomputeEvents();
@@ -226,9 +300,14 @@ void AppController::wire() {
     location_->restore();
 
     // 数据源与定位解耦：先连数据源，定位并行获取；校时并行后台进行。
-    source_->setStandard(settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis);
+    const IntensityStandard startStandard =
+        settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis;
+    source_->setStandard(startStandard);
+    pancakes_->setStandard(startStandard);
     if (startServices_) {
         if (settings_->enabledWolfx()) source_->start();
+        if (settings_->enabledPancakes()) pancakes_->start();
+        clock_->setCustomServer(settings_->customNtpServer());
         clock_->setEnabled(settings_->enableNtpSync());
         clock_->start();
         if (!location_->hasLocation()) location_->requestCurrentPosition();
@@ -240,6 +319,17 @@ bool AppController::startHidden() const {
     return settings_ && settings_->silentStart();
 }
 
+bool AppController::alertEligible() const {
+    return hasActiveWarning_ && announcer_->eligible(activeWarning_);
+}
+
+QStringList AppController::enabledSourceIds() const {
+    QStringList ids;
+    if (settings_->enabledWolfx()) ids << SourceIds::kWolfx;
+    if (settings_->enabledPancakes()) ids << SourceIds::kPancakes;
+    return ids;
+}
+
 void AppController::maybeAutoCheckUpdates() {
     if (!startServices_ || autoUpdateChecked_ || !settings_->autoCheckUpdates()) return;
     autoUpdateChecked_ = true;
@@ -248,7 +338,9 @@ void AppController::maybeAutoCheckUpdates() {
 }
 
 QString AppController::statusText() const {
-    const DataSourceInfo info = source_->info();
+    const DataSourceInfo info = combineSources(
+        {source_->info(), pancakes_->info()},
+        enabledSourceIds());
     switch (info.status) {
     case ConnectionStatus::Connected: return QStringLiteral("源在线");
     case ConnectionStatus::Connecting: return QStringLiteral("连接中");
@@ -259,7 +351,9 @@ QString AppController::statusText() const {
 }
 
 QString AppController::statusLevelTag() const {
-    const DataSourceInfo info = source_->info();
+    const DataSourceInfo info = combineSources(
+        {source_->info(), pancakes_->info()},
+        enabledSourceIds());
     switch (info.status) {
     case ConnectionStatus::Connected: return QStringLiteral("NORMAL");
     case ConnectionStatus::Error: return QStringLiteral("WARNING");
@@ -273,8 +367,38 @@ double AppController::userLatitude() const { return location_->latitude(); }
 double AppController::userLongitude() const { return location_->longitude(); }
 QString AppController::locationStatusText() const { return location_->statusText(); }
 
+QVariantList AppController::sources() const {
+    auto describe = [](const DataSourceInfo& info, bool enabled) {
+        QVariantMap m;
+        m["id"] = info.id;
+        m["name"] = info.name;
+        m["enabled"] = enabled;
+        m["status"] = info.statusLabel();
+        m["statusTag"] = info.statusTag();
+        m["latency"] = info.latencyMs >= 0 ? QStringLiteral("%1 ms").arg(info.latencyMs)
+                                           : QStringLiteral("— ms");
+        switch (info.directoryStatus) {
+        case ConnectionStatus::Connected: m["directory"] = QStringLiteral("目录刷新成功"); break;
+        case ConnectionStatus::Connecting: m["directory"] = QStringLiteral("目录刷新中"); break;
+        case ConnectionStatus::Error:
+            m["directory"] = QStringLiteral("目录刷新失败：") + info.directoryError; break;
+        default: m["directory"] = QStringLiteral("目录未刷新"); break;
+        }
+        m["directoryLatency"] = info.directoryLatencyMs >= 0
+            ? QStringLiteral("%1 ms").arg(info.directoryLatencyMs) : QStringLiteral("— ms");
+        m["description"] = info.description;
+        return m;
+    };
+    QVariantList list;
+    list.push_back(describe(source_->info(), settings_->enabledWolfx()));
+    list.push_back(describe(pancakes_->info(), settings_->enabledPancakes()));
+    return list;
+}
+
 QVariantMap AppController::sourceInfo() const {
-    const DataSourceInfo info = source_->info();
+    const DataSourceInfo info = combineSources(
+        {source_->info(), pancakes_->info()},
+        enabledSourceIds());
     QVariantMap m;
     m["id"] = info.id;
     m["name"] = info.name;
@@ -420,6 +544,52 @@ QVariant AppController::hudEvent() const {
     return QVariant();
 }
 
+std::vector<std::string> AppController::orderedActiveKeys() const {
+    std::vector<std::pair<long long, std::string>> ordered;
+    ordered.reserve(sessions_.active.size());
+    for (const auto& [key, state] : sessions_.active)
+        ordered.emplace_back(state.event.timestamp, key);
+    // 发震时刻倒序（最新在前）；同一时刻按 identity 稳定排序。
+    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second < b.second;
+    });
+    std::vector<std::string> keys;
+    keys.reserve(ordered.size());
+    for (const auto& entry : ordered) keys.push_back(entry.second);
+    return keys;
+}
+
+int AppController::hudCount() const { return static_cast<int>(sessions_.active.size()); }
+
+int AppController::hudIndex() const {
+    const auto keys = orderedActiveKeys();
+    for (size_t i = 0; i < keys.size(); ++i)
+        if (keys[i] == selectedWarning_) return static_cast<int>(i);
+    return 0;
+}
+
+void AppController::hudPrev() { shiftHud(-1); }
+void AppController::hudNext() { shiftHud(1); }
+
+void AppController::shiftHud(int delta) {
+    const auto keys = orderedActiveKeys();
+    if (keys.empty()) return;
+    int index = 0;
+    for (size_t i = 0; i < keys.size(); ++i)
+        if (keys[i] == selectedWarning_) { index = static_cast<int>(i); break; }
+    const int count = static_cast<int>(keys.size());
+    index = ((index + delta) % count + count) % count;
+    selectedWarning_ = keys[static_cast<size_t>(index)];
+    // 切换即同步地图焦点（非手动），使地图与 HUD 指向同一事件。
+    const auto it = sessions_.active.find(selectedWarning_);
+    if (it != sessions_.active.end()) {
+        announcer_->stopOutput();
+        setMapFocus(it->second.event, false);
+    }
+    syncWarning();
+}
+
 void AppController::scheduleHudRefresh() {
     hudRefreshTimer_.stop();
     if (!hasMapFocus_ || mapFocusManual_) return;
@@ -559,6 +729,11 @@ void AppController::setManualLocation(double latitude, double longitude, const Q
 
 void AppController::refreshCatalog() {
     if (source_ && settings_->enabledWolfx()) source_->refreshDirectory();
+    if (pancakes_ && settings_->enabledPancakes()) pancakes_->refreshDirectory();
+}
+
+void AppController::refreshClock() {
+    if (clock_) clock_->refresh();
 }
 
 QPointF AppController::wgs84ToGcj02(double lat, double lng) const {
@@ -648,8 +823,8 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         emit hudEventChanged();
         return;
     }
-    if (!event.isCanceled && !passesMagnitudeFilter(event) &&
-        !sessions_.active.count(event.identity())) return;
+    // 不做震级过滤：所有实时事件都进入生命周期（用于展示/HUD/倒计时），
+    // 是否提醒由 AlertAnnouncer 依据「预警总开关 + 本地烈度」决定。
     const auto change = sessions_.accept(event, nowMs());
     if (change == WarningSession::Change::Ignored) return;
     if (change == WarningSession::Change::Ended) {
@@ -692,11 +867,6 @@ void AppController::upsertHistory(const EarthquakeEvent& event) {
     history_.push_back(event);
 }
 
-bool AppController::passesMagnitudeFilter(const EarthquakeEvent& event) const {
-    if (isAlertLevel(event.warningLevel)) return true;
-    return event.magnitude >= settings_->minListenMagnitude();
-}
-
 void AppController::syncWarning() {
     auto selected = sessions_.active.find(selectedWarning_);
     if (selected == sessions_.active.end() && !sessions_.active.empty()) {
@@ -708,9 +878,10 @@ void AppController::syncWarning() {
     countdown_ = -1;
     if (hasActiveWarning_) {
         activeWarning_ = selected->second.event;
-        countdown_ = activeWarning_.remainingSeconds(nowMs());
-        overlayVisible_ = !selected->second.hidden && settings_->enableFullScreenWarning() &&
-                          isAlertLevel(activeWarning_.warningLevel) && announcer_->eligible(activeWarning_);
+        // 未达提醒门槛（总开关 / 本地烈度过滤）时不给倒计时，避免被过滤掉的事件仍显示预警卡。
+        const bool eligible = announcer_->eligible(activeWarning_);
+        countdown_ = eligible ? activeWarning_.remainingSeconds(nowMs()) : -1;
+        overlayVisible_ = !selected->second.hidden && eligible;
         countdownTimer_.start();
     } else {
         selectedWarning_.clear();
@@ -763,7 +934,9 @@ void AppController::onTick() {
     auto it = sessions_.active.find(selectedWarning_);
     if (it == sessions_.active.end()) return;
     activeWarning_ = it->second.event;
-    const int seconds = activeWarning_.remainingSeconds(now);
+    // 未达提醒门槛的事件不给倒计时，也不触发倒计时/到时音（被过滤掉的事件只展示）。
+    const int seconds = announcer_->eligible(activeWarning_)
+        ? activeWarning_.remainingSeconds(now) : -1;
     if (seconds != countdown_) {
         countdown_ = seconds;
         emit countdownChanged();

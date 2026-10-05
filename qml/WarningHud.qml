@@ -16,7 +16,8 @@ GlassCard {
     visible: !!event
     implicitWidth: 352
     implicitHeight: content.implicitHeight + 28
-    color: theme.glassCard
+    // 与主 HUD 一致：采样地图作为毛玻璃底，文字落在材质之上。
+    color: backdropSource ? (blurActive ? theme.backdropTint : theme.backdropFallback) : theme.glassCard
     border.color: theme.glassBorder
     radius: 16
 

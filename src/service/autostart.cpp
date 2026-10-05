@@ -11,20 +11,23 @@ namespace komira {
 
 namespace {
 
-/// 桌面项 Exec / 注册表命令行里带空格的路径需要引号包裹，并转义引号与反斜杠。
-[[maybe_unused]] QString quoted(const QString& path) {
+#if defined(Q_OS_LINUX) || defined(Q_OS_FREEBSD)
+const QString kAutostartFileName = QStringLiteral("komiraquake.desktop");
+
+/// .desktop 的 Exec 是转义字段：带空格的路径用引号包裹，并按规范转义反斜杠与引号。
+QString quoted(const QString& path) {
     QString escaped = path;
     escaped.replace(QLatin1Char('\\'), QStringLiteral("\\\\"));
     escaped.replace(QLatin1Char('"'), QStringLiteral("\\\""));
     return QLatin1Char('"') + escaped + QLatin1Char('"');
 }
 
-#if defined(Q_OS_LINUX) || defined(Q_OS_FREEBSD)
-const QString kAutostartFileName = QStringLiteral("komiraquake.desktop");
-
+/// 自启条目必须位于 `$XDG_CONFIG_HOME/autostart/`（通常 `~/.config/autostart/`）；
+/// QStandardPaths::ConfigLocation 只给到 `~/.config`，需自行补 `autostart` 段，
+/// 否则桌面环境不会读取该条目，自启不生效。
 QString autostartFilePath() {
     return QStandardPaths::writableLocation(QStandardPaths::ConfigLocation)
-           + QLatin1Char('/') + kAutostartFileName;
+           + QStringLiteral("/autostart/") + kAutostartFileName;
 }
 
 /// AppImage 运行时 applicationFilePath() 指向临时挂载点，重启后失效；
@@ -38,6 +41,12 @@ QString launchPath() {
 const QString kWindowsRunKey =
     QStringLiteral("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const QString kEntryName = QStringLiteral("KomiraQuake");
+
+/// Run 值是 REG_SZ，原样交给 CreateProcess，**不转义反斜杠**（否则路径会被写成
+/// `C:\\Program Files\\...` 这种双反斜杠）。只需为含空格的路径加引号。
+QString runValue(const QString& path) {
+    return QLatin1Char('"') + QDir::toNativeSeparators(path) + QLatin1Char('"');
+}
 #endif
 
 } // namespace
@@ -83,8 +92,7 @@ void AutoStartService::setEnabled(bool enabled) {
 #elif defined(Q_OS_WIN)
     QSettings run(kWindowsRunKey, QSettings::NativeFormat);
     if (enabled) {
-        run.setValue(kEntryName,
-                     quoted(QDir::toNativeSeparators(QCoreApplication::applicationFilePath())));
+        run.setValue(kEntryName, runValue(QCoreApplication::applicationFilePath()));
     } else {
         run.remove(kEntryName);
     }

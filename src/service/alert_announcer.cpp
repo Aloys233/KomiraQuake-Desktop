@@ -23,8 +23,10 @@ AlertAnnouncer::EventState& AlertAnnouncer::stateFor(const EarthquakeEvent& even
 }
 
 bool AlertAnnouncer::eligible(const EarthquakeEvent& event) const {
+    // 预警总开关（设置页「地震预警」）：关闭时只展示，不产生任何提醒。
+    if (!settings_->enableWarnings()) return false;
     if (event.isCanceled) return false;
-    // 本地烈度过滤：仅当本地预估烈度达到阈值时才提醒；0 表示不作筛选，无定位时无法判定故放行。
+    // 唯一过滤条件：本地预估烈度是否达到阈值（0 表示不作筛选，无定位放行）。
     const double filter = settings_->localIntensityFilter();
     if (filter > 0.0 && event.distanceKm >= 0.0 && event.rawIntensity < filter) return false;
     return true;
@@ -65,7 +67,6 @@ void AlertAnnouncer::onWarning(const EarthquakeEvent& event) {
 
 void AlertAnnouncer::onCountdown(const EarthquakeEvent& event, long long nowMs) {
     if (settings_->isMuted() || !eligible(event)) return;
-    if (!isAlertLevel(event.warningLevel)) return;
 
     const int seconds = event.remainingSeconds(nowMs);
     if (seconds <= 0 || seconds > 60) return;
@@ -91,7 +92,6 @@ void AlertAnnouncer::onCountdown(const EarthquakeEvent& event, long long nowMs) 
 
 void AlertAnnouncer::onArrived(const EarthquakeEvent& event) {
     if (settings_->isMuted() || !eligible(event)) return;
-    if (!isAlertLevel(event.warningLevel)) return;
     sound_->play(QStringLiteral("hypocenter"), 10000);
 }
 

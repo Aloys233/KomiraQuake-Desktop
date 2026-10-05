@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QDir>
 #include <QFontDatabase>
 #include <QGuiApplication>
 #include <QPainter>
@@ -36,11 +37,20 @@ public:
 };
 
 inline void configureNativeUi(QQmlEngine& engine) {
+    // 打包的 Google Sans 静态拉丁子集（见 tools/import_google_sans.py）。中文字形不在其中，
+    // 由 families 回退到系统 CJK；字重由各实例的 OS/2 决定。
+    const QStringList fontDirEntries =
+        QDir(QStringLiteral(":/fonts")).entryList({QStringLiteral("*.ttf")}, QDir::Files);
+    for (const QString& file : fontDirEntries)
+        QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/") + file);
     QFont font;
-    font.setFamilies({QStringLiteral("Noto Sans SC"), QStringLiteral("Noto Sans CJK SC"),
-                      QStringLiteral("PingFang SC"), QStringLiteral("sans-serif")});
+    font.setFamilies({QStringLiteral("Google Sans"), QStringLiteral("Noto Sans SC"),
+                      QStringLiteral("Noto Sans CJK SC"), QStringLiteral("PingFang SC"),
+                      QStringLiteral("sans-serif")});
     font.setPixelSize(14);
     font.setWeight(QFont::Normal);
+    // Google Sans 默认是比例数字；显式开启等宽数字，避免时钟/震级宽度抖动。
+    font.setFeature(QFont::Tag("tnum"), 1);
     QGuiApplication::setFont(font);
     // The installed CJK variable font shows excessively emboldened distance-field
     // glyphs on the software scenegraph. Use native glyph rasterization on both

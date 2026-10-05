@@ -4,7 +4,9 @@
 #include <QList>
 #include <QObject>
 #include <QPointF>
+#include <QStringList>
 #include <functional>
+#include <vector>
 #include "core/warning_session.h"
 #include <QTimer>
 #include <QVariantList>
@@ -19,6 +21,7 @@
 namespace komira {
 class LocationService;
 class WolfxSource;
+class PancakesSource;
 class HistoryStore;
 class AlertSoundService;
 class SpeechService;
@@ -43,12 +46,16 @@ class AppController : public QObject {
     Q_PROPERTY(double userLongitude READ userLongitude NOTIFY locationChanged)
     Q_PROPERTY(QString locationStatusText READ locationStatusText NOTIFY locationChanged)
     Q_PROPERTY(QVariantMap sourceInfo READ sourceInfo NOTIFY statusChanged)
+    /// 逐数据源的状态列表：`[{ id, name, enabled, status, statusTag, latency, directory, directoryLatency, description }]`。
+    Q_PROPERTY(QVariantList sources READ sources NOTIFY statusChanged)
     /// 校时状态：`{ enabled, state, detail }`。设置页展示；地震时间语义走 NtpClock::now()。
     Q_PROPERTY(QVariantMap clockInfo READ clockInfo NOTIFY clockChanged)
     Q_PROPERTY(QVariantList history READ history NOTIFY historyChanged)
     /// 右侧列表数据：目录条目用权威数据，并与实时预警按「发震时刻 + 震中」合并为一条。
     Q_PROPERTY(QVariantList eventList READ eventList NOTIFY eventListChanged)
     Q_PROPERTY(bool hasWarning READ hasWarning NOTIFY warningChanged)
+    /// 当前活动预警是否达到提醒门槛（总开关 + 本地烈度过滤）；未达标只展示、不出现预警卡/倒计时。
+    Q_PROPERTY(bool alertEligible READ alertEligible NOTIFY warningChanged)
     Q_PROPERTY(bool warningOverlayVisible READ warningOverlayVisible NOTIFY warningOverlayChanged)
     Q_PROPERTY(QVariant activeWarning READ activeWarning NOTIFY warningChanged)
     Q_PROPERTY(QVariantList activeWarnings READ activeWarnings NOTIFY warningChanged)
@@ -62,6 +69,9 @@ class AppController : public QObject {
     /// 左下角 HUD 要显示的那一个事件：用户主动点击的焦点最优先，其次实时预警，
     /// 再次是仍在 10 分钟窗口内的自动焦点；否则无效（HUD 默认隐藏，点击后才显示）。
     Q_PROPERTY(QVariant hudEvent READ hudEvent NOTIFY hudEventChanged)
+    /// HUD 在全部活动事件中的当前位置（0 基）与总数，供左右切换展示 `n/N`。
+    Q_PROPERTY(int hudIndex READ hudIndex NOTIFY hudEventChanged)
+    Q_PROPERTY(int hudCount READ hudCount NOTIFY hudEventChanged)
     /// P/S 波前圆半径（km），-1 表示不画。
     Q_PROPERTY(QVariantMap waveRadii READ waveRadii NOTIFY waveRadiiChanged)
 
@@ -82,6 +92,7 @@ public:
     double userLongitude() const;
     QString locationStatusText() const;
     QVariantMap sourceInfo() const;
+    QVariantList sources() const;
     QVariantMap clockInfo() const;
     /// 校时后的当前时刻，固定渲染为 UTC+8 的 `yyyy-MM-dd HH:mm:ss`（与设备时区无关）。
     /// 《NATIVE_PORT_SPEC》 §12。
@@ -89,6 +100,7 @@ public:
     QVariantList history() const;
     QVariantList eventList() const;
     bool hasWarning() const { return hasActiveWarning_; }
+    bool alertEligible() const;
     bool warningOverlayVisible() const { return overlayVisible_; }
     /// 无活动预警时返回无效 QVariant（QML 视为 undefined/falsy）。
     QVariant activeWarning() const;
@@ -100,7 +112,13 @@ public:
     QVariant mapEvent() const;
     bool hasMapFocus() const { return hasMapFocus_; }
     QVariant hudEvent() const;
+    int hudIndex() const;
+    int hudCount() const;
     QVariantMap waveRadii() const;
+
+    /// HUD 左右切换：在全部活动事件间循环（按发震时刻倒序，0 为最新）。
+    Q_INVOKABLE void hudPrev();
+    Q_INVOKABLE void hudNext();
 
     /// 列表卡片按钮：命中当前焦点则取消，否则把这次地震设为焦点。
     Q_INVOKABLE void toggleMapFocus(const QString& id);
@@ -109,6 +127,8 @@ public:
     Q_INVOKABLE void requestLocation();
     Q_INVOKABLE void setManualLocation(double latitude, double longitude, const QString& label = QString());
     Q_INVOKABLE void refreshCatalog();
+    /// 立即重新校时一次（不打断周期调度）。
+    Q_INVOKABLE void refreshClock();
     Q_INVOKABLE QPointF wgs84ToGcj02(double lat, double lng) const;
     Q_INVOKABLE QPointF gcj02ToWgs84(double lat, double lng) const;
     Q_INVOKABLE void dismissWarningOverlay();
@@ -140,6 +160,8 @@ signals:
 
 private:
     void wire();
+    /// 当前启用的数据源 id 列表（用于聚合状态展示）。
+    QStringList enabledSourceIds() const;
     /// inDirectory：事件来自 HTTP 目录（进入列表/历史）；否则为 WS 实时预警（只告警不入列表）。
     void handleEvent(const EarthquakeEvent& event, bool replay, bool inDirectory);
     /// 同 id 就地更新或追加；避免重启后「DB 载入 + 首次目录轮询」在列表留下重复条目。
@@ -150,7 +172,6 @@ private:
     WarningSession sessions_;
     std::string selectedWarning_;
     void rebuildHistory();
-    bool passesMagnitudeFilter(const EarthquakeEvent& event) const;
     /// 地图当前显示的那个事件（焦点优先，否则最近一次）；无事件返回 nullptr。
     const EarthquakeEvent* displayedEvent() const;
     /// manual=true 表示用户主动点击选中；false 表示实时预警自动接管。
@@ -160,6 +181,10 @@ private:
     bool hudWindowOpen(const EarthquakeEvent& event, long long now) const;
     /// 安排一次 HUD 可见性重算（跨过 10 分钟窗口时隐藏自动焦点的 HUD）。
     void scheduleHudRefresh();
+    /// 全部活动事件按发震时刻倒序（最新在前）的 identity 列表。
+    std::vector<std::string> orderedActiveKeys() const;
+    /// HUD 左右切换的公共实现：delta 为 ±1 时循环切换所选预警。
+    void shiftHud(int delta);
     /// 焦点事件"还年轻"（发震时刻在窗口内）时跑 100ms 波前定时器，否则停。
     void updateWaveTimer();
     void updateWaveRadii();
@@ -177,6 +202,7 @@ private:
     LocationService* location_ = nullptr;
     HistoryStore* historyStore_ = nullptr;
     WolfxSource* source_ = nullptr;
+    PancakesSource* pancakes_ = nullptr;
     AlertSoundService* sound_ = nullptr;
     SpeechService* speech_ = nullptr;
     AlertAnnouncer* announcer_ = nullptr;

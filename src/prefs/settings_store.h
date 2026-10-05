@@ -13,22 +13,21 @@ class SettingsStore : public QObject {
     Q_PROPERTY(QString customBasemapUrl READ customBasemapUrl WRITE setCustomBasemapUrl NOTIFY changed)
     Q_PROPERTY(int customBasemapDatum READ customBasemapDatum WRITE setCustomBasemapDatum NOTIFY changed)
     Q_PROPERTY(int intensityStandard READ intensityStandard WRITE setIntensityStandard NOTIFY changed)
-    Q_PROPERTY(double minWarningMagnitude READ minWarningMagnitude WRITE setMinWarningMagnitude NOTIFY changed)
-    Q_PROPERTY(double minWarningIntensity READ minWarningIntensity WRITE setMinWarningIntensity NOTIFY changed)
     Q_PROPERTY(double localIntensityFilter READ localIntensityFilter WRITE setLocalIntensityFilter NOTIFY changed)
-    Q_PROPERTY(bool enableFullScreenWarning READ enableFullScreenWarning WRITE setEnableFullScreenWarning NOTIFY changed)
+    Q_PROPERTY(bool enableWarnings READ enableWarnings WRITE setEnableWarnings NOTIFY changed)
     Q_PROPERTY(bool enableSoundAlert READ enableSoundAlert WRITE setEnableSoundAlert NOTIFY changed)
     Q_PROPERTY(bool reduceMotion READ reduceMotion WRITE setReduceMotion NOTIFY changed)
     Q_PROPERTY(bool backgroundBlur READ backgroundBlur WRITE setBackgroundBlur NOTIFY changed)
     Q_PROPERTY(bool isMuted READ isMuted WRITE setIsMuted NOTIFY changed)
     Q_PROPERTY(bool enabledWolfx READ enabledWolfx WRITE setEnabledWolfx NOTIFY changed)
-    Q_PROPERTY(double minListenMagnitude READ minListenMagnitude WRITE setMinListenMagnitude NOTIFY changed)
+    Q_PROPERTY(bool enabledPancakes READ enabledPancakes WRITE setEnabledPancakes NOTIFY changed)
     Q_PROPERTY(double alertVolume READ alertVolume WRITE setAlertVolume NOTIFY changed)
     Q_PROPERTY(bool enableSpeech READ enableSpeech WRITE setEnableSpeech NOTIFY changed)
     Q_PROPERTY(bool speakUpdates READ speakUpdates WRITE setSpeakUpdates NOTIFY changed)
     Q_PROPERTY(bool speakCountdown READ speakCountdown WRITE setSpeakCountdown NOTIFY changed)
     Q_PROPERTY(double speechRate READ speechRate WRITE setSpeechRate NOTIFY changed)
     Q_PROPERTY(bool enableNtpSync READ enableNtpSync WRITE setEnableNtpSync NOTIFY changed)
+    Q_PROPERTY(QString customNtpServer READ customNtpServer WRITE setCustomNtpServer NOTIFY changed)
     Q_PROPERTY(bool darkMode READ darkMode WRITE setDarkMode NOTIFY changed)
     Q_PROPERTY(bool silentStart READ silentStart WRITE setSilentStart NOTIFY changed)
     Q_PROPERTY(bool autoCheckUpdates READ autoCheckUpdates WRITE setAutoCheckUpdates NOTIFY changed)
@@ -48,18 +47,12 @@ public:
     int intensityStandard() const { return s_.value("intensityStandard", 0).toInt(); } // 0 csis, 1 jma
     void setIntensityStandard(int v) { set("intensityStandard", v); }
 
-    double minWarningMagnitude() const { return s_.value("minWarningMagnitude", 4.0).toDouble(); }
-    void setMinWarningMagnitude(double v) { set("minWarningMagnitude", v); }
-
-    double minWarningIntensity() const { return s_.value("minWarningIntensity", 2.0).toDouble(); }
-    void setMinWarningIntensity(double v) { set("minWarningIntensity", v); }
-
-    /// 本地烈度过滤：仅当本地预估烈度达到该值时才提醒；0 表示不作筛选。
     double localIntensityFilter() const { return s_.value("localIntensityFilter", 0.0).toDouble(); }
     void setLocalIntensityFilter(double v) { set("localIntensityFilter", v); }
 
-    bool enableFullScreenWarning() const { return s_.value("enableFullScreenWarning", true).toBool(); }
-    void setEnableFullScreenWarning(bool v) { set("enableFullScreenWarning", v); }
+    /// 地震预警总开关（设置页「地震预警」）：关闭时只展示，不产生任何提醒。
+    bool enableWarnings() const { return s_.value("enableWarnings", false).toBool(); }
+    void setEnableWarnings(bool v) { set("enableWarnings", v); }
 
     bool enableSoundAlert() const { return s_.value("enableSoundAlert", true).toBool(); }
     void setEnableSoundAlert(bool v) { set("enableSoundAlert", v); }
@@ -76,8 +69,8 @@ public:
     bool enabledWolfx() const { return s_.value("enabledWolfx", true).toBool(); }
     void setEnabledWolfx(bool v) { set("enabledWolfx", v); }
 
-    double minListenMagnitude() const { return s_.value("minListenMagnitude", 0.0).toDouble(); }
-    void setMinListenMagnitude(double v) { set("minListenMagnitude", v); }
+    bool enabledPancakes() const { return s_.value("enabledPancakes", true).toBool(); }
+    void setEnabledPancakes(bool v) { set("enabledPancakes", v); }
 
     double alertVolume() const { return s_.value("alertVolume", 1.0).toDouble(); }
     void setAlertVolume(double v) { set("alertVolume", v); }
@@ -96,6 +89,10 @@ public:
 
     bool enableNtpSync() const { return s_.value("enableNtpSync", true).toBool(); }
     void setEnableNtpSync(bool v) { set("enableNtpSync", v); }
+
+    /// 自定义 NTP 服务器主机名；留空则使用内置 SNTP 列表。
+    QString customNtpServer() const { return s_.value("customNtpServer", "").toString(); }
+    void setCustomNtpServer(const QString& v) { set("customNtpServer", v); }
 
     bool darkMode() const { return s_.value("darkMode", false).toBool(); }
     void setDarkMode(bool v) { set("darkMode", v); }

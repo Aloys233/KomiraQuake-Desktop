@@ -13,11 +13,19 @@ Item {
         { key: "location", title: "定位与基准地", icon: "map-pin", description: "设置用于估算本地烈度、距离与预计到时的位置。" },
         { key: "warning", title: "预警策略", icon: "shield", description: "决定何时提醒，以及如何显示本地预警。" },
         { key: "audio", title: "音效与语音", icon: "volume-2", description: "管理警报声音、音量与语音播报。" },
-        { key: "source", title: "数据源与授时", icon: "radio", description: "查看实时预警连接与网络校时状态。" },
+        { key: "source", title: "数据源", icon: "radio", description: "查看各数据源的连接与目录刷新状态。" },
+        { key: "clock", title: "时间校准", icon: "clock", description: "网络授时：开关、自定义 NTP 服务器与校准状态。" },
         { key: "about", title: "自启与更新", icon: "refresh-cw", description: "管理开机自启与静默启动，检查新版本。" }
     ]
     signal back()
     signal pickLocationRequested()
+    /// 数据源状态行：连接/延迟 + 目录刷新 + 说明。
+    function sourceLine(s) {
+        if (!s) return "";
+        const prefix = s.enabled ? "" : "（已停用）";
+        return prefix + "连接：" + s.status + " · 延迟 " + s.latency + "\n"
+             + s.directory + " · " + s.directoryLatency + "\n" + s.description;
+    }
     onCurrentSectionChanged: flick.contentY = 0
     onVisibleChanged: if (visible) root.forceActiveFocus()
     Keys.onEscapePressed: root.back()
@@ -255,7 +263,7 @@ Item {
                     SettingsSection {
                         objectName: "settingsPanel-warning"
                         width: parent.width; theme: root.theme; title: "提醒条件"; iconName: "shield"; visible: root.currentSection === 2
-                        GlassSwitch { width: parent.width; theme: root.theme; text: "预警卡片"; description: "满足提醒条件时，在主 HUD 下方显示本地预计到时与避险操作。"; checked: app.settings.enableFullScreenWarning; onToggled: app.settings.enableFullScreenWarning = checked }
+                        GlassSwitch { objectName: "warningsSwitch"; width: parent.width; theme: root.theme; text: "地震预警"; description: "总开关。开启后仅按本地烈度过滤决定是否提醒；关闭时地震事件只展示，不产生声音、语音、震动或全屏预警。"; checked: app.settings.enableWarnings; onToggled: app.settings.enableWarnings = checked }
                         Column {
                             width: parent.width; spacing: 10
                             Text { text: "烈度标准"; color: root.theme.textPrimary; font.pixelSize: 14 }
@@ -290,15 +298,31 @@ Item {
                     }
                     SettingsSection {
                         objectName: "settingsPanel-source"
-                        width: parent.width; theme: root.theme; title: "连接与校时"; iconName: "radio"; visible: root.currentSection === 4
-                        GlassSwitch { width: parent.width; theme: root.theme; text: "Wolfx 实时预警"; description: app.sourceInfo.name + " · " + app.sourceInfo.status + " · 延迟 " + app.sourceInfo.latency; checked: app.settings.enabledWolfx; onToggled: app.settings.enabledWolfx = checked }
-                        Text { width: parent.width; text: app.sourceInfo.description; color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4 }
-                        GlassSwitch { width: parent.width; theme: root.theme; text: "网络时间校准"; description: "使用 SNTP，失败时回退 HTTP。校正本机时间偏差，改善到时估算。"; checked: app.settings.enableNtpSync; onToggled: app.settings.enableNtpSync = checked }
+                        width: parent.width; theme: root.theme; title: "数据源"; iconName: "radio"; visible: root.currentSection === 4
+                        GlassSwitch { objectName: "wolfxSwitch"; width: parent.width; theme: root.theme; text: "Wolfx 实时预警"; description: "Wolfx all_eew 聚合（CENC/SC/JMA/CWA/FJ/CQ）"; checked: app.settings.enabledWolfx; onToggled: app.settings.enabledWolfx = checked }
+                        Text { width: parent.width; text: root.sourceLine(app.sources[0]); color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4 }
+                        GlassSwitch { objectName: "pancakesSwitch"; width: parent.width; theme: root.theme; text: "Pancakes 实时预警"; description: "api.aloys23.link 聚合（GQ / USGS / JMA）"; checked: app.settings.enabledPancakes; onToggled: app.settings.enabledPancakes = checked }
+                        Text { width: parent.width; text: root.sourceLine(app.sources[1]); color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4 }
+                    }
+                    SettingsSection {
+                        objectName: "settingsPanel-clock"
+                        width: parent.width; theme: root.theme; title: "时间校准"; iconName: "clock"; visible: root.currentSection === 5
+                        GlassSwitch { objectName: "ntpSwitch"; width: parent.width; theme: root.theme; text: "网络校时 (SNTP)"; description: "以网络时间为倒计时与走时反解的基准；SNTP 失败时回退 HTTP 授时。"; checked: app.settings.enableNtpSync; onToggled: app.settings.enableNtpSync = checked }
                         Text { width: parent.width; text: "校时状态 · " + app.clockInfo.state + "\n" + app.clockInfo.detail; color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.5 }
+                        Column {
+                            width: parent.width; spacing: 6
+                            Text { text: "自定义 NTP 服务器"; color: root.theme.textPrimary; font.pixelSize: 14 }
+                            GlassTextField { id: ntpServerField; objectName: "customNtpField"; width: parent.width; theme: root.theme; text: app.settings.customNtpServer; placeholderText: "如 ntp.aliyun.com（留空用默认）"; Accessible.name: "自定义 NTP 服务器" }
+                            GlassButton {
+                                theme: root.theme; text: "应用并重新校时"; iconName: "check"
+                                onClicked: { app.settings.customNtpServer = ntpServerField.text.trim(); app.refreshClock(); }
+                            }
+                            Text { width: parent.width; text: "留空时按内置顺序尝试：ntp.aliyun.com / ntp1.aliyun.com / ntp.tencent.com / pool.ntp.org / time.apple.com。自定义主机将优先尝试。"; color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4 }
+                        }
                     }
                     SettingsSection {
                         objectName: "settingsPanel-about"
-                        width: parent.width; theme: root.theme; title: "启动与更新"; iconName: "refresh-cw"; visible: root.currentSection === 5
+                        width: parent.width; theme: root.theme; title: "启动与更新"; iconName: "refresh-cw"; visible: root.currentSection === 6
                         GlassSwitch {
                             objectName: "autoStartSwitch"
                             width: parent.width; theme: root.theme; text: "开机自启"

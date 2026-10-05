@@ -23,8 +23,8 @@ constexpr int kSamplesPerServer = 2;
 constexpr int kMaxHosts = 3;
 constexpr int kTargetSamples = 3;
 
-/// 授时源顺序。《NATIVE_PORT_SPEC》 §13.2。
-const QStringList& sntpHosts() {
+/// 内置授时源顺序。《NATIVE_PORT_SPEC》 §13.2。
+const QStringList& builtinSntpHosts() {
     static const QStringList hosts = {
         QStringLiteral("ntp.aliyun.com"),
         QStringLiteral("ntp1.aliyun.com"),
@@ -33,6 +33,15 @@ const QStringList& sntpHosts() {
         QStringLiteral("time.apple.com"),
     };
     return hosts;
+}
+
+/// 规范化用户输入的自定义主机名：去空白与 `ntp://` 前缀 / 结尾斜杠。
+QString normalizeHost(const QString& raw) {
+    QString host = raw.trimmed();
+    if (host.startsWith(QStringLiteral("ntp://"), Qt::CaseInsensitive))
+        host = host.mid(6);
+    while (host.endsWith(QLatin1Char('/'))) host.chop(1);
+    return host.trimmed();
 }
 
 struct HttpSource {
@@ -98,6 +107,22 @@ void NtpClock::setEnabled(bool enabled) {
         if (running_) scheduleNext(kNormalIntervalMs);
     }
     emit changed();
+}
+
+void NtpClock::setCustomServer(const QString& host) {
+    const QString normalized = normalizeHost(host);
+    if (customServer_ == normalized) return;
+    customServer_ = normalized;
+    // 启用且正在运行时，立即按新的主机顺序重校一次。
+    if (running_ && enabled_) refresh();
+}
+
+QStringList NtpClock::sntpHosts() const {
+    QStringList hosts;
+    if (!customServer_.isEmpty()) hosts << customServer_;
+    for (const QString& host : builtinSntpHosts())
+        if (!hosts.contains(host)) hosts << host;
+    return hosts;
 }
 
 QVariantMap NtpClock::info() const {

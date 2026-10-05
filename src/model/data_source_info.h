@@ -44,9 +44,10 @@ struct DataSourceInfo {
     }
 };
 
-/// v1 仅 Wolfx。
+/// 数据源唯一标识。
 namespace SourceIds {
 inline const QString kWolfx = QStringLiteral("wolfx");
+inline const QString kPancakes = QStringLiteral("pancakes");
 }
 
 } // namespace komira

@@ -62,19 +62,19 @@ struct MaxIntensity {
 };
 
 double jmaTextToRaw(const QString& s) {
-    if (s == QStringLiteral("5弱")) return 5.0;
-    if (s == QStringLiteral("5強") || s == QStringLiteral("5强")) return 5.5;
-    if (s == QStringLiteral("6弱")) return 6.0;
-    if (s == QStringLiteral("6強") || s == QStringLiteral("6强")) return 6.5;
+    if (s == QStringLiteral("5弱") || s == QStringLiteral("5-")) return 5.0;
+    if (s == QStringLiteral("5強") || s == QStringLiteral("5强") || s == QStringLiteral("5+")) return 5.5;
+    if (s == QStringLiteral("6弱") || s == QStringLiteral("6-")) return 6.0;
+    if (s == QStringLiteral("6強") || s == QStringLiteral("6强") || s == QStringLiteral("6+")) return 6.5;
     if (s == QStringLiteral("7")) return 7.0;
     bool ok = false;
     const double d = s.toDouble(&ok);
     return ok ? d : 0.0;
 }
 
-MaxIntensity parseMaxIntensity(const QJsonObject& obj, IntensityStandard standard) {
+MaxIntensity parseMaxIntensityImpl(const QJsonObject& obj, IntensityStandard standard) {
     MaxIntensity result;
-    const auto value = firstValue(obj, {"MaxIntensity", "epiIntensity", "intensity"});
+    const auto value = firstValue(obj, {"MaxIntensity", "epiIntensity", "maxIntensity", "intensity"});
     if (!value) return result;
 
     if (value->isDouble()) {
@@ -250,7 +250,7 @@ std::optional<EarthquakeEvent> EewParser::parse(const QJsonObject& obj,
     const long long originTime =
         parseTime(firstString(obj, {"OriginTime", "originTime", "shockTime", "time"}).value_or(QString()));
 
-    const MaxIntensity maxIntensity = parseMaxIntensity(obj, standard);
+    const MaxIntensity maxIntensity = parseMaxIntensityImpl(obj, standard);
     EarthquakeEvent event = buildEvent(idPrefix + rawId, rawId, *magnitude, *latitude, *longitude, depth, location,
                       originTime != 0 ? originTime : nowMs, sourceTitle, user, standard,
                       maxIntensity.text, maxIntensity.raw, reportNum, isFinal, isCanceled);
@@ -281,7 +281,7 @@ std::optional<EarthquakeEvent> EewParser::parseCencDirectory(const QJsonObject& 
                            ? QStringLiteral("cenc_%1_%2").arg(origin).arg(*latitude, 0, 'f', 2)
                            : QStringLiteral("cenc_") + rawEventId;
 
-    const MaxIntensity maxIntensity = parseMaxIntensity(obj, standard);
+    const MaxIntensity maxIntensity = parseMaxIntensityImpl(obj, standard);
     EarthquakeEvent event = buildEvent(id, rawEventId, *magnitude, *latitude, *longitude, depth,
                                        location, origin, sourceTitle, user, standard,
                                        maxIntensity.text, maxIntensity.raw, 1, true, false);
@@ -290,6 +290,12 @@ std::optional<EarthquakeEvent> EewParser::parseCencDirectory(const QJsonObject& 
         event.warningLevel = WarningLevel::Watch;
     }
     return event;
+}
+
+EewParser::MaxIntensityValue EewParser::parseMaxIntensity(const QJsonObject& obj,
+                                                          IntensityStandard standard) {
+    const MaxIntensity m = parseMaxIntensityImpl(obj, standard);
+    return MaxIntensityValue{m.raw, m.text};
 }
 
 } // namespace komira

@@ -78,6 +78,10 @@ ApplicationWindow {
         backdropSource: map.renderLayer
         event: window.hudEvent; active: window.hudActive
         selected: !!event && app.isMapFocused(event.id)
+        pageIndex: app.hudIndex
+        pageCount: app.hudCount
+        onPrevPage: app.hudPrev()
+        onNextPage: app.hudNext()
     }
     // 左下角数据源状态：名称按连接状态着色（对齐 kanameishi）。
     GlassCard {
@@ -89,13 +93,17 @@ ApplicationWindow {
         width: sourceRow.implicitWidth + 24; height: 34; radius: 10
         visible: !window.showSettings
         readonly property color statusColor: appTheme.connectionColor(app.sourceInfo.statusTag)
-        Row {
+        RowLayout {
             id: sourceRow
             anchors.centerIn: parent; spacing: 8
-            AppIcon { anchors.verticalCenter: parent.verticalCenter; name: "radio"; size: 13; color: sourceBadge.statusColor }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "数据源"; color: appTheme.outline; font.pixelSize: 11 }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: app.sourceInfo.name; color: sourceBadge.statusColor; font.pixelSize: 11; font.weight: Font.Medium }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: app.sourceInfo.status; color: appTheme.outline; font.pixelSize: 10 }
+            AppIcon {
+                Layout.alignment: Qt.AlignVCenter
+                Layout.preferredWidth: 13; Layout.preferredHeight: 13
+                name: "radio"; size: 13; color: sourceBadge.statusColor
+            }
+            Text { Layout.alignment: Qt.AlignVCenter; text: "数据源"; color: appTheme.outline; font.pixelSize: 11 }
+            Text { Layout.alignment: Qt.AlignVCenter; text: app.sourceInfo.name; color: sourceBadge.statusColor; font.pixelSize: 11; font.weight: Font.Medium }
+            Text { Layout.alignment: Qt.AlignVCenter; text: app.sourceInfo.status; color: appTheme.outline; font.pixelSize: 10 }
         }
     }
     GlassCard {
@@ -107,12 +115,25 @@ ApplicationWindow {
         readonly property bool synced: app.clockInfo.synced === true
         property string timeText: ""
         Timer { interval: 1000; running: true; repeat: true; triggeredOnStart: true; onTriggered: clockBadge.timeText = app.clockTextUtc8() }
-        Row {
+        RowLayout {
             id: badgeRow
             anchors.centerIn: parent; spacing: 8
-            AppIcon { anchors.verticalCenter: parent.verticalCenter; name: "clock"; size: 13; color: clockBadge.synced ? appTheme.clockSynced : appTheme.clockUnsynced }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: clockBadge.timeText; color: clockBadge.synced ? appTheme.clockSynced : appTheme.clockUnsynced; font.family: appTheme.numberFamily; font.pixelSize: 11 }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "UTC+8"; color: appTheme.outline; font.pixelSize: 10 }
+            AppIcon {
+                Layout.alignment: Qt.AlignVCenter
+                Layout.preferredWidth: 13; Layout.preferredHeight: 13
+                name: "clock"; size: 13
+                color: clockBadge.synced ? appTheme.clockSynced : appTheme.clockUnsynced
+            }
+            Text {
+                Layout.alignment: Qt.AlignVCenter
+                text: clockBadge.timeText
+                color: clockBadge.synced ? appTheme.clockSynced : appTheme.clockUnsynced
+                font.family: appTheme.numberFamily; font.pixelSize: 11
+            }
+            Text {
+                Layout.alignment: Qt.AlignVCenter
+                text: "UTC+8"; color: appTheme.outline; font.pixelSize: 10
+            }
         }
     }
     EventListSidebar {
@@ -137,8 +158,9 @@ ApplicationWindow {
         anchors.top: hud.bottom
         anchors.topMargin: 8
         width: hud.width
-        visible: !!app.activeWarning && hud.visible && app.settings.enableFullScreenWarning
+        visible: !!app.activeWarning && hud.visible && app.alertEligible
         theme: appTheme
+        backdropSource: map.renderLayer
         event: app.activeWarning
         countdown: app.countdown
         onMuted: app.muteWarning()

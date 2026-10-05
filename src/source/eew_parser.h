@@ -20,6 +20,15 @@ public:
 
     using UserLocation = std::optional<std::pair<double, double>>;
 
+    /// 源报最大烈度（数值 + 展示文本），供 EEW/目录/Pancakes 各解析器复用。
+    struct MaxIntensityValue {
+        double raw = 0.0;
+        QString text;
+    };
+
+    /// 从 `MaxIntensity` / `epiIntensity` / `maxIntensity` / `intensity` 中取最大烈度。
+    static MaxIntensityValue parseMaxIntensity(const QJsonObject& obj, IntensityStandard standard);
+
     static std::optional<EarthquakeEvent> parse(const QJsonObject& obj,
                                                 const UserLocation& user,
                                                 IntensityStandard standard,

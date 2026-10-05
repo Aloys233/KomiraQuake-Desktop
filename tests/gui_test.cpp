@@ -66,6 +66,7 @@ private slots:
         controller.nowProvider_ = [&] { return now; };
         controller.settings()->setEnableSoundAlert(false);
         controller.settings()->setEnableSpeech(false);
+        controller.settings()->setEnableWarnings(true);
         controller.settings()->setLocalIntensityFilter(2.0);
         EarthquakeEvent e;
         e.id = e.eventId = "GUI-A";
@@ -76,13 +77,13 @@ private slots:
         QVERIFY(!controller.announcer_->eligible(e)); // 烈度低于过滤阈值，被拦截
         e.rawIntensity = 2.5;
         QVERIFY(controller.announcer_->eligible(e)); // 烈度达到过滤阈值，通过
+        // 总开关关闭：只展示，不提醒。
+        controller.settings()->setEnableWarnings(false);
+        QVERIFY(!controller.announcer_->eligible(e));
+        controller.settings()->setEnableWarnings(true);
         controller.settings()->setLocalIntensityFilter(0.0);
         e.distanceKm = -1;
-        controller.settings()->setMinListenMagnitude(4);
-        e.magnitude = 3;
-        controller.handleEvent(e, false, false);
-        QVERIFY(!controller.hasWarning());
-        e.magnitude = 5.6;
+        // 不做震级过滤：任何实时事件都进入生命周期用于展示。
         controller.handleEvent(e, false, false);
         QVERIFY(controller.hasWarning());
         QVERIFY(controller.warningOverlayVisible());
@@ -211,8 +212,8 @@ private slots:
         controller.handleEvent(b, false, false);
         QVERIFY(!controller.hasWarning());
         QVERIFY(screenshot("04-stopped"));
-        // Expiry is controller-owned even when the warning card is disabled.
-        controller.settings()->setEnableFullScreenWarning(false);
+        // Expiry is controller-owned even when the warning switch is disabled.
+        controller.settings()->setEnableWarnings(false);
         auto c = e; c.id = c.eventId = "GUI-C";
         controller.handleEvent(c, false, false);
         QVERIFY(controller.countdownTimer_.isActive());
@@ -364,7 +365,7 @@ private slots:
         QCOMPARE(background->property("color").value<QColor>(), lightBackground);
         QVERIFY(capture("settings-selected-light"));
 
-        const QStringList categories = {"appearance", "location", "warning", "audio", "source", "about"};
+        const QStringList categories = {"appearance", "location", "warning", "audio", "source", "clock", "about"};
         for (int index = 0; index < categories.size(); ++index) {
             QVERIFY(click("settingsNav-" + categories[index]));
             QTRY_COMPARE(page->property("currentSection").toInt(), index);

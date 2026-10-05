@@ -99,7 +99,7 @@ Item {
         if (!hasUser) return;
         following = false;
         userMovedCamera = true;
-        moveCamera(shiftedUser.lat, shiftedUser.lon, 6.5, cameraDuration);
+        moveCamera(shiftedUser.lat, shiftedUser.lon, 6, cameraDuration);
     }
     /// 还原默认视野：停止跟随，回到用户位置（无定位时回到全国概览）。
     function resetView() {
@@ -115,8 +115,9 @@ Item {
     }
     /// 中国版图范围（大陆 + 海南 + 台湾，含四至点），用于无定位时的全国概览取景。
     readonly property var chinaBounds: ({ lonMin: 73.5, lonMax: 135.1, latMin: 18.0, latMax: 53.6 })
-    /// 按中国范围自动取景：缩放到版图刚好铺满可视区（扣除左侧 HUD 与右侧工具条遮挡），
-    /// 再把版图中心对齐到可视区中心。取代原先写死的 `zoom 6`。
+    /// 按中国范围自动取景：缩放到版图铺满可视区（扣除左侧 HUD 与右侧工具条遮挡），
+    /// 再把版图中心对齐到可视区中心。取整到**整数层级**（对齐 Leaflet fitBounds 的 floor 行为），
+    /// 保证静止时瓦片 1:1 渲染、无缩放拉伸。取代原先写死的 `zoom 6`。
     function frameChina(animate) {
         if (width <= 0 || height <= 0) return;
         const b = chinaBounds;
@@ -126,7 +127,7 @@ Item {
         const right = 76, top = 80, bottom = 64;
         const availableW = Math.max(80, width - left - right);
         const availableH = Math.max(80, height - top - bottom);
-        const z = Math.max(1, Math.min(12, Math.log2(Math.min(availableW / (x1 - x0), availableH / (y1 - y0)))));
+        const z = Math.max(1, Math.min(12, Math.floor(Math.log2(Math.min(availableW / (x1 - x0), availableH / (y1 - y0))))));
         const scale = Math.pow(2, z);
         const lat = unprojLat((y0 + y1) / 2 - (top - bottom) / (2 * scale), 0);
         const lon = unprojLon((x0 + x1) / 2 - (left - right) / (2 * scale), 0);
@@ -163,19 +164,27 @@ Item {
         const right = 76, top = 80, bottom = 64;
         const availableW = Math.max(80, width - left - right);
         const availableH = Math.max(80, height - top - bottom);
-        const z = Math.max(1, Math.min(12, Math.log2(Math.min(availableW / (maxX - minX), availableH / (maxY - minY)))));
+        const z = Math.max(1, Math.min(12, Math.floor(Math.log2(Math.min(availableW / (maxX - minX), availableH / (maxY - minY))))));
         const scale = Math.pow(2, z);
         const lat = unprojLat((minY + maxY) / 2 - (top - bottom) / (2 * scale), 0);
         const lon = unprojLon((minX + maxX) / 2 - (left - right) / (2 * scale), 0);
         moveCamera(lat, lon, z, animate === false ? 0 : cameraDuration);
     }
+    /// 当前（或目标）整数缩放层级：相机动画进行中取动画目标，否则取当前值。
+    /// 以目标为基准，快速连续滚动时每一格都实打实 ±1，不会被进行中的补间吞掉。
+    readonly property int zoomLevel: cameraMove.running ? Math.round(camZoom.to) : Math.round(zoom)
+
+    /// 滚轮/按钮缩放：每次动作按整数层级步进，并吸附到整数 z（对齐参考项目 Leaflet 的整数缩放）。
+    /// 整数层级下瓦片以 1:1 像素渲染（tileScale == 1），不会因非整数倍拉伸而发虚或反复切层。
     function zoomAt(x, y, delta) {
         following = false;
         userMovedCamera = true;
+        const level = zoomLevel;
+        const z = clampZoom(level + delta);
+        if (z === level) return;   // 已到缩放上下限，避免原地抖动
         const oldSize = worldSize(zoom);
         const anchorX = (projX(centerLon, zoom) + x - width / 2) / oldSize;
         const anchorY = (projY(centerLat, zoom) + y - height / 2) / oldSize;
-        const z = clampZoom(zoom + delta);
         const lat = unprojLat(anchorY * worldSize(z) - y + height / 2, z);
         const lon = unprojLon(anchorX * worldSize(z) - x + width / 2, z);
         moveCamera(lat, lon, z, zoomDuration);
@@ -517,9 +526,16 @@ Item {
         property real lastY: 0
         property real pressX: 0
         property real pressY: 0
+        /// 滚轮增量累积器：凑满一格（angleDelta 120 = 一个刻度）才步进一级，
+        /// 兼容高精度滚轮/触摸板的碎增量；一格刻度固定 = z 整数级 ±1。
+        property real wheelAccum: 0
         onWheel: (wheel) => {
-            const delta = wheel.angleDelta.y / 120;
-            root.zoomAt(wheel.x, wheel.y, delta * 0.5);
+            wheelAccum += wheel.angleDelta.y;
+            const notches = Math.trunc(wheelAccum / 120);
+            if (notches !== 0) {
+                wheelAccum -= notches * 120;
+                root.zoomAt(wheel.x, wheel.y, notches);
+            }
             wheel.accepted = true;
         }
         onPressed: (mouse) => {

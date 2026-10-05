@@ -34,6 +34,9 @@ public:
     bool isEnabled() const { return enabled_; }
     void setEnabled(bool enabled);
 
+    /// 自定义 SNTP 主机名；留空则仅用内置列表。变更后（启用时）会立即重校一次。
+    void setCustomServer(const QString& host);
+
     /// 供 QML：`{ enabled, state, detail }`。
     Q_INVOKABLE QVariantMap info() const;
 
@@ -50,6 +53,8 @@ private:
     void beginCalibration();
 
     void querySntp();
+    /// 实际尝试的主机顺序：自定义（若非空）优先，其后为内置列表（去重）。
+    QStringList sntpHosts() const;
     void onHostResolved(const QHostInfo& info);
     void onUdpReadyRead();
     void onQueryTimeout();
@@ -72,6 +77,7 @@ private:
 
     bool enabled_ = true;
     bool running_ = false;
+    QString customServer_;
 
     std::vector<ntp::Sample> samples_;
     int hostIndex_ = 0;

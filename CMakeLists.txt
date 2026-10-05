@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(KomiraQuake VERSION 1.0.2 LANGUAGES CXX)
+project(KomiraQuake VERSION 1.0.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,6 +27,8 @@ qt_add_executable(komiraquake
     # source
     src/source/eew_parser.cpp
     src/source/wolfx_source.cpp
+    src/source/pancakes_parser.cpp
+    src/source/pancakes_source.cpp
 
     # store / prefs
     src/store/history_store.cpp
@@ -104,6 +106,10 @@ qt_add_qml_module(komiraquake
 file(GLOB KOMIRA_ICON_FILES CONFIGURE_DEPENDS qml/icons/*.svg qml/icons/LICENSE.txt)
 qt_add_resources(komiraquake lucide_icons PREFIX "/icons" BASE "qml/icons" FILES ${KOMIRA_ICON_FILES})
 
+# Google Sans（OFL）静态拉丁子集，见 tools/import_google_sans.py；打包进二进制避免依赖系统字体。
+file(GLOB KOMIRA_FONT_FILES CONFIGURE_DEPENDS fonts/*.ttf fonts/OFL.txt)
+qt_add_resources(komiraquake komira_fonts PREFIX "/fonts" BASE "fonts" FILES ${KOMIRA_FONT_FILES})
+
 # 资源（travel_times.json / sounds）拷贝到可执行文件旁的 assets/
 add_custom_command(TARGET komiraquake POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -150,6 +156,7 @@ if(BUILD_TESTING)
         src/core/ip_geo_lookup.cpp src/service/location_service.cpp
         src/core/travel_table.cpp src/core/travel_time_service.cpp
         src/source/eew_parser.cpp src/source/wolfx_source.cpp
+        src/source/pancakes_parser.cpp src/source/pancakes_source.cpp
         src/store/history_store.cpp src/prefs/settings_store.cpp)
     target_include_directories(qt_business_test PRIVATE src)
     target_link_libraries(qt_business_test PRIVATE Qt6::Test Qt6::Network Qt6::WebSockets Qt6::Sql)
@@ -164,6 +171,7 @@ if(BUILD_TESTING)
         Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::WebSockets Qt6::Sql
         Qt6::Multimedia Qt6::TextToSpeech Qt6::Svg)
     qt_add_resources(gui_test test_lucide_icons PREFIX "/icons" BASE "qml/icons" FILES ${KOMIRA_ICON_FILES})
+    qt_add_resources(gui_test test_komira_fonts PREFIX "/fonts" BASE "fonts" FILES ${KOMIRA_FONT_FILES})
     qt_add_resources(gui_test test_qml PREFIX "/qt/qml/KomiraQuake" FILES ${KOMIRA_QML_FILES})
     add_test(NAME qt_gui COMMAND gui_test)
     set_tests_properties(qt_gui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software")
