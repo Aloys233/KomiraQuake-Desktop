@@ -51,6 +51,10 @@ EventGateDecision EventGate::admit(const EarthquakeEvent& event, long long nowMs
     if (event.reportNum < prev.event.reportNum) return EventGateDecision::Stale;
     if (event.reportNum == prev.event.reportNum) {
         if (sameBody(event, prev.event)) return EventGateDecision::Duplicate;
+        // 跨聚合商同报次：现任优先（先到者胜）。两路转发的同一报文若字段有细微差异，
+        // 会随各自轮询反复互相覆盖而抖动；只有更高报次才接管。
+        if (event.sourceProvider != prev.event.sourceProvider) return EventGateDecision::Duplicate;
+        // 同一聚合商的同报次修正仍然生效。
         prev.event = event;
         return EventGateDecision::Correction;
     }

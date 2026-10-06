@@ -80,7 +80,7 @@ PancakesParsed build(const QString& source,
                      long long sourceUpdatedAt,
                      const EewParser::UserLocation& user,
                      IntensityStandard standard,
-                     PancakesKind kind) {
+                     SourceEventKind kind) {
     EarthquakeEvent event;
     event.id = (prefixFor(source) + rawEventId).toStdString();
     event.eventId = (source + QStringLiteral(":") + rawEventId).toStdString();
@@ -101,7 +101,7 @@ PancakesParsed build(const QString& source,
     event.isCanceled = isCanceled;
 
     EewParser::recompute(event, user, standard);
-    if (kind == PancakesKind::Directory) {
+    if (kind == SourceEventKind::Directory) {
         // 目录永不产生 warning/critical：若有则降级为 watch。
         if (event.warningLevel == WarningLevel::Critical || event.warningLevel == WarningLevel::Warning)
             event.warningLevel = WarningLevel::Watch;
@@ -119,7 +119,7 @@ std::optional<PancakesParsed> parseGq(const QString& action, const QJsonObject& 
         return build(PancakesProtocol::sourceGq(), *rawId, 0.0, 0.0, 0.0, EewParser::kDefaultDepth,
                      QStringLiteral("已取消"), envelopeTime, QString(), 0.0,
                      PancakesProtocol::kCancelReportNum, false, true, envelopeTime,
-                     user, standard, PancakesKind::Live);
+                     user, standard, SourceEventKind::Live);
     }
     const auto latitude = firstDouble(payload, QStringLiteral("latitude"));
     const auto longitude = firstDouble(payload, QStringLiteral("longitude"));
@@ -135,7 +135,7 @@ std::optional<PancakesParsed> parseGq(const QString& action, const QJsonObject& 
                  location, origin, max.text, max.raw, revision + 1,
                  action == QLatin1String("archived"), false,
                  firstLong(payload, QStringLiteral("lastUpdateMs")).value_or(0),
-                 user, standard, PancakesKind::Live);
+                 user, standard, SourceEventKind::Live);
 }
 
 std::optional<PancakesParsed> parseUsgs(const QString& action, const QJsonObject& payload,
@@ -156,7 +156,7 @@ std::optional<PancakesParsed> parseUsgs(const QString& action, const QJsonObject
                  location, origin, QString(), 0.0, 1,
                  infoType == QLatin1String("Reviewed"), false,
                  firstLong(payload, QStringLiteral("updatedTimeMs")).value_or(0),
-                 user, standard, PancakesKind::Live);
+                 user, standard, SourceEventKind::Live);
 }
 
 std::optional<PancakesParsed> parseJmaEew(const QJsonObject& payload, long long envelopeTime,
@@ -185,7 +185,7 @@ std::optional<PancakesParsed> parseJmaEew(const QJsonObject& payload, long long 
                  location, origin, max.text, max.raw, serial,
                  payload.value("isFinal").toBool(false), canceled,
                  EewParser::parseTime(firstString(payload, QStringLiteral("AnnouncedTime")).value_or(QString())),
-                 user, standard, PancakesKind::Live);
+                 user, standard, SourceEventKind::Live);
 }
 
 std::optional<PancakesParsed> parseJmaEqlist(const QString& action, const QJsonObject& payload,
@@ -216,7 +216,7 @@ std::optional<PancakesParsed> parseJmaEqlist(const QString& action, const QJsonO
     return build(PancakesProtocol::sourceJmaEqlist(), *rawId, magnitude, *latitude, *longitude, depth,
                  location, origin, max.text, max.raw, serial, true, canceled,
                  EewParser::parseTime(reportTimeText),
-                 user, standard, PancakesKind::Directory);
+                 user, standard, SourceEventKind::Directory);
 }
 
 } // namespace
@@ -266,7 +266,7 @@ std::optional<EarthquakeEvent> PancakesParser::parseListItem(const QJsonObject& 
     return build(source, *rawId, magnitude, *latitude, *longitude, depth, location, origin,
                  max.text, max.raw, 1, status == QLatin1String("archived"),
                  status == QLatin1String("cancelled"), updated,
-                 user, standard, PancakesKind::Directory)
+                 user, standard, SourceEventKind::Directory)
         .event;
 }
 

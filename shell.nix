@@ -22,7 +22,6 @@ pkgs.mkShell {
     qt6.qtwebsockets
     qt6.qtsvg
     qt6.qtmultimedia
-    qt6.qtspeech
   ];
 
   shellHook = ''

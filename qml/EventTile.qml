@@ -56,28 +56,17 @@ GlassCard {
                 AppIcon { visible: root.isFocused; name: "map-pin"; size: 13; color: root.theme.accent; Layout.alignment: Qt.AlignVCenter }
             }
 
-            // 发震时刻写全，置于中部；来源标注靠右，二者按基线对齐。
-            RowLayout {
+            // 发震时刻独占一行：不参与任何伸缩，始终完整显示。
+            Text {
                 Layout.fillWidth: true
-                spacing: 8
-                Text {
-                    Layout.fillWidth: true
-                    Layout.alignment: Qt.AlignBaseline
-                    text: root.event ? root.event.timeText + "  UTC+8" : ""
-                    color: root.theme.outline
-                    font.family: root.theme.numberFamily
-                    font.pixelSize: 12
-                    elide: Text.ElideRight
-                }
-                Text {
-                    Layout.alignment: Qt.AlignBaseline
-                    text: root.event ? root.event.sourceTag : ""
-                    color: root.theme.outline
-                    font.pixelSize: 11
-                }
+                text: root.event ? root.event.timeText + "  UTC+8" : ""
+                color: root.theme.outline
+                font.family: root.theme.numberFamily
+                font.pixelSize: 12
+                elide: Text.ElideRight
             }
 
-            // 震级与深度/距离：同一字体族并按基线对齐，避免大小不一显得错位。
+            // 震级与深度：同一字体族并按基线对齐；右侧为数据源标注。
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 8
@@ -92,10 +81,16 @@ GlassCard {
                 Text {
                     Layout.fillWidth: true
                     Layout.alignment: Qt.AlignBaseline
-                    text: root.event ? "深度 " + root.event.depthText + " km"
-                          + (root.event.hasDistance ? " · 距你 " + root.event.distanceText + " km" : " · 距离未知") : ""
+                    text: root.event ? "深度 " + root.event.depthText + " km" : ""
                     color: root.theme.outline
                     font.pixelSize: 12
+                    elide: Text.ElideRight
+                }
+                Text {
+                    Layout.alignment: Qt.AlignBaseline
+                    text: root.event ? root.event.sourceTag : ""
+                    color: root.theme.outline
+                    font.pixelSize: 11
                     elide: Text.ElideRight
                 }
             }

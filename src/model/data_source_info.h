@@ -48,6 +48,10 @@ struct DataSourceInfo {
 namespace SourceIds {
 inline const QString kWolfx = QStringLiteral("wolfx");
 inline const QString kPancakes = QStringLiteral("pancakes");
+inline const QString kJian = QStringLiteral("jian");
+inline const QString kWhews = QStringLiteral("whews");
+/// 自建模拟源（仅开发自测）。由开发者模式 + 地址双重门控，不在默认禁用集内。
+inline const QString kSimulated = QStringLiteral("simulated");
 }
 
 } // namespace komira

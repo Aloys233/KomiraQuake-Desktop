@@ -1,9 +1,11 @@
 #include <QtTest>
+#include <QDateTime>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkAccessManager>
 #include <QSettings>
+#include <QSet>
 #include <QSignalSpy>
 #include <QSqlDatabase>
 #include <QSqlQuery>
@@ -14,20 +16,29 @@
 #include <functional>
 
 #include "core/ip_geo_lookup.h"
+#include "core/quake_calculator.h"
 #include "core/travel_time_service.h"
 #include "core/version_compare.h"
 #include "core/warning_session.h"
 #include "model/data_source_info.h"
 #include "prefs/settings_store.h"
 #include "source/eew_parser.h"
+#include "source/jian_parser.h"
 #include "source/pancakes_parser.h"
 #include "source/pancakes_protocol.h"
+#include "source/simulated_parser.h"
+#include "source/simulated_protocol.h"
+#include "source/whews_parser.h"
+#include "source/whews_protocol.h"
 #include "store/history_store.h"
 
 // No production clock/network seam exists for message injection. Restrict access
-// widening to this header; all of its Qt/STL dependencies are included above.
+// widening to these headers; all of their Qt/STL dependencies are included above.
+// 合成一段而非多段：moc 处理本文件时也会看到这些宏，分段会让 vtable 声明失配。
 #define private public
 #include "source/wolfx_source.h"
+#include "source/whews_source.h"
+#include "source/simulated_source.h"
 #undef private
 
 using namespace komira;
@@ -73,7 +84,7 @@ private slots:
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settingsDir_.path());
         QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, settingsDir_.path());
         qRegisterMetaType<EarthquakeEvent>();
-        qRegisterMetaType<WolfxEventKind>();
+        qRegisterMetaType<SourceEventKind>();
         const QString asset = QFINDTESTDATA("../assets/travel_times.json");
         QVERIFY2(!asset.isEmpty(), "The real travel asset must be available; do not silently use fallback speeds");
         QVERIFY(TravelTimeService::instance().loadFromFile(asset));
@@ -174,6 +185,128 @@ private slots:
         QCOMPARE(session.active.size(), size_t(1));
     }
 
+    // 跨聚合商的同一份 JMA EEW 报文：identity 不含 provider，二者落进同一会话；
+    // 同报次现任优先（不抖动），更高报次由另一路接管（互为备份）。
+    void crossSourceLiveReportsMergeIntoOneSession() {
+        WarningSession session;
+        auto wolfx = makeEvent();
+        wolfx.sourceProvider = "Wolfx";
+        wolfx.sourceAgency = "JMA";
+        wolfx.eventId = "jma_eew:20261005223109";
+        wolfx.reportNum = 4;
+        wolfx.magnitude = 4.6;
+        auto pancakes = wolfx;
+        pancakes.sourceProvider = "Pancakes";
+        pancakes.magnitude = 4.7;   // 同报次、字段略有差异
+        QCOMPARE(wolfx.identity(), pancakes.identity());
+
+        QCOMPARE(session.accept(wolfx, origin), WarningSession::Change::Added);
+        // 同报次的另一聚合商：现任优先 → 不覆盖、不新增。
+        QCOMPARE(session.accept(pancakes, origin + 1), WarningSession::Change::Ignored);
+        QCOMPARE(session.active.size(), size_t(1));
+        QCOMPARE(session.active.at(wolfx.identity()).event.magnitude, 4.6);
+
+        // 更高报次由另一路接管。
+        pancakes.reportNum = 5;
+        pancakes.magnitude = 4.8;
+        QCOMPARE(session.accept(pancakes, origin + 2), WarningSession::Change::Updated);
+        QCOMPARE(session.active.size(), size_t(1));
+        auto& state = session.active.at(wolfx.identity()).event;
+        QCOMPARE(state.magnitude, 4.8);
+        QCOMPARE(QString::fromStdString(state.sourceProvider), QStringLiteral("Pancakes"));
+
+        // 任一路取消 → 合并键落 tombstone，另一路后续报文被挡住、不复活。
+        pancakes.isCanceled = true;
+        QCOMPARE(session.accept(pancakes, origin + 3), WarningSession::Change::Ended);
+        wolfx.reportNum = 6;
+        wolfx.isCanceled = false;
+        QCOMPARE(session.accept(wolfx, origin + 4), WarningSession::Change::Ignored);
+        QVERIFY(session.active.empty());
+    }
+
+    // Jian（api.sismotide.top）：频道映射 + 字段解析 + 跨源合并键。
+    void jianRecordsMapToChannelsAndMergeKeys() {
+        // 未接入频道（气象/海啸等）不解析。
+        QVERIFY(jianChannelFor(QStringLiteral("weather")) == nullptr);
+        QVERIFY(jianChannelFor(QStringLiteral("jma-tsunami")) == nullptr);
+        const JianChannel* ceaChannel = jianChannelFor(QStringLiteral("cea"));
+        const JianChannel* cencChannel = jianChannelFor(QStringLiteral("cenc"));
+        const JianChannel* jmaEewChannel = jianChannelFor(QStringLiteral("jma-eew"));
+        const JianChannel* jmaChannel = jianChannelFor(QStringLiteral("jma"));
+        QVERIFY(ceaChannel && cencChannel && jmaEewChannel && jmaChannel);
+
+        // CEA 速报 → 告警链路；eventId 频道化后与 Wolfx cenc_eew 对齐。
+        auto cea = JianParser::parseRecord(
+            *ceaChannel,
+            QJsonObject{{"id", "202608201100.0001"}, {"number", 2}, {"originTime", static_cast<double>(1787194858000)},
+                        {"latitude", 35.789}, {"longitude", 115.7}, {"depth", 16}, {"magnitude", 4.1},
+                        {"placeName", "山东菏泽市郓城县"}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(cea.has_value());
+        QCOMPARE(QString::fromStdString(cea->sourceProvider), QStringLiteral("Jian"));
+        QCOMPARE(QString::fromStdString(cea->sourceAgency), QStringLiteral("CEA"));
+        QCOMPARE(QString::fromStdString(cea->eventId), QStringLiteral("cenc_eew:202608201100.0001"));
+        QCOMPARE(cea->reportNum, 2);
+        QCOMPARE(cea->timestamp, 1787194858000LL);
+        QVERIFY(!cea->isFinal);
+
+        // CENC 目录：id 去掉 _M/_A 后与 Wolfx cenc_eqlist 的 EventID 对齐；目录不产生高级别告警。
+        auto cenc = JianParser::parseRecord(
+            *cencChannel,
+            QJsonObject{{"id", "CD.20260819132221.000_M"}, {"originTime", static_cast<double>(1787116941000)},
+                        {"latitude", 37.84}, {"longitude", 95.62}, {"depth", 10.0}, {"magnitude", 3.7},
+                        {"placeName", "青海海西州直辖区"}, {"infoTypeName", "[正式测定]"}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(cenc.has_value());
+        QCOMPARE(QString::fromStdString(cenc->eventId), QStringLiteral("CD.20260819132221.000"));
+        QCOMPARE(QString::fromStdString(cenc->sourceAgency), QStringLiteral("CENC"));
+        QVERIFY(cenc->isFinal);
+        QVERIFY(cenc->warningLevel != WarningLevel::Critical && cenc->warningLevel != WarningLevel::Warning);
+
+        // JMA 速报（EEW）：originTime 是带 +09:00 的 ISO，必须按偏移解析。
+        const long long jstEpoch =
+            QDateTime::fromString(QStringLiteral("2026-08-20T08:38:21+09:00"), Qt::ISODate)
+                .toMSecsSinceEpoch();
+        auto jma = JianParser::parseRecord(
+            *jmaEewChannel,
+            QJsonObject{{"id", "20260820083831"}, {"originTime", "2026-08-20T08:38:21+09:00"},
+                        {"latitude", 36.5}, {"longitude", 140.6}, {"depth", 70.0}, {"magnitude", 3.5},
+                        {"placeName", "茨城県北部"}, {"infoTypeName", "予報"}, {"intensity", "2"},
+                        {"serial", 3}, {"isFinal", true}, {"isCancel", false}},
+            std::nullopt, IntensityStandard::Jma);
+        QVERIFY(jma.has_value());
+        QCOMPARE(jma->timestamp, jstEpoch);
+        QCOMPARE(QString::fromStdString(jma->eventId), QStringLiteral("jma_eew:20260820083831"));
+        QCOMPARE(QString::fromStdString(jma->sourceAgency), QStringLiteral("JMA"));
+        QCOMPARE(QString::fromStdString(jma->maxIntensityText), QStringLiteral("2"));
+        QCOMPARE(jma->reportNum, 3);
+        QVERIFY(jma->isFinal);
+
+        // JMA 速报（目录）：infoType=取消 → 取消报。
+        auto jmaCancel = JianParser::parseRecord(
+            *jmaChannel,
+            QJsonObject{{"id", "20260820094551"}, {"originTime", "2026-08-20T09:45:00+09:00"},
+                        {"latitude", 32.6}, {"longitude", 130.7}, {"depth", 10.0}, {"magnitude", 2.3},
+                        {"placeName", "熊本県熊本地方"}, {"infoType", "取消"}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(jmaCancel.has_value());
+        QVERIFY(jmaCancel->isCanceled);
+        QCOMPARE(QString::fromStdString(jmaCancel->eventId), QStringLiteral("jma_eqlist:20260820094551"));
+
+        // 必填字段缺失 → 丢弃。
+        QVERIFY(!JianParser::parseRecord(*cencChannel,
+                                        QJsonObject{{"id", "x"}, {"originTime", static_cast<double>(1787116941000)}},
+                                        std::nullopt, IntensityStandard::Csis).has_value());
+    }
+
+    void jianAuthTokenParsing() {
+        QCOMPARE(JianParser::parseAuthToken(QByteArrayLiteral("{\"ok\":true,\"token\":\"rt_x\"}"))
+                     .value_or(QString()),
+                 QStringLiteral("rt_x"));
+        QVERIFY(!JianParser::parseAuthToken(QByteArrayLiteral("{\"ok\":false,\"code\":4101}")).has_value());
+        QVERIFY(!JianParser::parseAuthToken(QByteArrayLiteral("not json")).has_value());
+    }
+
     void hiddenMutedStopAndReplay() {
         WarningSession session;
         auto a = makeEvent();
@@ -243,42 +376,95 @@ private slots:
         SettingsStore settings;
         QSignalSpy changed(&settings, &SettingsStore::changed);
         QVERIFY(changed.isValid());
-        settings.setEnabledWolfx(false);
+        settings.setSourceEnabled("wolfx", false);
         QCOMPARE(changed.count(), 1);
-        settings.setEnabledWolfx(false);
+        settings.setSourceEnabled("wolfx", false);
         QCOMPARE(changed.count(), 1);
         settings.setIsMuted(true);
         settings.setIntensityStandard(1);
         QCOMPARE(changed.count(), 3);
         SettingsStore reloaded;
-        QVERIFY(!reloaded.enabledWolfx());
+        QVERIFY(!reloaded.isSourceEnabled("wolfx"));
         QVERIFY(reloaded.isMuted());
         QCOMPARE(reloaded.intensityStandard(), 1);
         settings.resetToDefaults();
         QCOMPARE(changed.count(), 4);
-        QVERIFY(settings.enabledWolfx());
+        QVERIFY(settings.isSourceEnabled("wolfx"));
         QVERIFY(!settings.isMuted());
         QCOMPARE(settings.intensityStandard(), 0);
+    }
+
+    // 需要鉴权的源默认关闭，且未填凭据前不建立连接。
+    void credentialSourcesAreOffByDefault() {
+        QSettings().clear();
+        SettingsStore settings;
+        QVERIFY(!settings.isSourceEnabled(QStringLiteral("jian")));
+        QVERIFY(settings.isSourceEnabled(QStringLiteral("wolfx")));
+        QVERIFY(settings.isSourceEnabled(QStringLiteral("pancakes")));
+        QVERIFY(!settings.jianConfigured());
+        // 手动开启后仍保持"已配置=假"，直到登录成功写入刷新令牌。
+        settings.setSourceEnabled(QStringLiteral("jian"), true);
+        QVERIFY(settings.isSourceEnabled(QStringLiteral("jian")));
+        QVERIFY(!settings.jianConfigured());
+        settings.setJianRefreshToken(QStringLiteral("rt_x"));
+        QVERIFY(settings.jianConfigured());
+    }
+
+    // Whews 同样需要令牌：默认关闭，粘贴令牌后标记为已配置。
+    void whewsTokenIsOptionalAndGatesTheSource() {
+        QSettings().clear();
+        SettingsStore settings;
+        QVERIFY(!settings.isSourceEnabled(QStringLiteral("whews")));
+        QVERIFY(!settings.whewsConfigured());
+        WhewsSource source;
+        QVERIFY(!source.isConfigured());
+        // 手动开启但未填令牌：仍视为未配置，上层不会启动本源。
+        settings.setSourceEnabled(QStringLiteral("whews"), true);
+        QVERIFY(!settings.whewsConfigured());
+        QVERIFY(!source.isConfigured());
+        settings.setWhewsToken(QStringLiteral("  wat_x  "));
+        QVERIFY(settings.whewsConfigured());
+        QCOMPARE(settings.whewsToken(), QStringLiteral("wat_x"));   // 去空白后持久化
+        source.setToken(settings.whewsToken());
+        QVERIFY(source.isConfigured());
     }
 
     void themeDefaultsAndPersistence() {
         QSettings().clear();
         {
             SettingsStore settings;
-            QVERIFY(!settings.darkMode());
-            settings.setDarkMode(true);
+            // 全新安装默认跟随系统（与安卓端一致）。
+            QCOMPARE(settings.themeMode(), QString("system"));
+            settings.setThemeMode("dark");
         }
         {
             SettingsStore reloaded;
-            QVERIFY(reloaded.darkMode());
-            reloaded.setDarkMode(false);
+            QCOMPARE(reloaded.themeMode(), QString("dark"));
+            reloaded.setThemeMode("system");
         }
         SettingsStore settings;
-        QVERIFY(!settings.darkMode());
-        settings.setDarkMode(true);
+        QCOMPARE(settings.themeMode(), QString("system"));
+        settings.setThemeMode("dark");
         settings.resetToDefaults();
-        QVERIFY(!settings.darkMode());
+        QCOMPARE(settings.themeMode(), QString("system"));
+        QVERIFY(!QSettings().contains("themeMode"));
         QVERIFY(!QSettings().contains("darkMode"));
+    }
+
+    void themeModeMigratesLegacyDarkMode() {
+        // 旧版只有布尔 darkMode：true → dark，false → light。
+        QSettings().clear();
+        QSettings().setValue("darkMode", true);
+        QCOMPARE(SettingsStore().themeMode(), QString("dark"));
+        QSettings().clear();
+        QSettings().setValue("darkMode", false);
+        QCOMPARE(SettingsStore().themeMode(), QString("light"));
+        // themeMode 一旦存在即为唯一来源，旧键不再干扰。
+        QSettings().setValue("themeMode", "system");
+        QCOMPARE(SettingsStore().themeMode(), QString("system"));
+        // 非法值回落到跟随系统，不崩也不返回脏值。
+        QSettings().setValue("themeMode", "nonsense");
+        QCOMPARE(SettingsStore().themeMode(), QString("system"));
     }
 
     void versionCompare() {
@@ -342,7 +528,8 @@ private slots:
         source.handleMessage(text);
         QCOMPARE(received.count(), 1); // Positive control: this is a valid live message.
         const auto emitted = qvariant_cast<EarthquakeEvent>(received.at(0).at(0));
-        QCOMPARE(emitted.eventId, std::string("A"));
+        // eventId 带频道前缀（cenc_eew:），供跨聚合商对齐合并键。
+        QCOMPARE(emitted.eventId, std::string("cenc_eew:A"));
         QCOMPARE(emitted.sourceProvider, std::string("Wolfx"));
         bool delivered = false;
         QMetaObject::invokeMethod(&source, [&] {
@@ -351,11 +538,11 @@ private slots:
             delivered = true;
         }, Qt::QueuedConnection);
         SettingsStore settings;
-        settings.setEnabledWolfx(true);
+        settings.setSourceEnabled("wolfx", true);
         connect(&settings, &SettingsStore::changed, &source, [&] {
-            if (!settings.enabledWolfx()) source.stop();
+            if (!settings.isSourceEnabled("wolfx")) source.stop();
         });
-        settings.setEnabledWolfx(false);
+        settings.setSourceEnabled("wolfx", false);
         const int infoAfterStop = info.count();
         QTRY_VERIFY(delivered);
         QCOMPARE(received.count(), 1);
@@ -384,7 +571,7 @@ private slots:
                           {"infoType", "Reviewed"}}),
                 std::nullopt, IntensityStandard::Csis, origin);
             QVERIFY(parsed.has_value());
-            QCOMPARE(parsed->kind, PancakesKind::Live);
+            QCOMPARE(parsed->kind, SourceEventKind::Live);
             QCOMPARE(parsed->event.eventId, std::string("usgs:us7000abcd"));
             QCOMPARE(parsed->event.sourceProvider, std::string("Pancakes"));
             QCOMPARE(parsed->event.sourceAgency, std::string("USGS"));
@@ -423,7 +610,7 @@ private slots:
                           {"isCancel", false}}),
                 std::nullopt, IntensityStandard::Jma, origin);
             QVERIFY(parsed.has_value());
-            QCOMPARE(parsed->kind, PancakesKind::Live);
+            QCOMPARE(parsed->kind, SourceEventKind::Live);
             QCOMPARE(parsed->event.eventId, std::string("jma_eew:20231114221320"));
             QCOMPARE(parsed->event.reportNum, 4);
             QCOMPARE(parsed->event.maxIntensityRaw, 5.5);
@@ -438,7 +625,7 @@ private slots:
                           {"reportTime", "2023-11-14T22:21:00+09:00"}}),
                 std::nullopt, IntensityStandard::Csis, origin);
             QVERIFY(parsed.has_value());
-            QCOMPARE(parsed->kind, PancakesKind::Directory);
+            QCOMPARE(parsed->kind, SourceEventKind::Directory);
             QVERIFY(parsed->event.isFinal);
         }
         {
@@ -464,6 +651,55 @@ private slots:
                      .toMSecsSinceEpoch());
         QCOMPARE(event->reportTime, origin);
         QVERIFY(!event->isCanceled);
+    }
+
+    // Wolfx 的 JMA 报文时刻是无时区 JST(UTC+9) 墙钟，必须按 JST 解析，才能与 Pancakes 的
+    // 同一地震（带偏移 ISO）对齐；两路 jma_eqlist 由此合并为一条，互为备份而不重复。
+    void jmaTimesUseJstAndSourcesAgree() {
+        const auto expected = QDateTime::fromString(QStringLiteral("2026-10-06T04:47:00Z"),
+                                                    Qt::ISODate).toMSecsSinceEpoch();
+        const QJsonObject wolfxJma{
+            {"Title", "震源・震度情報"}, {"EventID", "20261006134727"},
+            {"time", "2026/10/06 13:47"}, {"time_full", "2026/10/06 13:47:00"},
+            {"location", "熊本県熊本地方"}, {"magnitude", "2.9"}, {"shindo", "1"},
+            {"depth", "10km"}, {"latitude", "32.6"}, {"longitude", "130.7"}, {"info", ""}};
+        auto jma = EewParser::parseJmaDirectory(wolfxJma, std::nullopt, IntensityStandard::Csis);
+        QVERIFY(jma.has_value());
+        QCOMPARE(jma->timestamp, expected);
+        QCOMPARE(jma->eventId, std::string("jma_eqlist:20261006134727"));
+        // 只有分钟精度（time，无 time_full）也必须按 JST 解析成功。
+        QJsonObject minuteOnly = wolfxJma;
+        minuteOnly.remove(QStringLiteral("time_full"));
+        auto minute = EewParser::parseJmaDirectory(minuteOnly, std::nullopt, IntensityStandard::Csis);
+        QVERIFY(minute.has_value());
+        QCOMPARE(minute->timestamp, expected);
+
+        // Wolfx jma_eew 的 OriginTime 同样是 JST 墙钟。
+        auto eew = EewParser::parse(
+            QJsonObject{{"type", "jma_eew"}, {"EventID", "20261005223109"},
+                        {"OriginTime", "2026/10/05 22:30:47"}, {"Hypocenter", "石垣島北西沖"},
+                        {"Latitude", 25.1}, {"Longitude", 123.3}, {"Magnitude", 4.6},
+                        {"Depth", 140}, {"MaxIntensity", "2"}, {"isCancel", false}},
+            std::nullopt, IntensityStandard::Jma, QStringLiteral("JMA 紧急地震速报"),
+            QStringLiteral("wolfx_"), origin, /*originTimeIsJst=*/true);
+        QVERIFY(eew.has_value());
+        QCOMPARE(eew->timestamp, QDateTime::fromString(QStringLiteral("2026-10-05T13:30:47Z"),
+                                                       Qt::ISODate)
+                                    .toMSecsSinceEpoch());
+
+        // Pancakes 的同一条目（eventId 相同、originTime 为带 Z 的 ISO）应与之判为同一地震。
+        const QJsonObject pancakesItem{
+            {"source", "jma_eqlist"}, {"eventId", "20261006134727"}, {"status", "active"},
+            {"revision", static_cast<double>(origin)},
+            {"originTime", "2026-10-06T04:47:00Z"}, {"magnitude", 2.9}, {"depthKm", 10.0},
+            {"place", "熊本県熊本地方"}, {"maxIntensity", "1"}, {"latitude", 32.6},
+            {"longitude", 130.7}};
+        auto pan = PancakesParser::parseListItem(pancakesItem, std::nullopt,
+                                                 IntensityStandard::Csis, origin);
+        QVERIFY(pan.has_value());
+        QCOMPARE(pan->timestamp, expected);
+        QVERIFY(QuakeCalculator::isSameQuake(jma->timestamp, jma->latitude, jma->longitude,
+                                             pan->timestamp, pan->latitude, pan->longitude));
     }
 
     // QWebSocket 传输失败会同时发 errorOccurred 与 disconnected：一次连接尝试只应调度
@@ -588,6 +824,600 @@ private slots:
             store.clear();
             QVERIFY(store.loadRecent().empty());
         }
+    }
+
+    // ---- Whews (api.2v8.cn) ----
+
+    // 站点顺序：国内备用站在前，主站在后（需求：优先备用站，不可用才用主站）。
+    void whewsPrefersDomesticSiteFirst() {
+        const QStringList hosts = WhewsProtocol::wsHosts();
+        QCOMPARE(hosts.size(), 2);
+        QCOMPARE(hosts.at(0), QStringLiteral("wss://api.2v8.cn"));
+        QCOMPARE(hosts.at(1), QStringLiteral("wss://api.beecld.com"));
+        QCOMPARE(WhewsProtocol::providerName(), QStringLiteral("Whews"));
+    }
+
+    // 时刻是无时区墙钟：非 JMA 频道按 UTC+8、JMA 频道按 UTC+9 解释。
+    // 这是接入 Whews 最易错的一处：按本地时区解释会让非 UTC+8 设备的时刻整体偏移。
+    void whewsParsesWallClockPerChannelTimeZone() {
+        const auto* cenc = whewsChannelFor(QStringLiteral("cenc"));
+        QVERIFY(cenc);
+        QCOMPARE(cenc->tz, WhewsTimeZone::Utc8);
+        const auto cencEvent = WhewsParser::parseRecord(
+            *cenc,
+            QJsonObject{{"id", QStringLiteral("CD.20260813084717.000")},
+                        {"shockTime", QStringLiteral("2026-08-13 08:47:00")},
+                        {"latitude", 36.06}, {"longitude", 103.55}, {"depth", 11.0},
+                        {"magnitude", 3.2}, {"placeName", QString::fromUtf8("甘肃临夏州永靖县")}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(cencEvent.has_value());
+        // 08:47:00 +08:00 == 00:47:00Z
+        QCOMPARE(cencEvent->timestamp,
+                 QDateTime::fromString(QStringLiteral("2026-08-13T00:47:00Z"), Qt::ISODate)
+                     .toMSecsSinceEpoch());
+
+        const auto* jma = whewsChannelFor(QStringLiteral("jma_eew"));
+        QVERIFY(jma);
+        QCOMPARE(jma->tz, WhewsTimeZone::Jst);
+        const auto jmaEvent = WhewsParser::parseRecord(
+            *jma,
+            QJsonObject{{"id", QStringLiteral("20240101161010")}, {"updates", 10},
+                        {"shockTime", QStringLiteral("2024-01-01 16:10:08")},
+                        {"latitude", 37.5}, {"longitude", 137.3}, {"depth", 10.0},
+                        {"magnitude", 6.2}, {"epiIntensity", QStringLiteral("6+")}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(jmaEvent.has_value());
+        // 16:10:08 +09:00 == 07:10:08Z（若误按 UTC+8 会差 1 小时）
+        QCOMPARE(jmaEvent->timestamp,
+                 QDateTime::fromString(QStringLiteral("2024-01-01T07:10:08Z"), Qt::ISODate)
+                     .toMSecsSinceEpoch());
+        QCOMPARE(jmaEvent->reportNum, 10);
+        QCOMPARE(jmaEvent->maxIntensityRaw, 6.5);   // JMA 震度文本 "6+"
+    }
+
+    // createTime / updateTime 同样按频道时区解析。
+    void whewsParsesReportTimePerChannelTimeZone() {
+        const auto* cenc = whewsChannelFor(QStringLiteral("cenc"));
+        const auto cencEvent = WhewsParser::parseRecord(
+            *cenc,
+            QJsonObject{{"id", QStringLiteral("CD.1")},
+                        {"shockTime", QStringLiteral("2026-08-13 08:47:00")},
+                        {"createTime", QStringLiteral("2026-08-13 08:51:51")},
+                        {"latitude", 36.06}, {"longitude", 103.55}, {"magnitude", 3.2}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(cencEvent.has_value());
+        QCOMPARE(cencEvent->reportTime,
+                 QDateTime::fromString(QStringLiteral("2026-08-13T00:51:51Z"), Qt::ISODate)
+                     .toMSecsSinceEpoch());
+
+        const auto* jma = whewsChannelFor(QStringLiteral("jma"));
+        const auto jmaEvent = WhewsParser::parseRecord(
+            *jma,
+            QJsonObject{{"id", QStringLiteral("20240101161010")},
+                        {"shockTime", QStringLiteral("2024-01-01 16:10:08")},
+                        {"createTime", QStringLiteral("2024-01-01 16:12:00")},
+                        {"latitude", 37.5}, {"longitude", 137.3}, {"magnitude", 6.2}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(jmaEvent.has_value());
+        QCOMPARE(jmaEvent->reportTime,
+                 QDateTime::fromString(QStringLiteral("2024-01-01T07:12:00Z"), Qt::ISODate)
+                     .toMSecsSinceEpoch());
+    }
+
+    // Whews 用 cancel / final（不带 is 前缀），与 Wolfx 的 isCancel / isFinal 不同。
+    void whewsHonoursCancelAndFinalFlags() {
+        const auto* channel = whewsChannelFor(QStringLiteral("jma_eew"));
+        QVERIFY(channel);
+        const auto ongoing = WhewsParser::parseRecord(
+            *channel,
+            QJsonObject{{"id", QStringLiteral("A")}, {"updates", 3},
+                        {"shockTime", QStringLiteral("2024-01-01 16:10:08")},
+                        {"latitude", 37.5}, {"longitude", 137.3}, {"magnitude", 6.2},
+                        {"cancel", false}, {"final", false}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(ongoing->isFinal == false);
+        QVERIFY(ongoing->isCanceled == false);
+        const auto done = WhewsParser::parseRecord(
+            *channel,
+            QJsonObject{{"id", QStringLiteral("B")}, {"updates", 9},
+                        {"shockTime", QStringLiteral("2024-01-01 16:10:08")},
+                        {"latitude", 37.5}, {"longitude", 137.3}, {"magnitude", 6.2},
+                        {"cancel", true}, {"final", true}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(done->isFinal);
+        QVERIFY(done->isCanceled);
+    }
+
+    // cenc 用上游 id 原文（无频道前缀），以便与 Wolfx cenc_eqlist 落进同一合并键。
+    void whewsCencUsesUpstreamIdVerbatimForCrossSourceMerge() {
+        const auto* cenc = whewsChannelFor(QStringLiteral("cenc"));
+        QVERIFY(cenc->eventNs.isEmpty());
+        const auto event = WhewsParser::parseRecord(
+            *cenc,
+            QJsonObject{{"id", QStringLiteral("CD.20260813084717.000_M")},
+                        {"shockTime", QStringLiteral("2026-08-13 08:47:00")},
+                        {"latitude", 36.06}, {"longitude", 103.55}, {"magnitude", 3.2}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(event.has_value());
+        // 去掉 _M 后缀即与 Wolfx 的 EventID 对齐。
+        QCOMPARE(event->eventId, std::string("CD.20260813084717.000"));
+        QCOMPARE(event->identity(), std::string("CENC|CD.20260813084717.000"));
+
+        // EEW 频道带 eventNs 前缀，与 Wolfx / Pancakes 同名频道对齐。
+        const auto* cea = whewsChannelFor(QStringLiteral("cea"));
+        const auto ceaEvent = WhewsParser::parseRecord(
+            *cea,
+            QJsonObject{{"id", QStringLiteral("bi9wyea65mayd")}, {"updates", 3},
+                        {"shockTime", QStringLiteral("2026-08-13 08:47:00")},
+                        {"latitude", 29.43}, {"longitude", 101.09}, {"depth", 8},
+                        {"magnitude", 4.0}, {"epiIntensity", 5.5}},
+            std::nullopt, IntensityStandard::Csis);
+        QCOMPARE(ceaEvent->eventId, std::string("cenc_eew:bi9wyea65mayd"));
+        QCOMPARE(ceaEvent->identity(), std::string("CEA|cenc_eew:bi9wyea65mayd"));
+        QCOMPARE(ceaEvent->sourceProvider, std::string("Whews"));
+    }
+
+    // 文档明示这些端点不进入 /ws/all，不应被当作已接入频道。
+    void whewsIgnoresEndpointsExcludedFromAggregate() {
+        QSet<QString> seen;
+        QVERIFY(!whewsChannelFor(QStringLiteral("cenc_int")));
+        QVERIFY(!whewsChannelFor(QStringLiteral("cmt_usgs")));
+        QVERIFY(!whewsChannelFor(QStringLiteral("nied")));
+        QVERIFY(!whewsChannelFor(QStringLiteral("weatheralarm")));
+        QCOMPARE(whewsChannelFor(QStringLiteral("jma_eew"))->kind, SourceEventKind::Live);
+        QCOMPARE(whewsChannelFor(QStringLiteral("cenc"))->kind, SourceEventKind::Directory);
+        // 频道 id 唯一，避免同一 source 短名重复登记导致先命中者生效。
+        for (const auto& channel : whewsChannels()) {
+            QVERIFY2(!seen.contains(channel.source), qPrintable(channel.source));
+            seen.insert(channel.source);
+        }
+    }
+
+    // 无令牌 → 不建立任何连接（urlIndex 保持初始值，不会前进）。
+    void whewsUnconfiguredSourceNeverConnects() {
+        WhewsSource source;
+        QVERIFY(!source.isConfigured());
+        source.start();
+        QVERIFY(source.socket_ == nullptr);
+        QCOMPARE(source.urlIndex_, 0);
+        QVERIFY(!source.reconnectTimer_.isActive());
+        QCOMPARE(source.info().status, ConnectionStatus::Disconnected);
+        source.stop();
+    }
+
+    // 首连快照为 JSON 数组：逐条解析并按频道区分 LIVE / DIRECTORY。
+    void whewsSnapshotArrayIsParsedPerChannel() {
+        WhewsSource source;
+        source.setNowProvider([] { return origin + 2000; });
+        source.running_ = true;
+        source.socket_ = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+        QSignalSpy received(&source, &WhewsSource::eventReceived);
+        QVERIFY(received.isValid());
+        // 发震时刻取在 origin 附近的新鲜时刻，否则会被 30 min 新鲜度窗口当作回放丢弃。
+        const auto wallClock = [](qint64 epochMs, int offsetHours) {
+            return QDateTime::fromMSecsSinceEpoch(epochMs, QTimeZone(offsetHours * 3600))
+                .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+        };
+        const QString freshCenc = wallClock(origin, 8);
+        const QString freshJma = wallClock(origin, 9);
+        QJsonObject cencData;
+        cencData.insert(QStringLiteral("id"), QStringLiteral("CD.20260813084717.000"));
+        cencData.insert(QStringLiteral("shockTime"), freshCenc);
+        cencData.insert(QStringLiteral("latitude"), 36.06);
+        cencData.insert(QStringLiteral("longitude"), 103.55);
+        cencData.insert(QStringLiteral("magnitude"), 3.2);
+        QJsonObject jmaData;
+        jmaData.insert(QStringLiteral("id"), QStringLiteral("20240101161010"));
+        jmaData.insert(QStringLiteral("shockTime"), freshJma);
+        jmaData.insert(QStringLiteral("latitude"), 37.5);
+        jmaData.insert(QStringLiteral("longitude"), 137.3);
+        jmaData.insert(QStringLiteral("magnitude"), 6.2);
+        QJsonObject cencFrame;
+        cencFrame.insert(QStringLiteral("source"), QStringLiteral("cenc"));
+        cencFrame.insert(QStringLiteral("md5"), QStringLiteral("a"));
+        cencFrame.insert(QStringLiteral("Data"), cencData);
+        QJsonObject jmaFrame;
+        jmaFrame.insert(QStringLiteral("source"), QStringLiteral("jma_eew"));
+        jmaFrame.insert(QStringLiteral("md5"), QStringLiteral("b"));
+        jmaFrame.insert(QStringLiteral("Data"), jmaData);
+        const QJsonArray snapshot{cencFrame, jmaFrame};
+        source.handleMessage(QString::fromUtf8(QJsonDocument(snapshot).toJson()));
+        QCOMPARE(received.count(), 2);
+        const auto cenc = qvariant_cast<EarthquakeEvent>(received.at(0).at(0));
+        QCOMPARE(qvariant_cast<SourceEventKind>(received.at(0).at(1)), SourceEventKind::Directory);
+        QCOMPARE(cenc.sourceAgency, std::string("CENC"));
+        const auto jma = qvariant_cast<EarthquakeEvent>(received.at(1).at(0));
+        QCOMPARE(qvariant_cast<SourceEventKind>(received.at(1).at(1)), SourceEventKind::Live);
+        QCOMPARE(jma.sourceAgency, std::string("JMA"));
+        source.stop();
+    }
+
+    // 过期的 EEW 回放不得当作实时预警（上游首连会补发「最近一次」预警）。
+    void whewsDropsStaleLiveEewButKeepsDirectory() {
+        WhewsSource source;
+        const long long now = origin;
+        source.setNowProvider([now] { return now; });
+        source.running_ = true;
+        source.socket_ = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+        QSignalSpy received(&source, &WhewsSource::eventReceived);
+        // 发震时刻在 30 分钟新鲜度窗口之外（origin 为 2027-01，本次固定取 2024-01）。
+        QJsonObject data;
+        data.insert(QStringLiteral("id"), QStringLiteral("old"));
+        data.insert(QStringLiteral("shockTime"), QStringLiteral("2024-01-01 16:10:08"));
+        data.insert(QStringLiteral("latitude"), 37.5);
+        data.insert(QStringLiteral("longitude"), 137.3);
+        data.insert(QStringLiteral("magnitude"), 6.2);
+        QJsonObject eew;
+        eew.insert(QStringLiteral("source"), QStringLiteral("jma_eew"));
+        eew.insert(QStringLiteral("Data"), data);
+        source.handleMessage(QString::fromUtf8(QJsonDocument(eew).toJson()));
+        QCOMPARE(received.count(), 0);
+        // 同一时刻的情报（目录）仍应保留：只有 EEW 受新鲜度窗口约束。
+        QJsonObject info;
+        info.insert(QStringLiteral("source"), QStringLiteral("jma"));
+        info.insert(QStringLiteral("Data"), data);
+        source.handleMessage(QString::fromUtf8(QJsonDocument(info).toJson()));
+        QCOMPARE(received.count(), 1);
+        QCOMPARE(qvariant_cast<SourceEventKind>(received.at(0).at(1)), SourceEventKind::Directory);
+        source.stop();
+    }
+
+    // 传输失败才前进站点索引：先国内站，失败后切主站。
+    void whewsRotatesSiteOnlyOnTransportFailure() {
+        WhewsSource source;
+        source.running_ = true;
+        source.generation_ = 1;
+        QCOMPARE(source.urlIndex_, 0);
+
+        // 正常断开（服务端主动关闭）不轮换：仍优先国内站。
+        {
+            auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+            source.socket_ = socket;
+            source.attachSocketHandlers(socket, /*generation*/ 1, ++source.attempt_);
+            socket->disconnected();
+            QCOMPARE(source.urlIndex_, 0);
+            source.reconnectTimer_.stop();
+        }
+
+        // 传输失败才 ++urlIndex_，下一次 connectSocket 指向主站。
+        {
+            auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+            source.socket_ = socket;
+            source.attachSocketHandlers(socket, /*generation*/ 1, ++source.attempt_);
+            socket->errorOccurred(QAbstractSocket::RemoteHostClosedError);
+            QCOMPARE(source.urlIndex_, 1);
+            QVERIFY(source.reconnectTimer_.isActive());
+            source.reconnectTimer_.stop();
+        }
+
+        // 与 Wolfx 同款保证：errorOccurred + disconnected 同时到达只调度一次重连。
+        {
+            auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+            source.socket_ = socket;
+            source.attachSocketHandlers(socket, /*generation*/ 1, ++source.attempt_);
+            const int before = source.retryCount_;
+            socket->errorOccurred(QAbstractSocket::RemoteHostClosedError);
+            socket->disconnected();   // 已被 errorOccurred 退休，不会再调度一次
+            QCOMPARE(source.retryCount_, before + 1);
+            QVERIFY(source.reconnectTimer_.isActive());
+        }
+        source.stop();
+        QVERIFY(!source.reconnectTimer_.isActive());
+    }
+
+    // 4401/4403 为服务端明确拒绝：按文档停止重连，否则重连过频会被智能封禁。
+    // 这两个码不在 Qt 的 CloseCode 枚举内，无法经 Qt API 注入，故直接验证判定谓词；
+    // 「停止重连」分支的行为由 isFatalClose 为真时不再调度重连保证。
+    void whewsAuthRejectionIsFatal() {
+        QVERIFY(WhewsSource::isFatalClose(
+            static_cast<QWebSocketProtocol::CloseCode>(WhewsProtocol::CloseCode::kUnauthorized)));
+        QVERIFY(WhewsSource::isFatalClose(
+            static_cast<QWebSocketProtocol::CloseCode>(WhewsProtocol::CloseCode::kBanned)));
+        // 正常关闭与其它错误码不得误判为鉴权失败。
+        QVERIFY(!WhewsSource::isFatalClose(QWebSocketProtocol::CloseCodeNormal));
+        QVERIFY(!WhewsSource::isFatalClose(QWebSocketProtocol::CloseCodeGoingAway));
+        QVERIFY(!WhewsSource::isFatalClose(QWebSocketProtocol::CloseCodeAbnormalDisconnection));
+        QVERIFY(!WhewsSource::isFatalClose(static_cast<QWebSocketProtocol::CloseCode>(4503)));
+    }
+
+    // 正常关闭（非致命码）应退避重连，且不前进站点索引（仍优先国内站）。
+    void whewsNormalCloseSchedulesReconnectOnSameSite() {
+        WhewsSource source;
+        source.running_ = true;
+        source.generation_ = 1;
+        auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+        source.socket_ = socket;
+        source.attachSocketHandlers(socket, /*generation*/ 1, ++source.attempt_);
+        socket->disconnected();
+        QCOMPARE(source.info().status, ConnectionStatus::Disconnected);
+        QVERIFY(!source.info().description.contains(QString::fromUtf8("鉴权")));
+        QVERIFY(source.reconnectTimer_.isActive());
+        QCOMPARE(source.urlIndex_, 0);
+        QCOMPARE(source.retryCount_, 1);
+        source.stop();
+        QVERIFY(!source.reconnectTimer_.isActive());
+    }
+
+    // ── 模拟源（sim-eew/1）──────────────────────────────────────────
+
+    static QJsonObject simFrame(const QString& eventId = QStringLiteral("sim-1-a"),
+                                int reportNum = 1, long long originMs = origin,
+                                const QString& type = QStringLiteral("report"),
+                                bool isFinal = false) {
+        QJsonObject f;
+        f.insert(QStringLiteral("type"), type);
+        f.insert(QStringLiteral("eventId"), eventId);
+        f.insert(QStringLiteral("reportNum"), reportNum);
+        // 契约要求 epoch 毫秒数字，不能是墙钟串。
+        f.insert(QStringLiteral("originTime"), static_cast<double>(originMs));
+        f.insert(QStringLiteral("magnitude"), 6.5);
+        f.insert(QStringLiteral("latitude"), 20.0);
+        f.insert(QStringLiteral("longitude"), 160.0);
+        f.insert(QStringLiteral("depth"), 12.0);
+        f.insert(QStringLiteral("location"), QStringLiteral("模拟震源"));
+        f.insert(QStringLiteral("isFinal"), isFinal);
+        return f;
+    }
+
+    /// 起一个已连接、时钟固定的模拟源。QSignalSpy 不可默认构造、也不可赋值，
+    /// 故连同源一起返回，由调用方就地构造 spy。
+    static std::unique_ptr<SimulatedSource> startedSimulated(long long nowMs) {
+        auto source = std::make_unique<SimulatedSource>();
+        source->setNowProvider([nowMs] { return nowMs; });
+        source->setDevMode(true);
+        source->setUrl(QStringLiteral("ws://127.0.0.1:8080/ws"));
+        source->running_ = true;
+        source->generation_ = 1;
+        source->socket_ = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, source.get());
+        return source;
+    }
+
+    // 门控：开发者模式 + 地址缺一不可。关闭时上层不启动，源自身也不连接。
+    void simulatedIsConfiguredRequiresBothGates() {
+        SimulatedSource source;
+        QVERIFY(!source.isConfigured());                       // 两者皆空
+        source.setDevMode(true);
+        QVERIFY(!source.isConfigured());                       // 有模式无地址
+        source.setUrl(QStringLiteral("  ws://127.0.0.1:8080/ws  "));
+        QVERIFY(source.isConfigured());                        // 齐备
+        QCOMPARE(source.url_, QStringLiteral("ws://127.0.0.1:8080/ws"));  // 读时去空白
+        source.setDevMode(false);
+        QVERIFY(!source.isConfigured());                       // 关模式即刻退回未配置
+    }
+
+    // 未配置时 connect() 不得开 socket：这是「开发者模式关 ⇒ 从不连接」的最后一道保证。
+    void simulatedUnconfiguredNeverConnects() {
+        SimulatedSource source;
+        source.setNowProvider([] { return origin; });
+        source.setDevMode(false);
+        source.setUrl(QStringLiteral("ws://127.0.0.1:8080/ws"));
+        source.start();
+        QCOMPARE(source.info().status, ConnectionStatus::Disconnected);
+        QVERIFY(!source.info().description.isEmpty());
+        source.stop();
+    }
+
+    // 机构固定 SIM：与真实 CENC 报文不得落进同一合并键，否则告警被静默吞掉。
+    void simulatedAgencyNeverCollidesWithRealSources() {
+        auto source = startedSimulated(origin);
+        QSignalSpy received(source.get(), &SimulatedSource::eventReceived);
+        source->handleMessage(QString::fromUtf8(QJsonDocument(simFrame()).toJson()));
+        QCOMPARE(received.count(), 1);
+        const auto event = qvariant_cast<EarthquakeEvent>(received.at(0).at(0));
+        QCOMPARE(QString::fromStdString(event.sourceAgency), QStringLiteral("SIM"));
+        QCOMPARE(QString::fromStdString(event.sourceProvider), QStringLiteral("Simulated"));
+        QCOMPARE(QString::fromStdString(event.id), QStringLiteral("sim_sim-1-a"));
+        QVERIFY(QString::fromStdString(event.eventId).startsWith(QStringLiteral("sim-")));
+
+        // 形状相同的真实 CENC 报文：id 相同，但 identity 必须不同。
+        auto cenc = event;
+        cenc.id = "wolfx_CD.1";
+        cenc.eventId = "CD.1";
+        cenc.sourceAgency = "CENC";
+        cenc.sourceProvider = "Wolfx";
+        QVERIFY(cenc.identity() != event.identity());
+        // 反向对照：同机构同 id 确实合并（证明差异来自机构而非巧合）。
+        cenc.sourceProvider = "Pancakes";
+        QCOMPARE(cenc.identity(), QString::fromStdString("CENC|CD.1").toStdString());
+
+        // 两者同入一个 EventGate 必须并存，否则用户看不到第二次预警。
+        EventGate gate;
+        QCOMPARE(gate.admit(event, origin), EventGateDecision::Pass);
+        QCOMPARE(gate.admit(cenc, origin), EventGateDecision::Pass);
+        source->stop();
+    }
+
+    // 多报次递增、末报 final，各报共用一个 identity（EventGate 靠它归并）。
+    void simulatedMultiReportIncrementsAndFinalizes() {
+        auto source = startedSimulated(origin);
+        QSignalSpy received(source.get(), &SimulatedSource::eventReceived);
+        const auto send = [&](int n, bool final) {
+            source->handleMessage(
+                QString::fromUtf8(QJsonDocument(simFrame(QStringLiteral("sim-1-a"), n, origin,
+                                                      QStringLiteral("report"), final)).toJson()));
+        };
+        send(1, false);
+        send(2, false);
+        send(3, true);
+        QCOMPARE(received.count(), 3);
+        QList<int> nums, finals;
+        QSet<std::string> identities;
+        for (int i = 0; i < received.count(); ++i) {
+            const auto e = qvariant_cast<EarthquakeEvent>(received.at(i).at(0));
+            nums << e.reportNum;
+            finals << int(e.isFinal);
+            identities.insert(e.identity());
+        }
+        QCOMPARE(nums, (QList<int>{1, 2, 3}));
+        QCOMPARE(finals, (QList<int>{0, 0, 1}));
+        QCOMPARE(identities.size(), size_t(1));
+        source->stop();
+    }
+
+    // type 带内承载 Live/Directory：目录帧必须走 Directory，不得进入告警链路。
+    void simulatedTypeMapsToEventKind() {
+        auto source = startedSimulated(origin);
+        QSignalSpy received(source.get(), &SimulatedSource::eventReceived);
+        source->handleMessage(QString::fromUtf8(QJsonDocument(simFrame()).toJson()));
+        source->handleMessage(QString::fromUtf8(
+            QJsonDocument(simFrame(QStringLiteral("sim-2-b"), 1, origin, QStringLiteral("directory"))).toJson()));
+        QCOMPARE(received.count(), 2);
+        QCOMPARE(qvariant_cast<SourceEventKind>(received.at(0).at(1)), SourceEventKind::Live);
+        QCOMPARE(qvariant_cast<SourceEventKind>(received.at(1).at(1)), SourceEventKind::Directory);
+        QCOMPARE(QString::fromStdString(qvariant_cast<EarthquakeEvent>(received.at(0).at(0)).source),
+                 QStringLiteral("模拟数据源 地震预警"));
+        QCOMPARE(QString::fromStdString(qvariant_cast<EarthquakeEvent>(received.at(1).at(0)).source),
+                 QStringLiteral("模拟数据源 地震情报"));
+        source->stop();
+    }
+
+    // 超 30 分钟活跃窗口的实时帧丢弃；同一时刻的目录帧仍保留（只有 Live 受限）。
+    void simulatedDropsStaleLiveButKeepsDirectory() {
+        const long long now = origin;
+        const long long old = origin - 31LL * 60 * 1000;
+        auto source = startedSimulated(now);
+        QSignalSpy received(source.get(), &SimulatedSource::eventReceived);
+        source->handleMessage(QString::fromUtf8(
+            QJsonDocument(simFrame(QStringLiteral("sim-old"), 1, old)).toJson()));
+        QCOMPARE(received.count(), 0);
+        source->handleMessage(QString::fromUtf8(
+            QJsonDocument(simFrame(QStringLiteral("sim-old"), 1, old, QStringLiteral("directory"))).toJson()));
+        QCOMPARE(received.count(), 1);
+        source->stop();
+    }
+
+    // 未来时刻的帧不得进入链路：它一出生就判过期（与 Android EventLifecycle 同规则）。
+    void simulatedDropsFutureOrigin() {
+        const long long now = origin;
+        auto source = startedSimulated(now);
+        QSignalSpy received(source.get(), &SimulatedSource::eventReceived);
+        source->handleMessage(QString::fromUtf8(
+            QJsonDocument(simFrame(QStringLiteral("sim-future"), 1, now + 5 * 60 * 1000)).toJson()));
+        QCOMPARE(received.count(), 0);
+        // 60s 之内的未来时刻仍放行（服务端钳到 +55s 就是为了留这个余量）。
+        source->handleMessage(QString::fromUtf8(
+            QJsonDocument(simFrame(QStringLiteral("sim-soon"), 1, now + 55 * 1000)).toJson()));
+        QCOMPARE(received.count(), 1);
+        source->stop();
+    }
+
+    // expired() 的未来时刻守卫：与 Android 端 EventLifecycle 对齐，本次补齐。
+    // 注意 expired(nowMs) 的入参是「当前时刻」，不是发震时刻：未来时刻的判据是
+    // 「发震时刻比当前时刻超前 60s 以上」，故用发震时刻在前的场景来构造。
+    void futureOriginIsExpired() {
+        const long long now = origin;
+        // 发震时刻恰为当下：不是未来；未知到时给 5 分钟窗口，故仍有效。
+        auto a = makeEvent();
+        QVERIFY(!a.expired(now));
+        // 发震时刻超前 60s 之内的仍在窗口内。
+        QVERIFY(!a.expired(a.timestamp - 60'000));
+        // 发震时刻超前 60s 以上：判过期（本次补齐的守卫，Android 端同规则）。
+        QVERIFY(a.expired(a.timestamp - 60'001));
+    }
+
+    // hello / ping 是控制帧：只刷新心跳，不产生事件。
+    void simulatedControlFramesProduceNoEvents() {
+        auto source = startedSimulated(origin);
+        QSignalSpy received(source.get(), &SimulatedSource::eventReceived);
+        source->handleMessage(QStringLiteral(R"({"type":"hello","server":"sim-eew/1"})"));
+        source->handleMessage(QStringLiteral(R"({"type":"ping","epoch":1})"));
+        QCOMPARE(received.count(), 0);
+        source->stop();
+    }
+
+    // 畸形帧忽略而非致命：连接必须保持，一条坏帧不该触发断线重连。
+    // 截断帧用普通字符串而非 R"()"：裸串里的 )" 会提前终止原始字符串，
+    // moc 的简易解析器随之错位，整个测试类的 vtable 就丢了（链接期才报）。
+    void simulatedMalformedFrameKeepsSocket() {
+        auto source = startedSimulated(origin);
+        QSignalSpy received(source.get(), &SimulatedSource::eventReceived);
+        auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, source.get());
+        source->socket_ = socket;
+        source->attachSocketHandlers(socket, /*generation*/ 1, source->attempt_);
+        // 桩 socket 不会真的握手成功，故直接置为已连接：这里要验的是
+        // 「坏帧不会把连接打掉」，不是握手流程。
+        source->setStatus(ConnectionStatus::Connected);
+        source->handleMessage(QStringLiteral("{\"type\":\"report\",\"eventId\":"));  // 截断
+        source->handleMessage(QStringLiteral("{\"type\":\"report\"}"));             // 缺必填
+        source->handleMessage(QString::fromUtf8(QJsonDocument(simFrame()).toJson()));
+        QCOMPARE(received.count(), 1);
+        QCOMPARE(source->info().status, ConnectionStatus::Connected);
+        source->stop();
+    }
+
+    // 烈度文本原文透传：JMA 式写法经 parseMaxIntensity 会被重新格式化而破坏。
+    void simulatedPreservesIntensityTextVerbatim() {
+        auto frame = simFrame();
+        frame.insert(QStringLiteral("maxIntensity"), 5.0);
+        frame.insert(QStringLiteral("maxIntensityText"), QStringLiteral("5弱"));
+        const auto event = SimulatedParser::parseReport(frame, SourceEventKind::Live, std::nullopt,
+                                                        IntensityStandard::Csis, origin);
+        QVERIFY(event.has_value());
+        QCOMPARE(QString::fromStdString(event->maxIntensityText), QStringLiteral("5弱"));
+        QCOMPARE(event->maxIntensityRaw, 5.0);
+    }
+
+    // 必填缺失一律拒绝：0/0 会被当成几内亚湾的合法坐标，故不能用默认值蒙混。
+    void simulatedParserRejectsMissingRequiredFields() {
+        QJsonObject noEventId = simFrame();
+        noEventId.remove(QStringLiteral("eventId"));
+        QVERIFY(!SimulatedParser::parseReport(noEventId, SourceEventKind::Live, std::nullopt,
+                                              IntensityStandard::Csis, origin).has_value());
+        QJsonObject noOrigin = simFrame();
+        noOrigin.remove(QStringLiteral("originTime"));
+        QVERIFY(!SimulatedParser::parseReport(noOrigin, SourceEventKind::Live, std::nullopt,
+                                              IntensityStandard::Csis, origin).has_value());
+        QJsonObject noEpicenter = simFrame();
+        noEpicenter.remove(QStringLiteral("latitude"));
+        QVERIFY(!SimulatedParser::parseReport(noEpicenter, SourceEventKind::Live, std::nullopt,
+                                              IntensityStandard::Csis, origin).has_value());
+    }
+
+    // reportTime 必须置为收帧时刻：目录去重以它决胜，缺省会令条目任意胜出。
+    void simulatedParserStampsReportTime() {
+        const long long now = origin + 1234;
+        const auto event = SimulatedParser::parseReport(simFrame(), SourceEventKind::Directory,
+                                                        std::nullopt, IntensityStandard::Csis, now);
+        QVERIFY(event.has_value());
+        QCOMPARE(event->reportTime, now);
+    }
+
+    // 传输失败时 errorOccurred 与 disconnected 都会触发：只许调度一次重连。
+    // 与 Wolfx / Whews 同款保证，是本仓库反复踩过的坑。
+    void simulatedSchedulesReconnectOnlyOnce() {
+        auto source = startedSimulated(origin);
+        auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, source.get());
+        source->socket_ = socket;
+        source->attachSocketHandlers(socket, /*generation*/ 1, ++source->attempt_);
+        const int before = source->retryCount_;
+        socket->errorOccurred(QAbstractSocket::RemoteHostClosedError);
+        socket->disconnected();   // 已被 errorOccurred 退休，不会再调度一次
+        QCOMPARE(source->retryCount_, before + 1);
+        QVERIFY(source->reconnectTimer_.isActive());
+        source->stop();
+        QVERIFY(!source->reconnectTimer_.isActive());
+    }
+
+    // 设置项语义：开发者模式与地址是持久化的，且模拟源刻意不在默认禁用集内
+    //（门控交给 isConfigured，否则会形成「开关+地址+禁用集」三重门）。
+    void simulatedSettingsArePersistedAndNotDisabledByDefault() {
+        QSettings().clear();   // 套件已把 QSettings 重定向到临时目录
+        {
+            SettingsStore store;
+            QVERIFY(!store.developerMode());                 // 默认关闭
+            QVERIFY(store.simulatedUrl().isEmpty());         // 默认空：不预填
+            store.setDeveloperMode(true);
+            store.setSimulatedUrl(QStringLiteral("  ws://10.0.2.2:8080/ws  "));
+            QVERIFY(store.developerMode());
+            QCOMPARE(store.simulatedUrl(), QStringLiteral("ws://10.0.2.2:8080/ws"));
+            // 模拟源刻意不在默认禁用集内：门控交给 isConfigured，否则形成三重门。
+            QVERIFY(!SettingsStore::defaultDisabledSources().contains(SourceIds::kSimulated));
+            QVERIFY(store.isSourceEnabled(SourceIds::kSimulated));
+        }
+        SettingsStore reloaded;   // 新实例：验证真的落了盘
+        QVERIFY(reloaded.developerMode());
+        QCOMPARE(reloaded.simulatedUrl(), QStringLiteral("ws://10.0.2.2:8080/ws"));
+        QSettings().clear();
     }
 };
 

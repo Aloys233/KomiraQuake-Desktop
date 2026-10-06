@@ -3,27 +3,12 @@
 #include <algorithm>
 #include <cmath>
 
-#include "core/coordinate_transform.h"
-
 namespace komira {
 
 namespace {
 constexpr double kPi = 3.14159265358979323846;
 
 bool finite(double v) { return std::isfinite(v); }
-
-/// 震中到「中国范围」包围盒最远角点的距离（km），即波前扫过全境所需的半径。
-double maxDistanceToChinaKm(double lat, double lon) {
-    const double lats[2] = {CoordinateTransform::kChinaMinLat, CoordinateTransform::kChinaMaxLat};
-    const double lons[2] = {CoordinateTransform::kChinaMinLon, CoordinateTransform::kChinaMaxLon};
-    double far = 0.0;
-    for (double la : lats) {
-        for (double lo : lons) {
-            far = std::max(far, QuakeCalculator::haversineDistance(lat, lon, la, lo));
-        }
-    }
-    return far;
-}
 } // namespace
 
 double QuakeCalculator::haversineDistance(double lat1, double lon1, double lat2, double lon2) {
@@ -57,13 +42,6 @@ bool QuakeCalculator::isValidCoordinate(double lat, double lon) {
 
 double QuakeCalculator::elapsedSeconds(long long originEpochMs, long long nowEpochMs) {
     return static_cast<double>(nowEpochMs - originEpochMs) / 1000.0;
-}
-
-bool QuakeCalculator::bothWavesBeyondChina(double lat, double lon, double pKm, double sKm) {
-    const double far = maxDistanceToChinaKm(lat, lon);
-    const bool pOut = pKm < 0.0 || pKm > far;
-    const bool sOut = sKm < 0.0 || sKm > far;
-    return pOut && sOut;
 }
 
 bool QuakeCalculator::isSameQuake(long long timestampA, double latA, double lonA,

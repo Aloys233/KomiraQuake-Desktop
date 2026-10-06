@@ -16,7 +16,7 @@
 
 namespace komira {
 
-PancakesSource::PancakesSource(QObject* parent) : QObject(parent) {
+PancakesSource::PancakesSource(QObject* parent) : EarthquakeSource(parent) {
     info_.id = SourceIds::kPancakes;
     info_.name = QStringLiteral("Pancakes");
     info_.region = QStringLiteral("全球");
@@ -220,7 +220,7 @@ void PancakesSource::fetchList(const QString& source, quint64 generation) {
         for (const auto& v : doc.array()) {
             if (!running_ || generation != generation_) return;
             auto event = PancakesParser::parseListItem(v.toObject(), userLocation(), standard_, now);
-            if (event) emit eventReceived(*event, PancakesKind::Directory);
+            if (event) emit eventReceived(*event, SourceEventKind::Directory);
         }
         info_.directoryLatencyMs = monoMs() - started;
         finishDirectoryRequest();

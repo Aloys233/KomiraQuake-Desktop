@@ -9,6 +9,7 @@
 #include <QDir>
 #include <functional>
 #include <cmath>
+#include "core/intensity_calculator.h"
 #include "core/warning_session.h"
 #include "prefs/settings_store.h"
 #include "theme/native_ui.h"
@@ -34,6 +35,22 @@ static QQuickItem* findVisualItem(QQuickWindow* window, const QString& name) {
     for (auto* item : visualItems(window->contentItem()))
         if (item->objectName() == name) return item;
     return nullptr;
+}
+
+// 发震时刻必须写全：Text 被 elide 时 contentWidth 会小于 implicitWidth。
+// 返回是否找到时刻文本；若被截断则写入 offender 并返回 false。
+static bool timesFullyShown(QQuickItem* root, QString* offender) {
+    bool saw = false;
+    for (auto* item : visualItems(root)) {
+        const QString text = item->property("text").toString();
+        if (!text.contains("UTC+8")) continue;
+        saw = true;
+        if (item->property("contentWidth").toDouble() < item->implicitWidth() - 0.5) {
+            if (offender) *offender = text;
+            return false;
+        }
+    }
+    return saw;
 }
 
 static QString evidenceDirectory(QQuickWindow* window) {
@@ -65,18 +82,47 @@ private slots:
         long long now = 1'800'000'000'000LL;
         controller.nowProvider_ = [&] { return now; };
         controller.settings()->setEnableSoundAlert(false);
-        controller.settings()->setEnableSpeech(false);
         controller.settings()->setEnableWarnings(true);
         controller.settings()->setLocalIntensityFilter(2.0);
         EarthquakeEvent e;
         e.id = e.eventId = "GUI-A";
-        e.sourceProvider = "Test"; e.sourceAgency = "TEST";
+        // 使用较长的「提供方·机构」标注（Pancakes·USGS），复现来源挤压发震时刻的排版问题。
+        e.sourceProvider = "Pancakes"; e.sourceAgency = "USGS"; e.source = "GlobalQuake地震信息";
         e.timestamp = now; e.latitude = 30.6; e.longitude = 104;
         e.magnitude = 3; e.location = "演练事件（仅测试）";
         e.distanceKm = 100; e.rawIntensity = 1.0;
         QVERIFY(!controller.announcer_->eligible(e)); // 烈度低于过滤阈值，被拦截
         e.rawIntensity = 2.5;
         QVERIFY(controller.announcer_->eligible(e)); // 烈度达到过滤阈值，通过
+        // 阈值按显示烈度（取整）比较：raw 2.6 显示为Ⅲ度，阈值 3.0 应放行，
+        // 否则 HUD 显示Ⅲ度却收不到提醒。raw 2.4 显示为Ⅱ度，仍拦截。
+        controller.settings()->setLocalIntensityFilter(3.0);
+        e.rawIntensity = 2.6;
+        QVERIFY(controller.announcer_->eligible(e));
+        e.rawIntensity = 2.4;
+        QVERIFY(!controller.announcer_->eligible(e));
+        // 过滤跟随设置页所选显示标准。M5.0/30km 实测：CSIS 5 级 vs JMA 1 级
+        // （JMA s=1.0986→1 级；CSIS raw=4.6268→5 级）。阈值 5.0 时，
+        // CSIS 放行、JMA 拦截——若不跟随标准就会拿 CSIS 阈值去比震度而误判。
+        e.magnitude = 5.0; e.distanceKm = 30; e.depth = 10; e.rawIntensity = 4.6268;
+        controller.settings()->setLocalIntensityFilter(5.0);
+        controller.settings()->setIntensityStandard(0);
+        QVERIFY(controller.announcer_->eligible(e));
+        controller.settings()->setIntensityStandard(1);
+        QVERIFY(!controller.announcer_->eligible(e));
+        // JMA「及以上」：1 级在阈值 1.0 下放行。5弱/5强 同为 5 级（M6.0/10km、M6.0/5km）。
+        controller.settings()->setLocalIntensityFilter(1.0);
+        QVERIFY(controller.announcer_->eligible(e));
+        controller.settings()->setLocalIntensityFilter(5.0);
+        e.magnitude = 6.0; e.distanceKm = 10;
+        QVERIFY(IntensityCalculator::formatJma(6.0, 10.0, 10.0) == "5弱");
+        QVERIFY(controller.announcer_->eligible(e));
+        e.distanceKm = 5;
+        QVERIFY(IntensityCalculator::formatJma(6.0, 5.0, 10.0) == "5强");
+        QVERIFY(controller.announcer_->eligible(e));
+        controller.settings()->setIntensityStandard(0);
+        controller.settings()->setLocalIntensityFilter(2.0);
+        e.magnitude = 3; e.depth = 0; e.rawIntensity = 2.5;
         // 总开关关闭：只展示，不提醒。
         controller.settings()->setEnableWarnings(false);
         QVERIFY(!controller.announcer_->eligible(e));
@@ -108,6 +154,11 @@ private slots:
         QVERIFY(controller.warningOverlayVisible());
         QQmlApplicationEngine engine;
         QQuickStyle::setStyle("Basic");
+        // 布局回调若形成绑定环，Qt 会打印 "Detected recursive rearrange"；此处收集以便断言。
+        QStringList qmlWarnings;
+        connect(&engine, &QQmlEngine::warnings, this, [&](const QList<QQmlError>& warnings) {
+            for (const auto& warning : warnings) qmlWarnings.append(warning.toString());
+        });
         configureNativeUi(engine);
         engine.rootContext()->setContextProperty("app", &controller);
         engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
@@ -146,7 +197,7 @@ private slots:
             if (item->property("text").toString() == "停止本次提醒" && item->property("hovered").isValid()) alertButton = item;
         QVERIFY(alertButton);
         for (bool dark : {false, true}) {
-            controller.setDarkMode(dark);
+            controller.settings()->setThemeMode(dark ? "dark" : "light");
             const QPoint center = alertButton->mapToScene(QPointF(alertButton->width()/2, alertButton->height()/2)).toPoint();
             QTest::mouseMove(window, center);
             QTest::qWait(30);
@@ -161,9 +212,16 @@ private slots:
         QVERIFY(controller.hasWarning());
         auto* hud = window->findChild<QQuickItem*>("hudCard");
         QVERIFY(hud && hud->isVisible());
+        {
+            QString offender;
+            QVERIFY2(timesFullyShown(hud, &offender),
+                     qPrintable("HUD 发震时刻被截断: " + offender));
+        }
         QVERIFY(screenshot("02-hud"));
         auto* map = window->findChild<QQuickItem*>("mapView");
         QVERIFY(map);
+        // S 波径向渐变填充（QtQuick.Shapes）须已实例化，否则说明该 QML 模块加载失败。
+        QVERIFY(window->findChild<QQuickItem*>("sWaveFill"));
         const double oldZoom = map->property("zoom").toDouble();
         QVERIFY(QMetaObject::invokeMethod(map, "zoomAt", Q_ARG(QVariant, 500), Q_ARG(QVariant, 400), Q_ARG(QVariant, 1.0)));
         QVERIFY(!map->property("following").toBool());
@@ -224,6 +282,67 @@ private slots:
         controller.onTick();
         QVERIFY(!controller.hasWarning());
         QVERIFY(!controller.countdownTimer_.isActive());
+        // 多个活动地震：HUD 底部分页器应保持紧凑，不占用过多纵向空间。
+        {
+            auto p1 = e;
+            p1.id = p1.eventId = "GUI-P1"; p1.location = "第一起事件（仅测试）";
+            p1.pWaveArrival.reset(); p1.sWaveArrival.reset();
+            p1.magnitude = 4.1; p1.longitude = 104.0;
+            auto p2 = p1;
+            p2.id = p2.eventId = "GUI-P2"; p2.location = "第二起事件（仅测试）"; p2.longitude = 105.2;
+            now += 1000; p1.timestamp = now; p2.timestamp = now;
+            controller.handleEvent(p1, false, false);
+            controller.handleEvent(p2, false, false);
+            QTRY_COMPARE(controller.hudCount(), 2);
+            auto* pager = window->findChild<QQuickItem*>("hudPager");
+            QVERIFY(pager && pager->isVisible());
+            // 紧凑：分页器高度不得超过一个小图标按钮（24px）+ 少量余量。
+            QVERIFY2(pager->height() <= 28,
+                     qPrintable(QStringLiteral("HUD 分页器过高: %1px").arg(pager->height())));
+            QVERIFY(screenshot("03-hud-pager"));
+            // 翻页按钮可用：2 页时下一页按 (i+1)%2 前进，上一页回到原页。
+            const int start = controller.hudIndex();
+            QVERIFY(clickText("下一个事件"));
+            QCOMPARE(controller.hudIndex(), (start + 1) % 2);
+            QVERIFY(clickText("上一个事件"));
+            QCOMPARE(controller.hudIndex(), start);
+        }
+        // 空闲自动归位：无活动预警时回到「我的位置」；有活动预警时回到预警震中并重新跟随。
+        {
+            map->setProperty("idleResetMs", 250);
+            const auto dragBy = [&](double dx) {
+                const QPointF origin = map->mapToScene(QPointF(map->width() / 2, map->height() / 2));
+                QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, origin.toPoint());
+                QTest::mouseMove(window, (origin + QPointF(dx, 0)).toPoint());
+                QTest::qWait(10);
+                QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, (origin + QPointF(dx, 0)).toPoint());
+            };
+            // (A) 仍有活动预警（上面添加的 p1/p2）：拖走后空闲 → 重新跟随预警震中。
+            {
+                QVERIFY(QMetaObject::invokeMethod(map, "frameEvent", Q_ARG(QVariant, true)));
+                QTest::qWait(600);
+                QVERIFY(map->property("following").toBool());
+                const double followLon = map->property("centerLon").toDouble();
+                dragBy(140);
+                QVERIFY(!map->property("following").toBool());
+                QVERIFY2(std::abs(map->property("centerLon").toDouble() - followLon) > 0.5,
+                         "拖动后镜头应离开震中");
+                QTRY_VERIFY_WITH_TIMEOUT(map->property("following").toBool(), 3000);
+                QTRY_VERIFY_WITH_TIMEOUT(std::abs(map->property("centerLon").toDouble() - followLon) < 1.0, 3000);
+            }
+            // (B) 停止全部预警后：拖走后空闲 → 回到我的位置。
+            while (controller.hasWarning()) controller.stopWarning();
+            QTest::qWait(50);
+            QVERIFY(QMetaObject::invokeMethod(map, "focusUser"));
+            QTest::qWait(500);
+            const QVariantMap user = map->property("shiftedUser").toMap();
+            const double userLon = user.value("lon").toDouble();
+            dragBy(140);
+            QVERIFY(!map->property("following").toBool());
+            QVERIFY2(std::abs(map->property("centerLon").toDouble() - userLon) > 0.05,
+                     "拖动后镜头应离开我的位置");
+            QTRY_VERIFY_WITH_TIMEOUT(std::abs(map->property("centerLon").toDouble() - userLon) < 0.01, 3000);
+        }
         QVERIFY(clickText("设置"));
         QVERIFY(window->property("showSettings").toBool());
         QVERIFY(screenshot("05-settings"));
@@ -233,7 +352,7 @@ private slots:
 
         // Theme changes preserve material ownership and readable primary controls.
         for (bool dark : {false, true}) {
-            controller.setDarkMode(dark);
+            controller.settings()->setThemeMode(dark ? "dark" : "light");
             controller.settings()->setBackgroundBlur(false);
             QTest::qWait(80);
             QVERIFY(!hud->property("blurActive").toBool());
@@ -250,6 +369,17 @@ private slots:
             QVERIFY(screenshot(dark ? "09-appearance-dark" : "09-appearance-light"));
             QVERIFY(clickText("返回地图"));
         }
+        // 展开事件列表，触发 EventTile 布局；布局绑定环会打印 "recursive rearrange"（见末尾断言）。
+        window->setProperty("showList", true);
+        QTest::qWait(250);
+        {
+            auto* sidebar = window->findChild<QQuickItem*>("eventSidebar");
+            QVERIFY(sidebar);
+            QString offender;
+            QVERIFY2(timesFullyShown(sidebar, &offender),
+                     qPrintable("列表发震时刻被截断: " + offender));
+        }
+        QVERIFY(screenshot("12-event-list"));
         window->resize(390, 720);
         QTest::qWait(200);
         QCOMPARE(map->width(), 390.0);
@@ -271,6 +401,9 @@ private slots:
         QVERIFY(screenshot("11-appearance-narrow"));
         // Every combo has exactly one indicator, and controls remain native/focusable.
         QVERIFY(!window->findChildren<QQuickItem*>("comboIndicator").isEmpty());
+        // 任何 QML 布局回调形成绑定环都会打印 "Detected recursive rearrange"；不得出现。
+        for (const auto& warning : qmlWarnings)
+            QVERIFY2(!warning.contains("recursive rearrange"), qPrintable(warning));
     }
 
     void settingsNavigationAndTheme() {
@@ -307,12 +440,17 @@ private slots:
         auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
         auto* light = findVisualItem(window, "lightThemeButton");
         auto* dark = findVisualItem(window, "darkThemeButton");
-        QVERIFY(page && sidebar && background && scroll && light && dark);
+        auto* systemTheme = findVisualItem(window, "systemThemeButton");
+        QVERIFY(page && sidebar && background && scroll && light && dark && systemTheme);
         QTest::qWait(100);
         QVERIFY(sidebar->isVisible());
         QCOMPARE(page->property("currentSection").toInt(), 0);
-        QVERIFY(light->property("checked").toBool());
+        // 默认是「跟随系统」；测试环境无深色配色方案，故解析结果为浅色。
+        QCOMPARE(controller.settings()->themeMode(), QString("system"));
+        QVERIFY(systemTheme->property("checked").toBool());
+        QVERIFY(!light->property("checked").toBool());
         QVERIFY(!dark->property("checked").toBool());
+        QVERIFY(!controller.darkMode());
         const QColor lightBackground = background->property("color").value<QColor>();
         QCOMPARE(lightBackground, QColor("#F4F7F7"));
         QCOMPARE(window->color(), lightBackground);
@@ -340,7 +478,7 @@ private slots:
         QVERIFY(click("darkThemeButton"));
         QTRY_VERIFY(controller.darkMode());
         QCOMPARE(themeChanges.count(), 1);
-        QVERIFY(controller.settings()->darkMode());
+        QVERIFY(controller.settings()->themeMode() == "dark");
         QVERIFY(dark->property("checked").toBool());
         QVERIFY(!light->property("checked").toBool());
         QCOMPARE(background->property("color").value<QColor>(), QColor("#101719"));
@@ -348,7 +486,7 @@ private slots:
         QCOMPARE(theme->property("accentForeground").value<QColor>(), QColor("#073637"));
         QCOMPARE(pickLocation->property("foregroundColor").value<QColor>(), QColor("#073637"));
         SettingsStore persisted;
-        QVERIFY(persisted.darkMode());
+        QVERIFY(persisted.themeMode() == "dark");
         {
             AppController reloaded(nullptr, false);
             QVERIFY(reloaded.darkMode());
@@ -361,7 +499,7 @@ private slots:
         QTest::keyClick(window, Qt::Key_Space);
         QTRY_VERIFY(!controller.darkMode());
         QCOMPARE(themeChanges.count(), 2);
-        QVERIFY(!persisted.darkMode());
+        QVERIFY(persisted.themeMode() == "light");
         QCOMPARE(background->property("color").value<QColor>(), lightBackground);
         QVERIFY(capture("settings-selected-light"));
 
@@ -404,7 +542,10 @@ private slots:
         QTRY_VERIFY(!dialog->property("visible").toBool());
         QVERIFY(!controller.darkMode());
         QVERIFY(!controller.settings()->reduceMotion());
-        QVERIFY(light->property("checked").toBool());
+        // 恢复默认后主题回到「跟随系统」，选中态必须跟着回落，不能停在旧按钮上。
+        QCOMPARE(controller.settings()->themeMode(), QString("system"));
+        QVERIFY(systemTheme->property("checked").toBool());
+        QVERIFY(!light->property("checked").toBool());
         QVERIFY(!dark->property("checked").toBool());
         QCOMPARE(background->property("color").value<QColor>(), lightBackground);
 
@@ -484,7 +625,6 @@ private slots:
         qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
         AppController controller(nullptr, false);
         controller.settings()->setEnableSoundAlert(false);
-        controller.settings()->setEnableSpeech(false);
         controller.settings()->setBackgroundBlur(true);
         QQmlApplicationEngine engine;
         configureNativeUi(engine);
@@ -553,7 +693,7 @@ private slots:
         QVERIFY(mark && mark->parentItem() == card);
         const QPoint markCenter = mark->mapToScene(QPointF(mark->width() / 2, mark->height() / 2)).toPoint();
         for (bool dark : {false, true}) {
-            controller.setDarkMode(dark);
+            controller.settings()->setThemeMode(dark ? "dark" : "light");
             controller.settings()->setBackgroundBlur(true);
             const QString theme = dark ? "dark" : "light";
             const auto blurred = capture();

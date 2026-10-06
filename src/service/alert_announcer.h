@@ -9,14 +9,13 @@
 namespace komira {
 
 class AlertSoundService;
-class SpeechService;
 class SettingsStore;
 
-/// 告警编排：音效 + 语音。《NATIVE_PORT_SPEC》 §10。
+/// 告警编排：音效。《NATIVE_PORT_SPEC》 §10。
 class AlertAnnouncer : public QObject {
     Q_OBJECT
 public:
-    AlertAnnouncer(SettingsStore* settings, AlertSoundService* sound, SpeechService* speech,
+    AlertAnnouncer(SettingsStore* settings, AlertSoundService* sound,
                    QObject* parent = nullptr);
 
     void onWarning(const EarthquakeEvent& event);
@@ -35,16 +34,15 @@ private:
         bool warned = false;
         bool cautioned = false;
         bool intense = false;
+        bool arrived = false;
         QSet<int> countdownSeconds;
     };
 
     EventState& stateFor(const EarthquakeEvent& event);
     static QString eventKey(const EarthquakeEvent& event);
-    void speakPhase(const EarthquakeEvent& event, EventState& state);
 
     SettingsStore* settings_;
     AlertSoundService* sound_;
-    SpeechService* speech_;
     QHash<QString, EventState> states_;
 };
 

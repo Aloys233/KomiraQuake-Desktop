@@ -15,7 +15,7 @@ GlassCard {
     readonly property bool hasPager: pageCount > 1
     visible: !!event
     implicitWidth: 352
-    implicitHeight: mainRow.implicitHeight + 28 + (hasPager ? pager.implicitHeight + 8 : 0)
+    implicitHeight: mainRow.implicitHeight + 28 + (hasPager ? pager.implicitHeight + 6 : 0)
     // Active is seismic state, not a selected surface. Retain the frosted material.
     color: backdropSource ? (blurActive ? theme.backdropTint : theme.backdropFallback) : theme.glassCard
     border.color: theme.glassBorder
@@ -54,14 +54,16 @@ GlassCard {
                 }
                 Text {
                     Layout.fillWidth: true
-                    text: !root.event ? "" : root.event.isCanceled ? "已取消的事件" : root.event.ended ? "本次提醒已结束"
-                          : !root.active ? (root.selected ? "已选目录事件" : "最近目录事件")
-                          : root.event.levelTag === "CRITICAL" ? "严重地震预警" : "地震预警"
+                    // 报文展示名（对齐 kanameishi 的 titleText），不再硬编码「地震预警」。
+                    text: root.event ? root.event.source : ""
                     color: root.active && root.event ? root.theme.severity(root.event.levelTag) : root.theme.outline
                     font.pixelSize: 12
                     elide: Text.ElideRight
                 }
-                Text { text: root.event ? "第 " + root.event.reportNum + " 报" : ""; color: root.theme.outline; font.pixelSize: 11 }
+                Text {
+                    text: root.event ? (root.event.isCanceled ? "取消报" : "第 " + root.event.reportNum + " 报") : ""
+                    color: root.theme.outline; font.pixelSize: 11
+                }
             }
 
             Text {
@@ -75,45 +77,50 @@ GlassCard {
                 elide: Text.ElideRight
             }
 
+            // 发震时刻独占一行：不参与任何伸缩，始终完整显示。
+            Text {
+                width: parent.width
+                text: root.event ? root.event.timeText + "  UTC+8" : ""
+                color: root.theme.outline
+                font.family: root.theme.numberFamily
+                font.pixelSize: 12
+                elide: Text.ElideRight
+            }
+
             RowLayout {
                 width: parent.width
                 spacing: 8
                 Text {
                     Layout.fillWidth: true
                     Layout.alignment: Qt.AlignBaseline
-                    text: root.event ? root.event.timeText + "  UTC+8" : ""
+                    text: root.event ? "M " + root.event.magnitudeText + " · 深度 " + root.event.depthText + " km" : ""
                     color: root.theme.outline
-                    font.family: root.theme.numberFamily
                     font.pixelSize: 12
                     elide: Text.ElideRight
                 }
+                // 数据源标注（提供方·机构）：次要信息，放在震级/深度行右侧。
                 Text {
                     Layout.alignment: Qt.AlignBaseline
                     text: root.event ? root.event.sourceTag : ""
                     color: root.theme.outline
                     font.pixelSize: 11
+                    elide: Text.ElideRight
                 }
-            }
-
-            Text {
-                width: parent.width
-                text: root.event ? "M " + root.event.magnitudeText + " · 深度 " + root.event.depthText + " km"
-                      + (root.event.hasDistance ? " · 距你 " + root.event.distanceText + " km" : " · 本地距离未知") : ""
-                color: root.theme.outline
-                font.pixelSize: 12
-                elide: Text.ElideRight
             }
         }
     }
 
+    // 多事件分页：紧凑一行，避免占用过多纵向空间。
     RowLayout {
         id: pager
+        objectName: "hudPager"
         visible: root.hasPager
-        x: 14; y: 14 + mainRow.implicitHeight + 8
+        x: 14; y: 14 + mainRow.implicitHeight + 6
         width: parent.width - 28
-        spacing: 8
+        spacing: 4
         GlassButton {
-            theme: root.theme; flat: true; iconName: "chevron-left"
+            theme: root.theme; flat: true; iconName: "chevron-left"; customRadius: 8
+            implicitWidth: 24; implicitHeight: 24
             accessibleName: "上一个事件"; onClicked: root.prevPage()
         }
         Text {
@@ -125,7 +132,8 @@ GlassCard {
             font.pixelSize: 11
         }
         GlassButton {
-            theme: root.theme; flat: true; iconName: "chevron-right"
+            theme: root.theme; flat: true; iconName: "chevron-right"; customRadius: 8
+            implicitWidth: 24; implicitHeight: 24
             accessibleName: "下一个事件"; onClicked: root.nextPage()
         }
     }

@@ -44,11 +44,12 @@ struct PancakesProtocol {
         return source.toUpper();
     }
 
+    /// 报文展示名（HUD 标题）。
     static QString titleFor(const QString& source) {
-        if (source == "gq") return QStringLiteral("GlobalQuake 全球地震");
-        if (source == "usgs") return QStringLiteral("USGS 全球地震");
+        if (source == "gq") return QStringLiteral("GlobalQuake地震信息");
+        if (source == "usgs") return QStringLiteral("USGS 地震信息");
         if (source == "jma_eew") return QStringLiteral("JMA 紧急地震速报");
-        if (source == "jma_eqlist") return QStringLiteral("JMA 地震速报");
+        if (source == "jma_eqlist") return QStringLiteral("JMA 地震情报");
         return source;
     }
 

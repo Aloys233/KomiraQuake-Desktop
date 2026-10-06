@@ -39,7 +39,7 @@ jobs:
         with:
           version: '6.8.3'
           arch: linux_gcc_64
-          modules: 'qtmultimedia qtspeech qtwebsockets'
+          modules: 'qtmultimedia qtwebsockets'
           cache: true
 
       - name: Install build dependencies
@@ -49,8 +49,7 @@ jobs:
             ninja-build libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xkb1 \
-            libxcb-xinerama0 \
-            libspeechd2
+            libxcb-xinerama0
 
       - name: Configure
         run: |
@@ -147,7 +146,7 @@ jobs:
         with:
           version: '6.8.3'
           arch: win64_msvc2022_64
-          modules: 'qtmultimedia qtspeech qtwebsockets'
+          modules: 'qtmultimedia qtwebsockets'
           cache: true
 
       - name: Set up MSVC

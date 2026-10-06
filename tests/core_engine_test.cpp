@@ -12,6 +12,7 @@
 #include "core/event_gate.h"
 #include "core/intensity_calculator.h"
 #include "core/quake_calculator.h"
+#include "core/sound_queue.h"
 #include "core/time_sync.h"
 #include "core/travel_table.h"
 #include "model/earthquake_event.h"
@@ -39,15 +40,6 @@ int main() {
     const auto [p, s] = QuakeCalculator::estimateTravelTimes(0.0, 60.0);
     check(near(p, 10.0) && near(s, 60.0 / 3.5), "constant-velocity travel times");
     check(!QuakeCalculator::isValidCoordinate(95.0, 100.0), "coordinate validation");
-    // 波前离开中国范围的隐藏判定：震中成都（30.66,104.06）。
-    check(!QuakeCalculator::bothWavesBeyondChina(30.66, 104.06, 100.0, 80.0),
-          "waves inside China stay visible");
-    check(!QuakeCalculator::bothWavesBeyondChina(30.66, 104.06, 100.0, 30000.0),
-          "P inside China keeps both visible");
-    check(QuakeCalculator::bothWavesBeyondChina(30.66, 104.06, 30000.0, 25000.0),
-          "both waves beyond China hidden");
-    check(QuakeCalculator::bothWavesBeyondChina(30.66, 104.06, -1.0, -1.0),
-          "out-of-range waves count as beyond China");
     // 同一地震判定：实时预警与目录发震时刻/震中一致但 ID 不同。
     const long long t0 = 1'700'000'000'000LL;
     check(QuakeCalculator::isSameQuake(t0, 25.088, 102.737, t0, 25.09, 102.73),
@@ -68,6 +60,22 @@ int main() {
     check(IntensityCalculator::formatCsis(4.2) == "IV", "CSIS roman IV");
     check(IntensityCalculator::formatCsis(20.0) == "XII", "CSIS roman clamp XII");
     check(IntensityCalculator::formatJma(9.0, 1.0, 1.0) == "7", "JMA band 7");
+    // 波前影响半径（CSIS 可感下限 I）与分段渐隐。
+    const double r6 = IntensityCalculator::distanceForCsis(6.0, 10.0, 1.0);
+    check(r6 > 0.0 && near(IntensityCalculator::rawCsis(6.0, r6, 10.0), 1.0, 0.02),
+          "distanceForCsis hits CSIS I");
+    check(IntensityCalculator::distanceForCsis(7.0, 10.0, 1.0) >
+              IntensityCalculator::distanceForCsis(4.0, 10.0, 1.0),
+          "fade radius grows with magnitude");
+    check(near(IntensityCalculator::distanceForCsis(0.0, 10.0, 1.0), 0.0), "fade radius zero for M0");
+    check(near(IntensityCalculator::waveOpacity(400.0, 1000.0), 1.0), "wave opacity full inside 0.8fade");
+    check(near(IntensityCalculator::waveOpacity(1000.0, 1000.0), 0.25), "wave opacity 0.25 at fade");
+    check(near(IntensityCalculator::waveOpacity(10000.0, 1000.0), 0.0), "wave opacity 0 at hard max");
+    check(near(IntensityCalculator::waveOpacity(12000.0, 1000.0), 0.0), "wave opacity 0 beyond hard max");
+    // S 波填充只在影响半径内可见，且由 0.25 递减到 0。
+    check(near(IntensityCalculator::waveFillOpacity(200.0, 1000.0), 0.25), "S fill 0.25 inside 0.8fade");
+    check(near(IntensityCalculator::waveFillOpacity(1000.0, 1000.0), 0.0), "S fill 0 at fade");
+    check(near(IntensityCalculator::waveFillOpacity(1500.0, 1000.0), 0.0), "S fill hidden beyond fade");
 
     // ---- CoordinateTransform --------------------------------------------
     const auto identity = CoordinateTransform::wgs84ToGcj02(35.0, 139.0);
@@ -206,6 +214,42 @@ int main() {
         check(clock.now() == 1'001, "clock keeps anchoring while stale");
         clock.reset();
         check(clock.state() == ClockState::Local, "clock reset returns to local");
+    }
+
+    // ---- SoundQueue: 串行播报，新语句不得打断未播完的语句 ---------------
+    {
+        SoundQueue queue;
+        check(queue.empty(), "sound queue starts empty");
+        queue.enqueue("issue");
+        queue.enqueue("warn");
+        check(queue.size() == 2, "two clips queued");
+        check(queue.take() == "issue", "queue preserves arrival order");
+        check(!queue.empty(), "still pending after first take");
+        check(queue.take() == "warn", "second clip follows first");
+        check(queue.take().empty(), "take on empty queue yields nothing");
+
+        queue.enqueue("hypocenter");
+        check(!queue.enqueue("hypocenter"), "duplicate clip is not queued twice");
+        check(queue.size() == 1, "duplicate enqueue keeps queue size");
+
+        queue.clear();
+        check(queue.empty(), "clear empties the queue");
+
+        SoundQueue bounded;
+        bounded.setMaxSize(3);
+        for (int i = 0; i < 5; ++i) bounded.enqueue("clip" + std::to_string(i));
+        check(bounded.size() == 3, "queue honours max size");
+        check(bounded.take() == "clip2", "overflow drops the oldest clips");
+
+        // 语句通道积压时后续语句仍须完整播出：长音频只推迟，不截断。
+        SoundQueue backlog;
+        backlog.enqueue("issue");
+        backlog.enqueue("warn");
+        backlog.enqueue("hypocenter");
+        check(backlog.size() == 3, "statements queue instead of interrupting");
+        check(backlog.take() == "issue", "first statement plays first");
+        check(backlog.take() == "warn", "second statement is not cut off");
+        check(backlog.take() == "hypocenter", "third statement is not cut off");
     }
 
     std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES",

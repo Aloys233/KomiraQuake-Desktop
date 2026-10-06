@@ -11,6 +11,7 @@
 #include "model/data_source_info.h"
 #include "model/earthquake_event.h"
 #include "source/eew_parser.h"
+#include "source/earthquake_source.h"
 #include "source/pancakes_parser.h"
 
 namespace komira {
@@ -20,30 +21,28 @@ namespace komira {
 /// 连接 `wss://api.aloys23.link/api/v1/alert/ws/all`，只处理 gq / usgs / jma_eew /
 /// jma_eqlist 四类地震事件；气象、海洋与火山事件一律忽略。服务端每 30s 发送 WebSocket
 /// Ping，QWebSocket 自动回 Pong，无需业务层心跳或订阅报文。
-class PancakesSource : public QObject {
+class PancakesSource : public EarthquakeSource {
     Q_OBJECT
 public:
     explicit PancakesSource(QObject* parent = nullptr);
 
-    void start();
-    void stop();
-    void setUserLocation(double lat, double lon);
-    void clearUserLocation();
-    void setStandard(IntensityStandard standard) { standard_ = standard; }
+    QString id() const override { return SourceIds::kPancakes; }
+
+    void start() override;
+    void stop() override;
+    void setUserLocation(double lat, double lon) override;
+    void clearUserLocation() override;
+    void setStandard(IntensityStandard standard) override { standard_ = standard; }
     /// Explicit directory refresh; ignored while disabled. Location changes are local only.
-    void refreshDirectory();
+    void refreshDirectory() override;
 
     /// 校时后的墙钟（epoch ms）：新鲜度判定与心跳展示走它。
-    void setNowProvider(std::function<long long()> provider) { nowProvider_ = std::move(provider); }
+    void setNowProvider(std::function<long long()> provider) override { nowProvider_ = std::move(provider); }
     /// 单调耗时（ms）：目录轮询 RTT 量测走它，不受系统时间影响。
-    void setMonoProvider(std::function<long long()> provider) { monoProvider_ = std::move(provider); }
+    void setMonoProvider(std::function<long long()> provider) override { monoProvider_ = std::move(provider); }
 
     bool hasLocation() const { return hasLocation_; }
-    DataSourceInfo info() const { return info_; }
-
-signals:
-    void eventReceived(const komira::EarthquakeEvent& event, PancakesKind kind);
-    void infoChanged();
+    DataSourceInfo info() const override { return info_; }
 
 private:
     void connectSocket();

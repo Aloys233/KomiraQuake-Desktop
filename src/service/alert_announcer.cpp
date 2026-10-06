@@ -1,16 +1,14 @@
 #include "service/alert_announcer.h"
 
-#include <QSet>
-
+#include "core/intensity_calculator.h"
 #include "prefs/settings_store.h"
 #include "service/alert_sound_service.h"
-#include "service/speech_service.h"
 
 namespace komira {
 
 AlertAnnouncer::AlertAnnouncer(SettingsStore* settings, AlertSoundService* sound,
-                               SpeechService* speech, QObject* parent)
-    : QObject(parent), settings_(settings), sound_(sound), speech_(speech) {}
+                               QObject* parent)
+    : QObject(parent), settings_(settings), sound_(sound) {}
 
 QString AlertAnnouncer::eventKey(const EarthquakeEvent& event) {
     return QString::fromStdString(event.identity());
@@ -27,14 +25,22 @@ bool AlertAnnouncer::eligible(const EarthquakeEvent& event) const {
     if (!settings_->enableWarnings()) return false;
     if (event.isCanceled) return false;
     // 唯一过滤条件：本地预估烈度是否达到阈值（0 表示不作筛选，无定位放行）。
+    // 按displayedLevel 比较，即「设置页所选显示标准」下的显示级数：
+    //   - 取显示档位而非raw 原始值，否则 raw 2.6 显示为Ⅲ度、阈值 3.0 却被判为未达到；
+    //   - 跟随所选标准，否则选 JMA 时会拿 CSIS 阈值去比震度，量纲不同。
     const double filter = settings_->localIntensityFilter();
-    if (filter > 0.0 && event.distanceKm >= 0.0 && event.rawIntensity < filter) return false;
+    if (filter > 0.0 && event.distanceKm >= 0.0) {
+        const auto standard = settings_->intensityStandard() == 1 ? IntensityStandard::Jma
+                                                                    : IntensityStandard::Csis;
+        const double level = IntensityCalculator::displayedLevel(
+            event.magnitude, event.rawIntensity, event.distanceKm, event.depth, standard);
+        if (level < filter) return false;
+    }
     return true;
 }
 
 void AlertAnnouncer::stopOutput() {
     sound_->stopAll();
-    speech_->stop();
 }
 
 void AlertAnnouncer::finish(const EarthquakeEvent& event, bool ownsOutput) {
@@ -61,7 +67,6 @@ void AlertAnnouncer::onWarning(const EarthquakeEvent& event) {
         state.cautioned = true;
         sound_->play(QStringLiteral("caution"));
     }
-    speakPhase(event, state);
     state.issued = true;
 }
 
@@ -82,48 +87,27 @@ void AlertAnnouncer::onCountdown(const EarthquakeEvent& event, long long nowMs) 
             sound_->playIntense();
         }
     }
-
-    static const QSet<int> speechSeconds = {10, 20, 30};
-    if (settings_->speakCountdown() && speechSeconds.contains(seconds)) {
-        speech_->speak(QStringLiteral("预计还有 %1 秒。").arg(seconds),
-                       eventKey(event) + QStringLiteral(":countdown:%1").arg(seconds), 2000);
-    }
 }
 
 void AlertAnnouncer::onArrived(const EarthquakeEvent& event) {
     if (settings_->isMuted() || !eligible(event)) return;
+    EventState& state = stateFor(event);
+    if (state.arrived) return;
+    state.arrived = true;
+    // 与 Android 同规则：只有确实播过倒计时的事件才播抵达，避免从未提醒过的事件
+    // 在倒计时缺席的情况下凭空播报抵达。
+    if (state.countdownSeconds.isEmpty()) return;
+    // 抵达提示：`0s` + 两下计时音走提示通道连播，与 hypocenter 并发。
+    sound_->playArrivalCues();
     sound_->play(QStringLiteral("hypocenter"), 10000);
 }
 
 void AlertAnnouncer::onMuteChanged() {
     if (settings_->isMuted()) {
         sound_->stopAll();
-        speech_->stop();
     }
 }
 
 void AlertAnnouncer::clear() { states_.clear(); }
-
-void AlertAnnouncer::speakPhase(const EarthquakeEvent& event, EventState& state) {
-    if (!settings_->enableSpeech()) return;
-    const QString location = QString::fromStdString(event.location);
-    QString text;
-    if (event.isFinal) {
-        text = QStringLiteral("%1 地震，最终报，震级 %2。")
-                   .arg(location)
-                   .arg(event.magnitude, 0, 'f', 1);
-    } else if (!state.issued) {
-        text = QStringLiteral("%1 发生地震，预估烈度 %2，震级 %3。")
-                   .arg(location, QString::fromStdString(event.estimatedIntensity))
-                   .arg(event.magnitude, 0, 'f', 1);
-    } else if (event.warningLevel == WarningLevel::Critical) {
-        text = QStringLiteral("严重地震预警，%1，请立即避险。").arg(location);
-    } else if (settings_->speakUpdates()) {
-        text = QStringLiteral("地震预警更新，%1，震级 %2。").arg(location).arg(event.magnitude, 0, 'f', 1);
-    }
-    if (!text.isEmpty()) {
-        speech_->speak(text, eventKey(event) + QStringLiteral(":") + QString::number(event.reportNum), 6000);
-    }
-}
 
 } // namespace komira

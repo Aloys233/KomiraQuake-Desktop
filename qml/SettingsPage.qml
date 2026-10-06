@@ -2,6 +2,8 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 
+// 设置页外壳：工具条 + 侧栏（窄屏退化为下拉）+ 单一分区面板。
+// 分区内容拆到 settings/*Section.qml；此处只负责导航与「恢复默认」。
 Item {
     id: root
     objectName: "settingsPage"
@@ -11,21 +13,14 @@ Item {
     readonly property var sections: [
         { key: "appearance", title: "界面与地图", icon: "layers", description: "选择舒适的外观，调整地图的显示方式。" },
         { key: "location", title: "定位与基准地", icon: "map-pin", description: "设置用于估算本地烈度、距离与预计到时的位置。" },
-        { key: "warning", title: "预警策略", icon: "shield", description: "决定何时提醒，以及如何显示本地预警。" },
-        { key: "audio", title: "音效与语音", icon: "volume-2", description: "管理警报声音、音量与语音播报。" },
+        { key: "warning", title: "预警策略", icon: "shield", description: "决定何时提醒，不再展开的选项会置灰显示。" },
+        { key: "audio", title: "警报提醒", icon: "volume-2", description: "管理警报声音、系统通知与窗口弹窗。" },
         { key: "source", title: "数据源", icon: "radio", description: "查看各数据源的连接与目录刷新状态。" },
         { key: "clock", title: "时间校准", icon: "clock", description: "网络授时：开关、自定义 NTP 服务器与校准状态。" },
         { key: "about", title: "自启与更新", icon: "refresh-cw", description: "管理开机自启与静默启动，检查新版本。" }
     ]
     signal back()
     signal pickLocationRequested()
-    /// 数据源状态行：连接/延迟 + 目录刷新 + 说明。
-    function sourceLine(s) {
-        if (!s) return "";
-        const prefix = s.enabled ? "" : "（已停用）";
-        return prefix + "连接：" + s.status + " · 延迟 " + s.latency + "\n"
-             + s.directory + " · " + s.directoryLatency + "\n" + s.description;
-    }
     onCurrentSectionChanged: flick.contentY = 0
     onVisibleChanged: if (visible) root.forceActiveFocus()
     Keys.onEscapePressed: root.back()
@@ -135,241 +130,36 @@ Item {
                         Text { width: parent.width; text: root.sections[root.currentSection].description; wrapMode: Text.Wrap; color: root.theme.outline; font.pixelSize: 13; lineHeight: 1.4 }
                     }
 
-                    Column {
-                        objectName: "settingsPanel-appearance"
-                        width: parent.width; spacing: 20; visible: root.currentSection === 0
-                        SettingsSection {
-                            width: parent.width; theme: root.theme; title: "外观"; iconName: "sun"
-                            RowLayout {
-                                width: parent.width; spacing: 12
-                                Repeater {
-                                    model: [{ title: "浅色", icon: "sun", dark: false }, { title: "深色", icon: "moon", dark: true }]
-                                    RadioButton {
-                                        id: themeChoice
-                                        required property var modelData
-                                        objectName: modelData.dark ? "darkThemeButton" : "lightThemeButton"
-                                        Layout.fillWidth: true; Layout.minimumWidth: 0; Layout.preferredHeight: 76
-                                        text: modelData.title
-                                        checked: app.darkMode === modelData.dark
-                                        hoverEnabled: true; focusPolicy: Qt.StrongFocus
-                                        Accessible.name: text + "主题"
-                                        onClicked: app.darkMode = modelData.dark
-                                        indicator: Item {}
-                                        background: Rectangle {
-                                            radius: 12
-                                            color: themeChoice.checked ? root.theme.accentContainer : themeChoice.hovered ? root.theme.glassCardHover : root.theme.surface
-                                            border.width: themeChoice.visualFocus || themeChoice.checked ? 2 : 1
-                                            border.color: themeChoice.checked || themeChoice.visualFocus ? root.theme.accent : root.theme.glassBorder
-                                        }
-                                        contentItem: RowLayout {
-                                            spacing: 8
-                                            AppIcon { Layout.leftMargin: 12; name: themeChoice.modelData.icon; size: 22; color: themeChoice.checked ? root.theme.accent : root.theme.outline }
-                                            Text { Layout.fillWidth: true; text: themeChoice.text; font.pixelSize: 14; font.weight: Font.Medium; color: root.theme.textPrimary }
-                                            AppIcon { Layout.rightMargin: 10; name: "circle-check"; size: 16; opacity: themeChoice.checked ? 1 : 0; color: root.theme.accent }
-                                        }
-                                    }
-                                }
-                            }
-                            Text { width: parent.width; text: "默认使用浅色。选择会自动保存，并应用到整个界面。"; wrapMode: Text.Wrap; color: root.theme.outline; font.pixelSize: 12 }
-                            GlassSwitch {
-                                objectName: "backgroundBlurSwitch"
-                                width: parent.width; theme: root.theme; text: "背景模糊"
-                                description: root.GraphicsInfo.api === GraphicsInfo.Software
-                                    ? "当前为软件渲染，不支持背景模糊；即使开启也会使用实色表面。"
-                                    : root.GraphicsInfo.api === GraphicsInfo.Unknown
-                                    ? "渲染后端尚未就绪，暂用实色表面；就绪后按此开关启用地图浮层模糊。"
-                                    : "模糊地图浮层后方，保持文字清晰；列表和设置页使用实色表面。"
-                                checked: app.settings.backgroundBlur
-                                onToggled: app.settings.backgroundBlur = checked
-                            }
-                            GlassSwitch { objectName: "reduceMotionSwitch"; width: parent.width; theme: root.theme; text: "减少动态效果"; description: "停用装饰过渡。真实波前、预计倒计时和数据更新不受影响。"; checked: app.settings.reduceMotion; onToggled: app.settings.reduceMotion = checked }
-                        }
-                        SettingsSection {
-                            width: parent.width; theme: root.theme; title: "地图显示"; iconName: "map"
-                            Column {
-                                width: parent.width; spacing: 10
-                                Text { text: "底图"; color: root.theme.textPrimary; font.pixelSize: 14 }
-                                GlassComboBox {
-                                    objectName: "basemapCombo"
-                                    width: parent.width; theme: root.theme; Accessible.name: "底图"
-                                    model: ["高德标准 · GCJ-02", "高德卫星 · GCJ-02", "Petal · GCJ-02", "OpenStreetMap · WGS-84", "自定义底图"]
-                                    currentIndex: Math.max(0, ["amap_vector","amap_satellite","petal","osm","custom"].indexOf(app.settings.basemapId))
-                                    onActivated: index => app.settings.basemapId = ["amap_vector","amap_satellite","petal","osm","custom"][index]
-                                }
-                            }
-                            Column {
-                                width: parent.width; spacing: 10; visible: app.settings.basemapId === "custom"
-                                GlassTextField { width: parent.width; theme: root.theme; placeholderText: "瓦片 URL 模板：{z}/{x}/{y}"; Accessible.name: "自定义瓦片 URL"; text: app.settings.customBasemapUrl; onEditingFinished: app.settings.customBasemapUrl = text }
-                                GlassComboBox { width: parent.width; theme: root.theme; Accessible.name: "自定义底图坐标系"; model: ["WGS-84", "GCJ-02"]; currentIndex: app.settings.customBasemapDatum; onActivated: index => app.settings.customBasemapDatum = index }
-                            }
-                        }
+                    // 全部分区都实例化，仅按 currentSection 切换 visible。
+                    AppearanceSection {
+                        width: parent.width; theme: root.theme
+                        visible: root.currentSection === 0; height: visible ? implicitHeight : 0
                     }
-
-                    SettingsSection {
-                        objectName: "settingsPanel-location"
-                        width: parent.width; theme: root.theme; title: "基准位置"; iconName: "map-pin"; visible: root.currentSection === 1
-                        Column {
-                            width: parent.width; spacing: 6
-                            Text { width: parent.width; text: app.locationName; color: root.theme.textPrimary; font.pixelSize: 16; wrapMode: Text.Wrap }
-                            Text { width: parent.width; text: app.locationStatusText + " · " + app.userLatitude.toFixed(4) + "°, " + app.userLongitude.toFixed(4) + "°"; color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap }
-                            Text { width: parent.width; text: "本地烈度、距离与预计到时以此位置估算。未定位时仍可接收地震事件。"; color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4 }
-                        }
-                        Flow {
-                            width: parent.width; spacing: 8
-                            GlassButton { theme: root.theme; text: "自动获取 IP 位置"; iconName: "globe"; onClicked: { app.requestLocation(); toast.show("已发起 IP 定位请求"); } }
-                            GlassButton { objectName: "pickLocationButton"; theme: root.theme; text: "在地图上点选位置"; iconName: "map-pin"; primary: true; onClicked: root.pickLocationRequested() }
-                        }
-                        Column {
-                            width: parent.width; spacing: 10
-                            Text { text: "常用城市"; color: root.theme.outline; font.pixelSize: 12 }
-                            Flow {
-                                width: parent.width; spacing: 8
-                                Repeater {
-                                    model: [{name:"北京",lat:39.9042,lon:116.4074}, {name:"上海",lat:31.2304,lon:121.4737}, {name:"成都",lat:30.5728,lon:104.0668}, {name:"昆明",lat:25.0453,lon:102.7097}, {name:"西安",lat:34.3416,lon:108.9398}, {name:"广州",lat:23.1291,lon:113.2644}, {name:"武汉",lat:30.5928,lon:114.3055}, {name:"台北",lat:25.0330,lon:121.5654}]
-                                    GlassButton {
-                                        required property var modelData
-                                        theme: root.theme; text: modelData.name; implicitWidth: 62; implicitHeight: 34
-                                        primary: Math.abs(app.userLatitude - modelData.lat) < 0.1 && Math.abs(app.userLongitude - modelData.lon) < 0.1
-                                        onClicked: { app.setManualLocation(modelData.lat, modelData.lon, modelData.name); manualLat.text = modelData.lat.toFixed(4); manualLon.text = modelData.lon.toFixed(4); toast.show("基准位置已切换至 " + modelData.name); }
-                                    }
-                                }
-                            }
-                        }
-                        GridLayout {
-                            width: parent.width
-                            columns: width > 510 ? 3 : 2
-                            columnSpacing: 10; rowSpacing: 10
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                Text { text: "纬度"; font.pixelSize: 12; color: root.theme.outline }
-                                GlassTextField { id: manualLat; objectName: "manualLatitude"; Layout.fillWidth: true; Layout.minimumWidth: 0; theme: root.theme; text: app.userLatitude.toFixed(4); placeholderText: "−90 ~ 90"; Accessible.name: "纬度" }
-                            }
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                Text { text: "经度"; font.pixelSize: 12; color: root.theme.outline }
-                                GlassTextField { id: manualLon; objectName: "manualLongitude"; Layout.fillWidth: true; Layout.minimumWidth: 0; theme: root.theme; text: app.userLongitude.toFixed(4); placeholderText: "−180 ~ 180"; Accessible.name: "经度" }
-                            }
-                            GlassButton {
-                                Layout.alignment: Qt.AlignBottom; theme: root.theme; text: "保存经纬度"; iconName: "check"
-                                onClicked: {
-                                    const la = Number(manualLat.text), lo = Number(manualLon.text);
-                                    if (manualLat.text.trim() && manualLon.text.trim() && isFinite(la) && isFinite(lo) && la >= -90 && la <= 90 && lo >= -180 && lo <= 180) {
-                                        app.setManualLocation(la, lo, "自定义坐标"); toast.show("基准坐标已应用");
-                                    } else toast.show("请输入有效的经纬度", false);
-                                }
-                            }
-                        }
+                    LocationSection {
+                        width: parent.width; theme: root.theme
+                        visible: root.currentSection === 1; height: visible ? implicitHeight : 0
+                        onPickLocationRequested: root.pickLocationRequested()
+                        onNotify: (message, success) => toast.show(message, success)
                     }
-                    SettingsSection {
-                        objectName: "settingsPanel-warning"
-                        width: parent.width; theme: root.theme; title: "提醒条件"; iconName: "shield"; visible: root.currentSection === 2
-                        GlassSwitch { objectName: "warningsSwitch"; width: parent.width; theme: root.theme; text: "地震预警"; description: "总开关。开启后仅按本地烈度过滤决定是否提醒；关闭时地震事件只展示，不产生声音、语音、震动或全屏预警。"; checked: app.settings.enableWarnings; onToggled: app.settings.enableWarnings = checked }
-                        Column {
-                            width: parent.width; spacing: 10
-                            Text { text: "烈度标准"; color: root.theme.textPrimary; font.pixelSize: 14 }
-                            GlassComboBox { width: parent.width; theme: root.theme; model: ["中国烈度 · CSIS", "日本震度 · JMA"]; Accessible.name: "烈度标准"; currentIndex: app.settings.intensityStandard; onActivated: index => app.settings.intensityStandard = index }
-                        }
-                        Column {
-                            width: parent.width; spacing: 6
-                            RowLayout { width: parent.width; Text { Layout.fillWidth: true; text: "本地烈度过滤"; color: root.theme.textPrimary; font.pixelSize: 14 } Text { text: app.settings.localIntensityFilter <= 0 ? "关闭" : app.settings.localIntensityFilter.toFixed(1) + " 度"; color: root.theme.textPrimary; font.family: root.theme.numberFamily; font.pixelSize: 14 } }
-                            GlassSlider { width: parent.width; theme: root.theme; from: 0; to: 8; stepSize: 0.5; value: app.settings.localIntensityFilter; Accessible.name: "本地烈度过滤"; onMoved: app.settings.localIntensityFilter = value }
-                            Text { width: parent.width; text: "仅当本地预估烈度达到该值时提醒；设为 0 表示不作筛选。"; color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4 }
-                        }
+                    WarningSection {
+                        width: parent.width; theme: root.theme
+                        visible: root.currentSection === 2; height: visible ? implicitHeight : 0
                     }
-                    SettingsSection {
-                        objectName: "settingsPanel-audio"
-                        width: parent.width; theme: root.theme; title: "声音与播报"; iconName: "volume-2"; visible: root.currentSection === 3
-                        GlassSwitch { width: parent.width; theme: root.theme; text: "警报音效"; description: "播放预警音效与倒计时提示音。"; checked: app.settings.enableSoundAlert; onToggled: app.settings.enableSoundAlert = checked }
-                        GlassSwitch { width: parent.width; theme: root.theme; text: "全局静音"; description: "停止声音与语音，保留视觉提醒。"; checked: app.settings.isMuted; onToggled: app.settings.isMuted = checked }
-                        Column {
-                            width: parent.width; spacing: 6
-                            RowLayout { width: parent.width; Text { Layout.fillWidth: true; text: "警报音量"; color: root.theme.textPrimary; font.pixelSize: 14 } Text { text: Math.round(app.settings.alertVolume * 100) + "%"; color: root.theme.textPrimary; font.family: root.theme.numberFamily; font.pixelSize: 14 } }
-                            GlassSlider { width: parent.width; theme: root.theme; from: 0; to: 1; stepSize: 0.05; value: app.settings.alertVolume; Accessible.name: "警报音量"; onMoved: app.settings.alertVolume = value }
-                        }
-                        GlassSwitch { width: parent.width; theme: root.theme; text: "语音播报"; description: app.speechAvailable ? "朗读震中、震级与预估烈度。" : "系统未安装可用的语音引擎。"; enabled: app.speechAvailable; checked: app.settings.enableSpeech; onToggled: app.settings.enableSpeech = checked }
-                        GlassSwitch { width: parent.width; theme: root.theme; text: "播报预计倒计时"; description: "预计 30、20、10 秒时播报。"; enabled: app.speechAvailable && app.settings.enableSpeech; checked: app.settings.speakCountdown; onToggled: app.settings.speakCountdown = checked }
-                        GlassSwitch { width: parent.width; theme: root.theme; text: "播报后续更新"; description: "报次递增时播报最新信息。"; enabled: app.speechAvailable && app.settings.enableSpeech; checked: app.settings.speakUpdates; onToggled: app.settings.speakUpdates = checked }
-                        Column {
-                            width: parent.width; spacing: 6; visible: app.speechAvailable && app.settings.enableSpeech
-                            RowLayout { width: parent.width; Text { Layout.fillWidth: true; text: "播报语速"; color: root.theme.textPrimary; font.pixelSize: 14 } Text { text: (app.settings.speechRate * 2).toFixed(1) + "×"; color: root.theme.textPrimary; font.pixelSize: 14 } }
-                            GlassSlider { width: parent.width; theme: root.theme; from: 0.1; to: 1; stepSize: 0.05; value: app.settings.speechRate; Accessible.name: "播报语速"; onMoved: app.settings.speechRate = value }
-                        }
-                        GlassButton { theme: root.theme; text: "试听预警语音"; iconName: "play"; enabled: app.speechAvailable && app.settings.enableSpeech; onClicked: app.sampleSpeech() }
+                    AudioSection {
+                        width: parent.width; theme: root.theme
+                        visible: root.currentSection === 3; height: visible ? implicitHeight : 0
                     }
-                    SettingsSection {
-                        objectName: "settingsPanel-source"
-                        width: parent.width; theme: root.theme; title: "数据源"; iconName: "radio"; visible: root.currentSection === 4
-                        GlassSwitch { objectName: "wolfxSwitch"; width: parent.width; theme: root.theme; text: "Wolfx 实时预警"; description: "Wolfx all_eew 聚合（CENC/SC/JMA/CWA/FJ/CQ）"; checked: app.settings.enabledWolfx; onToggled: app.settings.enabledWolfx = checked }
-                        Text { width: parent.width; text: root.sourceLine(app.sources[0]); color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4 }
-                        GlassSwitch { objectName: "pancakesSwitch"; width: parent.width; theme: root.theme; text: "Pancakes 实时预警"; description: "api.aloys23.link 聚合（GQ / USGS / JMA）"; checked: app.settings.enabledPancakes; onToggled: app.settings.enabledPancakes = checked }
-                        Text { width: parent.width; text: root.sourceLine(app.sources[1]); color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4 }
+                    SourceSection {
+                        width: parent.width; theme: root.theme
+                        visible: root.currentSection === 4; height: visible ? implicitHeight : 0
                     }
-                    SettingsSection {
-                        objectName: "settingsPanel-clock"
-                        width: parent.width; theme: root.theme; title: "时间校准"; iconName: "clock"; visible: root.currentSection === 5
-                        GlassSwitch { objectName: "ntpSwitch"; width: parent.width; theme: root.theme; text: "网络校时 (SNTP)"; description: "以网络时间为倒计时与走时反解的基准；SNTP 失败时回退 HTTP 授时。"; checked: app.settings.enableNtpSync; onToggled: app.settings.enableNtpSync = checked }
-                        Text { width: parent.width; text: "校时状态 · " + app.clockInfo.state + "\n" + app.clockInfo.detail; color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.5 }
-                        Column {
-                            width: parent.width; spacing: 6
-                            Text { text: "自定义 NTP 服务器"; color: root.theme.textPrimary; font.pixelSize: 14 }
-                            GlassTextField { id: ntpServerField; objectName: "customNtpField"; width: parent.width; theme: root.theme; text: app.settings.customNtpServer; placeholderText: "如 ntp.aliyun.com（留空用默认）"; Accessible.name: "自定义 NTP 服务器" }
-                            GlassButton {
-                                theme: root.theme; text: "应用并重新校时"; iconName: "check"
-                                onClicked: { app.settings.customNtpServer = ntpServerField.text.trim(); app.refreshClock(); }
-                            }
-                            Text { width: parent.width; text: "留空时按内置顺序尝试：ntp.aliyun.com / ntp1.aliyun.com / ntp.tencent.com / pool.ntp.org / time.apple.com。自定义主机将优先尝试。"; color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4 }
-                        }
+                    ClockSection {
+                        width: parent.width; theme: root.theme
+                        visible: root.currentSection === 5; height: visible ? implicitHeight : 0
                     }
-                    SettingsSection {
-                        objectName: "settingsPanel-about"
-                        width: parent.width; theme: root.theme; title: "启动与更新"; iconName: "refresh-cw"; visible: root.currentSection === 6
-                        GlassSwitch {
-                            objectName: "autoStartSwitch"
-                            width: parent.width; theme: root.theme; text: "开机自启"
-                            description: "登录系统后自动启动 KomiraQuake，保持预警连接。"
-                            checked: app.autoStart.enabled
-                            onToggled: app.autoStart.enabled = checked
-                        }
-                        GlassSwitch {
-                            objectName: "silentStartSwitch"
-                            width: parent.width; theme: root.theme; text: "静默启动"
-                            description: "启动时不显示主窗口，只保留托盘图标；可从托盘菜单随时打开（等同于关闭窗口）。"
-                            checked: app.settings.silentStart
-                            onToggled: app.settings.silentStart = checked
-                        }
-                        Column {
-                            width: parent.width; spacing: 6
-                            RowLayout {
-                                width: parent.width; spacing: 12
-                                Text { Layout.fillWidth: true; text: "当前版本 v" + app.updater.currentVersion; color: root.theme.textPrimary; font.pixelSize: 14; font.family: root.theme.numberFamily }
-                                GlassButton {
-                                    objectName: "checkUpdatesButton"
-                                    theme: root.theme; text: "检查更新"; iconName: "refresh-cw"
-                                    enabled: app.updater.state !== "checking"
-                                    onClicked: app.updater.check(false)
-                                }
-                                GlassButton {
-                                    objectName: "openReleaseButton"
-                                    visible: app.updater.state === "updateAvailable"
-                                    theme: root.theme; text: "打开下载页"; iconName: "external-link"; primary: true
-                                    onClicked: app.updater.openReleasePage()
-                                }
-                            }
-                            Text {
-                                width: parent.width; visible: app.updater.message !== ""
-                                text: app.updater.message; wrapMode: Text.Wrap; font.pixelSize: 12
-                                color: app.updater.state === "updateAvailable" ? root.theme.accent
-                                     : app.updater.state === "error" ? root.theme.severity("WARNING")
-                                     : root.theme.outline
-                            }
-                        }
-                        GlassSwitch {
-                            objectName: "autoCheckUpdatesSwitch"
-                            width: parent.width; theme: root.theme; text: "自动检查更新"
-                            description: "启动时在后台静默检查一次新版本，发现更新后在此提示。"
-                            checked: app.settings.autoCheckUpdates
-                            onToggled: app.settings.autoCheckUpdates = checked
-                        }
+                    AboutSection {
+                        width: parent.width; theme: root.theme
+                        visible: root.currentSection === 6; height: visible ? implicitHeight : 0
                     }
                 }
             }
@@ -388,7 +178,7 @@ Item {
         contentItem: ColumnLayout {
             spacing: 16
             Text { text: "恢复默认设置？"; color: root.theme.textPrimary; font.pixelSize: 20; font.weight: Font.Medium }
-            Text { Layout.fillWidth: true; text: "外观将恢复为浅色，地图、预警和声音等偏好也将重置。此操作无法撤销。"; color: root.theme.outline; font.pixelSize: 13; wrapMode: Text.Wrap; lineHeight: 1.5 }
+            Text { Layout.fillWidth: true; text: "外观、地图、预警和声音等偏好都将重置为初始值。此操作无法撤销。"; color: root.theme.outline; font.pixelSize: 13; wrapMode: Text.Wrap; lineHeight: 1.5 }
             RowLayout {
                 Layout.fillWidth: true; Layout.topMargin: 8
                 Item { Layout.fillWidth: true }

@@ -21,9 +21,6 @@ public:
     static bool isValidCoordinate(double lat, double lon);
     static double elapsedSeconds(long long originEpochMs, long long nowEpochMs);
 
-    /// P、S 波前是否都已超出中国范围；是则两个波前应一起隐藏（-1 视为已超出量程）。
-    static bool bothWavesBeyondChina(double lat, double lon, double pKm, double sKm);
-
     /// 两条报次（实时预警 / 目录）是否描述同一次地震：发震时刻接近且震中邻近。
     static bool isSameQuake(long long timestampA, double latA, double lonA,
                             long long timestampB, double latB, double lonB);

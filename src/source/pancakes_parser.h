@@ -7,15 +7,13 @@
 #include "core/intensity_calculator.h"
 #include "model/earthquake_event.h"
 #include "source/eew_parser.h"
+#include "source/source_event_kind.h"
 
 namespace komira {
 
-/// 实时预警（进入告警生命周期）还是目录条目（只进列表/历史）。
-enum class PancakesKind { Live, Directory };
-
 struct PancakesParsed {
     EarthquakeEvent event;
-    PancakesKind kind = PancakesKind::Live;
+    SourceEventKind kind = SourceEventKind::Live;
     QString source;
 };
 

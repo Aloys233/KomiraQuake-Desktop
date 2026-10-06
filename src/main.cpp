@@ -86,15 +86,23 @@ int main(int argc, char* argv[]) {
     if (engine.rootObjects().isEmpty()) return -1;
 
     komira::TrayController tray(&controller);
-    QObject::connect(&tray, &komira::TrayController::showWindowRequested, &app, [&engine]() {
+    // 两个来源要区分：用户点托盘只恢复窗口（保留他离开时的页面），
+    // 预警置顶则必须切回主页面 —— 否则他停在设置页时被预警弹出来，
+    // 看到的仍是设置页，预警卡与倒计时都被遮住。
+    const auto presentWindow = [&engine](bool resetToMainPage) {
         const QList<QObject*> roots = engine.rootObjects();
         if (roots.isEmpty()) return;
         if (auto* window = qobject_cast<QQuickWindow*>(roots.first())) {
+            if (resetToMainPage) window->setProperty("showSettings", false);
             window->show();
             window->raise();
             window->requestActivate();
         }
-    });
+    };
+    QObject::connect(&tray, &komira::TrayController::showWindowRequested, &app,
+                     [&presentWindow]() { presentWindow(false); });
+    QObject::connect(&tray, &komira::TrayController::alertWindowRaiseRequested, &app,
+                     [&presentWindow]() { presentWindow(true); });
 
     return app.exec();
 }

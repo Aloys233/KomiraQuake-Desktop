@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <vector>
 
 #include "source/eew_parser.h"
 #include "source/wolfx_protocol.h"
@@ -25,9 +26,40 @@ void stampSource(EarthquakeEvent& event, const QString& provider, const QString&
     event.sourceAgency = agency.toStdString();
 }
 
+/// 一个目录端点：URL + 该源的报数机构 + 解析函数。
+struct DirectoryEndpoint {
+    QString url;
+    QString agency;
+    std::optional<EarthquakeEvent> (*parse)(const QJsonObject&, const EewParser::UserLocation&,
+                                            IntensityStandard, long long);
+};
+
+std::optional<EarthquakeEvent> parseCencEntry(const QJsonObject& obj, const EewParser::UserLocation& user,
+                                              IntensityStandard standard, long long nowMs) {
+    return EewParser::parseCencDirectory(obj, user, standard, nowMs);
+}
+
+std::optional<EarthquakeEvent> parseJmaEntry(const QJsonObject& obj, const EewParser::UserLocation& user,
+                                             IntensityStandard standard, long long) {
+    return EewParser::parseJmaDirectory(obj, user, standard);
+}
+
+/// 目录端点全集，按声明顺序在一个轮询周期内串行拉取。
+///
+/// jma_eqlist 与 Pancakes 的同名子源互为备份：两路都启用时同一 JMA 地震会各自送达，
+/// 由 AppController 按「发震时刻 + 震中」（QuakeCalculator::isSameQuake）合并为一条展示，
+/// 因此这里无需在源内跨 provider 去重；任一路中断，另一路仍能独立填充目录。
+const std::vector<DirectoryEndpoint>& directoryEndpoints() {
+    static const std::vector<DirectoryEndpoint> endpoints = {
+        {WolfxProtocol::eqListUrl(), WolfxProtocol::directoryAgency(), &parseCencEntry},
+        {WolfxProtocol::jmaEqListUrl(), WolfxProtocol::jmaDirectoryAgency(), &parseJmaEntry},
+    };
+    return endpoints;
+}
+
 } // namespace
 
-WolfxSource::WolfxSource(QObject* parent) : QObject(parent) {
+WolfxSource::WolfxSource(QObject* parent) : EarthquakeSource(parent) {
     info_.id = SourceIds::kWolfx;
     info_.name = QStringLiteral("Wolfx");
     info_.region = QStringLiteral("全球");
@@ -215,10 +247,11 @@ void WolfxSource::handleJsonObject(const QJsonObject& obj) {
     const QString resolved = type.isEmpty() ? QStringLiteral("cwa_eew") : type;
     if (!WolfxProtocol::isEewType(resolved)) return;
 
-    // 无定位时照常解析，只是距离/烈度/走时为未知。
+    // 无定位时照常解析，只是距离/烈度/走时为未知。JMA 报文时刻为 JST，需按时区解析。
+    // eventNamespace 用频道名（如 jma_eew），使 eventId 与其它聚合商的同名频道对齐合并。
     auto event = EewParser::parse(obj, userLocation(), standard_,
                                   WolfxProtocol::titleFor(resolved), QStringLiteral("wolfx_"),
-                                  nowMs());
+                                  nowMs(), resolved == QLatin1String("jma_eew"), resolved);
     if (event) {
         // Wolfx 连上后会把「最近一次」EEW 回放回来（可能是几小时前的），不能当作实时预警。
         const long long now = nowMs();
@@ -228,7 +261,7 @@ void WolfxSource::handleJsonObject(const QJsonObject& obj) {
             return;
         }
         stampSource(*event, WolfxProtocol::providerName(), WolfxProtocol::agencyFor(resolved));
-        emit eventReceived(*event, WolfxEventKind::Eew);
+        emit eventReceived(*event, SourceEventKind::Live);
     }
 }
 
@@ -240,49 +273,73 @@ void WolfxSource::pollDirectory() {
     info_.directoryError.clear();
     emit infoChanged();
     if (!running_ || generation != generation_) return;
-    QNetworkRequest request{QUrl(WolfxProtocol::eqListUrl())};
+    directoryIndex_ = 0;
+    directoryFailed_ = false;
+    directoryError_.clear();
+    directoryCycleStart_ = monoMs();
+    fetchDirectoryEndpoint(0);
+}
+
+void WolfxSource::fetchDirectoryEndpoint(int index) {
+    if (!running_) return;
+    const quint64 generation = generation_;
+    const auto& endpoints = directoryEndpoints();
+    if (index >= static_cast<int>(endpoints.size())) {
+        // 周期结束：全部成功才算目录健康，否则记录首个失败端点。
+        if (!running_ || generation != generation_) return;
+        if (directoryFailed_) {
+            info_.directoryStatus = ConnectionStatus::Error;
+            info_.directoryError = directoryError_;
+        } else {
+            info_.directoryLatencyMs = monoMs() - directoryCycleStart_;
+            info_.directoryLastSuccess = nowMs();
+            info_.directoryStatus = ConnectionStatus::Connected;
+            info_.directoryError.clear();
+        }
+        emit infoChanged();
+        return;
+    }
+
+    const DirectoryEndpoint endpoint = endpoints[static_cast<size_t>(index)];
+    QNetworkRequest request{QUrl(endpoint.url)};
     request.setTransferTimeout(15000);
     request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("komiraquake/2.0"));
     QNetworkReply* reply = network_.get(request);
-    const qint64 started = monoMs();
-    connect(reply, &QNetworkReply::finished, this, [this, reply, started, generation]() {
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, endpoint, index, generation]() {
         reply->deleteLater();
         if (!running_ || generation != generation_) return;
+
+        const auto fail = [this](const QString& reason) {
+            directoryFailed_ = true;
+            if (directoryError_.isEmpty()) directoryError_ = reason;
+        };
+
         if (reply->error() != QNetworkReply::NoError) {
             const QString message = reply->errorString();
-            qWarning() << "[wolfx] directory request failed:" << message;
-            info_.directoryStatus = ConnectionStatus::Error;
-            info_.directoryError = QStringLiteral("目录请求失败：%1").arg(message);
-            emit infoChanged();
+            qWarning() << "[wolfx] directory request failed:" << endpoint.url << message;
+            fail(QStringLiteral("目录请求失败：%1（%2）").arg(message, endpoint.url));
+            fetchDirectoryEndpoint(index + 1);
             return;
         }
-        const QByteArray body = reply->readAll();
-        const qint64 latency = monoMs() - started;
 
-        const QJsonDocument doc = QJsonDocument::fromJson(body);
+        const QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
         if (!doc.isObject()) {
-            info_.directoryStatus = ConnectionStatus::Error;
-            info_.directoryError = QStringLiteral("目录响应格式无效");
-            emit infoChanged();
+            fail(QStringLiteral("目录响应格式无效（%1）").arg(endpoint.url));
+            fetchDirectoryEndpoint(index + 1);
             return;
         }
         const QJsonObject root = doc.object();
         for (auto it = root.begin(); it != root.end(); ++it) {
             if (!running_ || generation != generation_) return;
             if (!it.key().startsWith(QLatin1String("No"))) continue;
-            auto event = EewParser::parseCencDirectory(
-                it.value().toObject(), userLocation(), standard_, nowMs());
+            auto event = endpoint.parse(it.value().toObject(), userLocation(), standard_, nowMs());
             if (event) {
-                stampSource(*event, WolfxProtocol::providerName(), WolfxProtocol::directoryAgency());
-                emit eventReceived(*event, WolfxEventKind::Directory);
+                stampSource(*event, WolfxProtocol::providerName(), endpoint.agency);
+                emit eventReceived(*event, SourceEventKind::Directory);
             }
         }
-        if (!running_ || generation != generation_) return;
-        info_.directoryLatencyMs = latency;
-        info_.directoryLastSuccess = nowMs();
-        info_.directoryStatus = ConnectionStatus::Connected;
-        info_.directoryError.clear();
-        emit infoChanged();
+        fetchDirectoryEndpoint(index + 1);
     });
 }
 

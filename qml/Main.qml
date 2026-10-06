@@ -20,6 +20,9 @@ ApplicationWindow {
     function sameEvent(a, b) { return !!a && !!b && a.id === b.id && a.sourceTag === b.sourceTag; }
     // HUD 默认隐藏：仅活动预警或用户点击选中的事件才显示（hudEvent 由控制器裁决）。
     readonly property var hudEvent: app.hudEvent
+    // 波前走完后收起左上角 HUD；新的波前或切换到其它事件时恢复。
+    property string wavesDoneId: ""
+    readonly property bool hudSuppressed: !!hudEvent && hudEvent.id === wavesDoneId
     // 地图标记仍画最近一次事件，但不作为默认取景中心；取景只跟随显式焦点。
     readonly property var mapEvent: app.mapEvent
     readonly property bool hudActive: sameEvent(hudEvent, app.activeWarning)
@@ -32,9 +35,12 @@ ApplicationWindow {
         userLat: app.userLatitude; userLon: app.userLongitude
         event: window.mapEvent
         hasFocus: app.hasMapFocus
+        warningActive: !!app.activeWarning
         hudInset: hud.visible ? hud.width : 0
         zoom: 6
         listExpanded: window.showList && !window.showSettings
+        onWavesFinished: if (window.hudEvent) window.wavesDoneId = window.hudEvent.id
+        onWavesStarted: window.wavesDoneId = ""
         onToggleListRequested: { window.showSettings = false; window.showList = !window.showList }
         onOpenSettingsRequested: window.showSettings = true
         onLocationPicked: (lat, lon) => { app.setManualLocation(lat, lon, "地图选点"); globalToast.show("基准位置已更新"); }
@@ -65,13 +71,17 @@ ApplicationWindow {
     Connections {
         target: app
         function onLocationChanged() { window.applyDefaultView(); }
-        function onCenterMapRequested(latitude, longitude) { Qt.callLater(map.frameEvent); }
+        function onCenterMapRequested(latitude, longitude) {
+            // 显式聚焦/选中（含再次选中同一事件）应恢复 HUD。
+            window.wavesDoneId = "";
+            Qt.callLater(map.frameEvent);
+        }
         function onResetMapRequested() { map.resetView(); }
     }
     HudCard {
         id: hud
         width: Math.min(352, map.width - 88)
-        visible: !!window.hudEvent && !window.showSettings && !map.pickingLocation
+        visible: !!window.hudEvent && !window.hudSuppressed && !window.showSettings && !map.pickingLocation
         anchors.left: parent.left; anchors.top: parent.top
         anchors.leftMargin: 16; anchors.topMargin: 16
         theme: appTheme

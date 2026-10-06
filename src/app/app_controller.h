@@ -13,6 +13,7 @@
 #include <QVariantMap>
 
 #include "core/event_gate.h"
+#include "model/data_source_info.h"
 #include "model/earthquake_event.h"
 #include "prefs/settings_store.h"
 #include "service/autostart.h"
@@ -20,11 +21,12 @@
 
 namespace komira {
 class LocationService;
-class WolfxSource;
-class PancakesSource;
+class EarthquakeSource;
+class JianSource;
+class WhewsSource;
+class SimulatedSource;
 class HistoryStore;
 class AlertSoundService;
-class SpeechService;
 class AlertAnnouncer;
 class NtpClock;
 
@@ -60,8 +62,9 @@ class AppController : public QObject {
     Q_PROPERTY(QVariant activeWarning READ activeWarning NOTIFY warningChanged)
     Q_PROPERTY(QVariantList activeWarnings READ activeWarnings NOTIFY warningChanged)
     Q_PROPERTY(int countdown READ countdown NOTIFY countdownChanged)
-    Q_PROPERTY(bool speechAvailable READ speechAvailable CONSTANT)
-    Q_PROPERTY(bool darkMode READ darkMode WRITE setDarkMode NOTIFY darkModeChanged)
+    /// 解析后的实际深色状态：themeMode 为 dark 时恒真；system 时跟随系统配色方案。
+    /// 只读——切换主题请写 settings.themeMode。
+    Q_PROPERTY(bool darkMode READ darkMode NOTIFY darkModeChanged)
     /// 地图上要画的那一个事件：有焦点用焦点，否则退化为最近一次（`history[0]`）。
     Q_PROPERTY(QVariant mapEvent READ mapEvent NOTIFY mapEventChanged)
     /// 当前是否有地图焦点：地图仅在有关注事件时自动取景，避免默认被「最近事件」抢镜。
@@ -106,9 +109,15 @@ public:
     QVariant activeWarning() const;
     QVariantList activeWarnings() const;
     int countdown() const { return countdown_; }
-    bool speechAvailable() const;
     bool darkMode() const { return darkMode_; }
-    void setDarkMode(bool dark);
+    /// themeMode 变化或系统配色方案变化时重算 darkMode_。
+    /// themeMode 为 system 时跟随系统配色方案，其余取字面值。
+    bool resolveDarkMode() const {
+        const QString mode = settings_ ? settings_->themeMode() : QStringLiteral("light");
+        if (mode == QLatin1String("dark")) return true;
+        if (mode == QLatin1String("system")) return systemDark_;
+        return false;
+    }
     QVariant mapEvent() const;
     bool hasMapFocus() const { return hasMapFocus_; }
     QVariant hudEvent() const;
@@ -127,6 +136,12 @@ public:
     Q_INVOKABLE void requestLocation();
     Q_INVOKABLE void setManualLocation(double latitude, double longitude, const QString& label = QString());
     Q_INVOKABLE void refreshCatalog();
+    /// Jian 数据源登录：用登录密钥 `lk_…` 换取刷新令牌并持久化。
+    Q_INVOKABLE void loginJian(const QString& loginKey);
+    /// 写入 Whews 数据源令牌 `wat_…`（设置页粘贴框），空串表示清除。
+    Q_INVOKABLE void setWhewsToken(const QString& token);
+    /// 写入模拟数据源地址（设置页），并立即推入活动源使其重连。
+    Q_INVOKABLE void setSimulatedUrl(const QString& url);
     /// 立即重新校时一次（不打断周期调度）。
     Q_INVOKABLE void refreshClock();
     Q_INVOKABLE QPointF wgs84ToGcj02(double lat, double lng) const;
@@ -134,7 +149,6 @@ public:
     Q_INVOKABLE void dismissWarningOverlay();
     Q_INVOKABLE void muteWarning();
     Q_INVOKABLE void stopWarning();
-    Q_INVOKABLE void sampleSpeech();
     Q_INVOKABLE QString colorForIntensity(double raw) const;
     Q_INVOKABLE QString colorForMagnitude(double magnitude) const;
     Q_INVOKABLE QString severityColor(const QString& levelTag) const;
@@ -162,8 +176,12 @@ private:
     void wire();
     /// 当前启用的数据源 id 列表（用于聚合状态展示）。
     QStringList enabledSourceIds() const;
+    /// 注册表内全部源的链路状态（顺序即展示顺序）。
+    QList<DataSourceInfo> allSourceInfos() const;
     /// inDirectory：事件来自 HTTP 目录（进入列表/历史）；否则为 WS 实时预警（只告警不入列表）。
-    void handleEvent(const EarthquakeEvent& event, bool replay, bool inDirectory);
+    /// source：发出该帧的源，用于把仓库层的处置结果回传给需要它的数据源（见 EarthquakeSource::onAdmission）。
+    void handleEvent(const EarthquakeEvent& event, bool replay, bool inDirectory,
+                     EarthquakeSource* source = nullptr);
     /// 同 id 就地更新或追加；避免重启后「DB 载入 + 首次目录轮询」在列表留下重复条目。
     void upsertHistory(const EarthquakeEvent& event);
     void onTick();
@@ -201,10 +219,15 @@ private:
     SettingsStore* settings_ = nullptr;
     LocationService* location_ = nullptr;
     HistoryStore* historyStore_ = nullptr;
-    WolfxSource* source_ = nullptr;
-    PancakesSource* pancakes_ = nullptr;
+    /// 数据源注册表：所有源平级、互为备份。接线/启停/聚合都按本列表循环，不逐源硬编码。
+    QList<EarthquakeSource*> sources_;
+    /// Jian 源需要登录凭据交换，保留具体类型访问登录/令牌注入入口。
+    JianSource* jian_ = nullptr;
+    /// Whews 源需注入 `wat_…` 令牌，保留具体类型访问令牌注入入口。
+    WhewsSource* whews_ = nullptr;
+    /// 模拟源（仅开发自测）需注入开发者模式开关与地址，保留具体类型访问注入入口。
+    SimulatedSource* simulated_ = nullptr;
     AlertSoundService* sound_ = nullptr;
-    SpeechService* speech_ = nullptr;
     AlertAnnouncer* announcer_ = nullptr;
     /// 网络授时：所有地震时间语义的唯一时间基准。《NATIVE_PORT_SPEC》 §13。
     NtpClock* clock_ = nullptr;
@@ -222,6 +245,8 @@ private:
     bool arrivedAnnounced_ = false;
     int countdown_ = 0;
     bool darkMode_ = false;
+    /// 系统配色方案是否为深色（themeMode == "system" 时的判定依据）。
+    bool systemDark_ = false;
     QTimer countdownTimer_;
 
     /// 地图焦点：用户从列表选中，或被实时 EEW 自动接管。
@@ -233,10 +258,16 @@ private:
     QTimer hudRefreshTimer_;
     double wavePKm_ = -1.0;
     double waveSKm_ = -1.0;
+    double wavePOpacity_ = 0.0;
+    double waveSOpacity_ = 0.0;
+    /// S 波径向渐变填充的不透明度（仅影响半径内非零）。
+    double waveSFillOpacity_ = 0.0;
 
     /// 波前圆参数。《NATIVE_PORT_SPEC》 §12：>2000 km 切 `jb` 表，>10000 km 不再画。
     static constexpr double kWaveTableSwitchKm = 2000.0;
     static constexpr double kWaveMaxRadiusKm = 10000.0;
+    /// 波前隐去的烈度阈值（CSIS I：可感下限）。
+    static constexpr double kCsisFadeLevel = 1.0;
     static constexpr long long kWaveWindowMs = 60LL * 60LL * 1000LL;
     /// 自动焦点转为历史事件后仍展示 HUD 的宽限期（以最后一报推送时间为准）。
     static constexpr long long kHudWindowMs = 10LL * 60LL * 1000LL;

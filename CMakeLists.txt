@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(KomiraQuake VERSION 1.0.3 LANGUAGES CXX)
+project(KomiraQuake VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Qt6 6.5 REQUIRED COMPONENTS
-    Core Gui Widgets Quick QuickControls2 Qml Network WebSockets Sql Multimedia TextToSpeech Svg
+    Core Gui Widgets Quick QuickControls2 Qml Network WebSockets Sql Multimedia Svg
 )
 
 qt_standard_project_setup(REQUIRES 6.5)
@@ -25,10 +25,20 @@ qt_add_executable(komiraquake
     src/core/time_sync.cpp
 
     # source
+    src/source/earthquake_source.h
     src/source/eew_parser.cpp
     src/source/wolfx_source.cpp
     src/source/pancakes_parser.cpp
     src/source/pancakes_source.cpp
+    src/source/jian_protocol.cpp
+    src/source/jian_parser.cpp
+    src/source/jian_source.cpp
+    src/source/whews_protocol.cpp
+    src/source/whews_parser.cpp
+    src/source/whews_source.cpp
+    src/source/simulated_protocol.cpp
+    src/source/simulated_parser.cpp
+    src/source/simulated_source.cpp
 
     # store / prefs
     src/store/history_store.cpp
@@ -38,7 +48,6 @@ qt_add_executable(komiraquake
     src/service/location_service.cpp
     src/service/ntp_clock.cpp
     src/service/alert_sound_service.cpp
-    src/service/speech_service.cpp
     src/service/alert_announcer.cpp
     src/service/tray_controller.cpp
     src/service/autostart.cpp
@@ -63,14 +72,12 @@ target_link_libraries(komiraquake PRIVATE
     Qt6::WebSockets
     Qt6::Sql
     Qt6::Multimedia
-    Qt6::TextToSpeech
     Qt6::Svg
 )
 
 set(KOMIRA_QML_FILES
     qml/Main.qml
     qml/Theme.qml
-    qml/WarningOverlay.qml
     qml/WarningHud.qml
     qml/HudCard.qml
     qml/IntensityBadge.qml
@@ -78,6 +85,14 @@ set(KOMIRA_QML_FILES
     qml/EventListSidebar.qml
     qml/MapView.qml
     qml/SettingsPage.qml
+    qml/settings/AppearanceSection.qml
+    qml/settings/LocationSection.qml
+    qml/settings/WarningSection.qml
+    qml/settings/AudioSection.qml
+    qml/settings/SourceSection.qml
+    qml/settings/ClockSection.qml
+    qml/settings/AboutSection.qml
+    qml/SettingSlider.qml
     qml/GlassCard.qml
     qml/GlassButton.qml
     qml/GlassSwitch.qml
@@ -156,20 +171,27 @@ if(BUILD_TESTING)
         src/core/ip_geo_lookup.cpp src/service/location_service.cpp
         src/core/travel_table.cpp src/core/travel_time_service.cpp
         src/source/eew_parser.cpp src/source/wolfx_source.cpp
+        src/source/earthquake_source.h
         src/source/pancakes_parser.cpp src/source/pancakes_source.cpp
+        src/source/jian_protocol.cpp src/source/jian_parser.cpp src/source/jian_source.cpp
+        src/source/whews_protocol.cpp src/source/whews_parser.cpp src/source/whews_source.cpp
+        src/source/simulated_protocol.cpp src/source/simulated_parser.cpp
+        src/source/simulated_source.cpp
         src/store/history_store.cpp src/prefs/settings_store.cpp)
     target_include_directories(qt_business_test PRIVATE src)
     target_link_libraries(qt_business_test PRIVATE Qt6::Test Qt6::Network Qt6::WebSockets Qt6::Sql)
     add_test(NAME qt_business COMMAND qt_business_test)
     file(GLOB_RECURSE GUI_TEST_SOURCES CONFIGURE_DEPENDS src/*.cpp)
     list(FILTER GUI_TEST_SOURCES EXCLUDE REGEX "/main.cpp$")
-    qt_add_executable(gui_test tests/gui_test.cpp ${GUI_TEST_SOURCES})
+    # GLOB 只收 .cpp；含 Q_OBJECT 的接口头需显式列出，AUTOMOC 才会处理其 moc。
+    qt_add_executable(gui_test tests/gui_test.cpp ${GUI_TEST_SOURCES} src/source/earthquake_source.h
+        src/source/simulated_source.h)
     target_include_directories(gui_test PRIVATE src)
     target_compile_definitions(gui_test PRIVATE KOMIRA_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         KOMIRA_VERSION="${PROJECT_VERSION}")
     target_link_libraries(gui_test PRIVATE Qt6::Test Qt6::Core Qt6::Gui Qt6::Widgets
         Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::WebSockets Qt6::Sql
-        Qt6::Multimedia Qt6::TextToSpeech Qt6::Svg)
+        Qt6::Multimedia Qt6::Svg)
     qt_add_resources(gui_test test_lucide_icons PREFIX "/icons" BASE "qml/icons" FILES ${KOMIRA_ICON_FILES})
     qt_add_resources(gui_test test_komira_fonts PREFIX "/fonts" BASE "fonts" FILES ${KOMIRA_FONT_FILES})
     qt_add_resources(gui_test test_qml PREFIX "/qt/qml/KomiraQuake" FILES ${KOMIRA_QML_FILES})

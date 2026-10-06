@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Shapes
 
 // 原生栅格瓦片地图（slippy map）。《NATIVE_PORT_SPEC》 §8 / §12。
 // 默认只画"最近一次地震"的 X 十字；有焦点事件时画焦点事件，并按走时表反解画 P/S 波前圆。
@@ -20,6 +21,8 @@ Item {
     /// 是否有显式焦点（活动预警或用户点击）。仅此时才自动取景，
     /// 否则「最近一次事件」只画标记，不抢镜头。
     property bool hasFocus: false
+    /// 是否存在活动预警：空闲自动归位时优先回到预警震中而非我的位置。
+    property bool warningActive: false
     property real userLat: 0.0
     property real userLon: 0.0
     property bool hasUser: false
@@ -29,7 +32,7 @@ Item {
     property bool userMovedCamera: false
     property real hudInset: 0
     readonly property string basemap: app.settings.basemapId
-    readonly property bool gcjDatum: basemap === "amap_vector" || basemap === "amap_satellite" ||
+    readonly property bool gcjDatum: basemap === "amap_vector" ||
                                      basemap === "petal" ||
                                      (basemap === "custom" && app.settings.customBasemapDatum === 1)
     property bool previousGcjDatum: gcjDatum
@@ -73,6 +76,45 @@ Item {
         onStopped: root.centerLon = root.wrapLon(root.centerLon)
     }
 
+    // 跟随波前时，波前半径每 100ms 才更新一次；若把目标值直接赋值，缩放会一格一格地跳。
+    // 用 Behavior 把目标值插值到显示帧率，跟随才够细腻。拖动（following=false）、
+    // 程序化补间（cameraMove 进行中）或"减少动态效果"时禁用，保持 1:1 跟手。
+    readonly property bool followSmoothing: following && !cameraMove.running && !theme.reduceMotion
+    readonly property int followSmoothMs: 120
+    Behavior on zoom {
+        enabled: root.followSmoothing
+        NumberAnimation { duration: root.followSmoothMs; easing.type: Easing.Linear }
+    }
+    Behavior on centerLat {
+        enabled: root.followSmoothing
+        NumberAnimation { duration: root.followSmoothMs; easing.type: Easing.Linear }
+    }
+    Behavior on centerLon {
+        enabled: root.followSmoothing
+        NumberAnimation { duration: root.followSmoothMs; easing.type: Easing.Linear }
+    }
+
+    // 波前半径的显示值（km）。AppController 只按 10Hz 推送半径（见 updateWaveRadii），
+    // 波前圆直接绑定的话就是一圈一圈地跳；这里把半径本身插值到显示帧率。
+    // 平滑半径（km）而非像素宽度：宽度还含 pxPerKmValue，镜头缩放期间它每帧都在变，
+    // 平滑宽度会与 zoom 的 Behavior 叠加成两层滞后。
+    // 波前结束（半径归 -1）时 Behavior 关闭，半径立即归零：此时圆已 visible:false，
+    // 没必要再补一段收缩动画，也不必担心残值被下一个事件继承。
+    // 不按 hasFocus 门控：切换焦点时半径已是当前值，重新聚焦不会出现"从0 涨出来"的动画。
+    readonly property bool waveSmoothing: !theme.reduceMotion
+    readonly property bool wavePActive: (app.waveRadii.pKm || 0) > 0
+    readonly property bool waveSActive: (app.waveRadii.sKm || 0) > 0
+    property real wavePKmShown: Math.max(0, app.waveRadii.pKm || 0)
+    property real waveSKmShown: Math.max(0, app.waveRadii.sKm || 0)
+    Behavior on wavePKmShown {
+        enabled: root.waveSmoothing && root.wavePActive
+        NumberAnimation { duration: root.followSmoothMs; easing.type: Easing.Linear }
+    }
+    Behavior on waveSKmShown {
+        enabled: root.waveSmoothing && root.waveSActive
+        NumberAnimation { duration: root.followSmoothMs; easing.type: Easing.Linear }
+    }
+
     function clampZoom(z) { return Math.max(1, Math.min(18, z)); }
 
     /// 平滑移动镜头；duration 为 0 或开启"减少动态效果"时立即生效。
@@ -97,12 +139,14 @@ Item {
 
     function focusUser() {
         if (!hasUser) return;
+        idleResetTimer.stop();
         following = false;
         userMovedCamera = true;
         moveCamera(shiftedUser.lat, shiftedUser.lon, 6, cameraDuration);
     }
     /// 还原默认视野：停止跟随，回到用户位置（无定位时回到全国概览）。
     function resetView() {
+        idleResetTimer.stop();
         following = false;
         userMovedCamera = true;
         if (hasUser) moveCamera(shiftedUser.lat, shiftedUser.lon, 6, cameraDuration);
@@ -143,33 +187,80 @@ Item {
         following = false;
         frameChina(false);
     }
-    /// animate === false 用于尺寸/遮挡变化时的即时重新取景，避免与连续布局事件互相追赶。
+    /// 聚焦震中区域（不并入用户所在地）：半径跟随 P/S 波前，连续（无级）缩放。
+    /// animate === false 用于波前逐帧重取景，避免与 420ms 补间互相追赶。
     function frameEvent(animate) {
         following = true;
+        idleResetTimer.stop();
         if (!hasEvent || width <= 0 || height <= 0) return;
         const x = projX(shiftedHypo.lon, 0);
         const y = projY(shiftedHypo.lat, 0);
-        // Bound wave context so old, distant wavefronts cannot dominate.
-        // 取景至少覆盖震中周围 300 km；有更大波前时最多放宽到 1000 km。
-        const radiusKm = Math.min(1000, Math.max(300, app.waveRadii.pKm || 0, app.waveRadii.sKm || 0));
+        // 波前很小（t≈0）时保底 100 km；P/S 全部隐藏（历史事件/已淡出）时固定 300 km。
+        // 不设半径上限：靠 zoom 下限与"烈度低于可感即淡出"自然收尾。
+        const pKm = app.waveRadii.pKm || 0;
+        const sKm = app.waveRadii.sKm || 0;
+        const hasWaves = pKm > 0 || sKm > 0;
+        const radiusKm = hasWaves ? Math.max(100, pKm, sKm) : 300;
         const r = radiusKm * 256 / (360 * 111.32 * Math.max(0.01, Math.cos(shiftedHypo.lat * Math.PI / 180)));
-        let minX = x - r, maxX = x + r, minY = y - r, maxY = y + r;
-        if (hasUser) {
-            const ux = x + wrapLon(shiftedUser.lon - shiftedHypo.lon) / 360 * 256;
-            const uy = projY(shiftedUser.lat, 0);
-            minX = Math.min(minX, ux); maxX = Math.max(maxX, ux);
-            minY = Math.min(minY, uy); maxY = Math.max(maxY, uy);
-        }
+        const minX = x - r, maxX = x + r, minY = y - r, maxY = y + r;
         const left = Math.min(hudInset + 24, width * 0.5);
         const right = 76, top = 80, bottom = 64;
         const availableW = Math.max(80, width - left - right);
         const availableH = Math.max(80, height - top - bottom);
-        const z = Math.max(1, Math.min(12, Math.floor(Math.log2(Math.min(availableW / (maxX - minX), availableH / (maxY - minY))))));
+        // 无级缩放：不取整，随波前连续变化（clampZoom 已限制到 [1,18]）。
+        const z = clampZoom(Math.log2(Math.min(availableW / (maxX - minX), availableH / (maxY - minY))));
         const scale = Math.pow(2, z);
         const lat = unprojLat((minY + maxY) / 2 - (top - bottom) / (2 * scale), 0);
         const lon = unprojLon((minX + maxX) / 2 - (left - right) / (2 * scale), 0);
         moveCamera(lat, lon, z, animate === false ? 0 : cameraDuration);
     }
+
+    /// 波前（P/S）是否出现过。用于识别"波前消失"的瞬间并自动回到默认视野。
+    property bool wavesShown: false
+    /// 波前出现/结束：供主窗口收起 HUD 等使用。
+    signal wavesStarted()
+    signal wavesFinished()
+
+    // 波前约 10Hz 变化时无级跟随：duration 0 直接赋值，避免每 tick 重启 420ms 补间。
+    // 初次聚焦的入场补间结束后（cameraMove 停止）才接管，避免打断入场动画。
+    Connections {
+        target: app
+        function onWaveRadiiChanged() {
+            const hasWaves = (app.waveRadii.pKm || 0) > 0 || (app.waveRadii.sKm || 0) > 0;
+            if (hasWaves) {
+                if (!root.wavesShown) {
+                    root.wavesShown = true;
+                    root.wavesStarted();
+                }
+                if (!root.following || !root.hasFocus) return;
+                if (cameraMove.running) return;
+                root.frameEvent(false);
+                return;
+            }
+            // 波前全部消失（走完/淡出/事件结束）。仍聚焦（app.hasMapFocus）说明是自然结束而非
+            // 用户取消焦点：若之前在跟随震中，自动回到我的位置（无定位则全国概览），并收起 HUD。
+            // 用户手动操作过镜头（following=false）时不抢镜头。
+            if (!root.wavesShown) return;
+            root.wavesShown = false;
+            if (!app.hasMapFocus) return;
+            if (root.following) root.resetView();
+            root.wavesFinished();
+        }
+    }
+
+    /// 用户操作地图后，若一段时间无操作且未在跟随事件，则自动回到默认视野（我的位置/全国概览）。
+    property int idleResetMs: 20000
+    Timer {
+        id: idleResetTimer
+        interval: root.idleResetMs
+        onTriggered: {
+            if (root.pickingLocation || root.following) return;
+            // 有活动预警时归位到预警震中并重新跟随；否则回到我的位置（无定位则全国概览）。
+            if (root.warningActive && root.hasEvent) root.frameEvent();
+            else root.resetView();
+        }
+    }
+    function noteCameraInteraction() { idleResetTimer.restart(); }
     /// 当前（或目标）整数缩放层级：相机动画进行中取动画目标，否则取当前值。
     /// 以目标为基准，快速连续滚动时每一格都实打实 ±1，不会被进行中的补间吞掉。
     readonly property int zoomLevel: cameraMove.running ? Math.round(camZoom.to) : Math.round(zoom)
@@ -179,6 +270,7 @@ Item {
     function zoomAt(x, y, delta) {
         following = false;
         userMovedCamera = true;
+        root.noteCameraInteraction();
         const level = zoomLevel;
         const z = clampZoom(level + delta);
         if (z === level) return;   // 已到缩放上下限，避免原地抖动
@@ -221,6 +313,8 @@ Item {
     readonly property real scaledTile: tileSize * tileScale
     /// 视口外多取两圈，平移时新露出的瓦片已就绪，不会一格一格拼出来。
     readonly property int prefetchMargin: 2
+    /// 瓦片就绪后淡入时长（ms）：掩盖跨层级切换时清晰度突变造成的顿挫。
+    readonly property int tileFadeMs: 180
 
     /// 当前应绘制的瓦片集合，存**绝对瓦片坐标 + 层级 tz**。用 ListModel + 增量增删：
     /// 平移跨过瓦片边界时只增删边缘一圈，已有瓦片的 delegate 不重建、source 不变，不会整屏闪黑重载。
@@ -236,6 +330,12 @@ Item {
     Timer {
         id: underlayMaxTimer
         interval: 8000
+        onTriggered: root.retireUnderlay()
+    }
+    /// 顶层全部就绪后，等新层淡入（见 delegate 的 opacity）完成再撤底衬，避免淡入期间露底。
+    Timer {
+        id: underlayFadeTimer
+        interval: root.tileFadeMs
         onTriggered: root.retireUnderlay()
     }
     onTileZoomChanged: {
@@ -260,6 +360,7 @@ Item {
 
     function retireUnderlay() {
         underlayMaxTimer.stop();
+        underlayFadeTimer.stop();
         const u = root.underlayZ;
         if (u < 0) return;
         for (let i = tileModel.count - 1; i >= 0; --i) {
@@ -277,6 +378,7 @@ Item {
     }
     /// 顶层瓦片全部结算（Ready/Error，无 Loading/Null）才撤掉底衬，
     /// 避免冷瓦片（如 Petal 高层）加载慢时被固定计时器提前撤走而露白。
+    /// 就绪后再等 tileFadeMs，让新层淡入完成，避免淡入期间露底。
     function refreshTopLayerState() {
         if (underlayZ < 0) return;
         const z = tileModelZoom;
@@ -288,7 +390,11 @@ Item {
             const st = tileStatus[e.tz + ":" + e.tx + ":" + e.ty];
             if (st === undefined || st === Image.Null || st === Image.Loading) loading++;
         }
-        if (total > 0 && loading === 0) retireUnderlay();
+        if (total > 0 && loading === 0) {
+            if (!underlayFadeTimer.running) underlayFadeTimer.start();
+        } else {
+            underlayFadeTimer.stop();
+        }
     }
 
     /// 让 ListModel 与当前可视瓦片范围保持一致。只增删差集，保留已有瓦片与过渡底衬。
@@ -374,7 +480,6 @@ Item {
     function tileUrl(x, y, z) {
         let templateUrl = tileUrlTemplate;
         if (basemap === "osm") templateUrl = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
-        else if (basemap === "amap_satellite") templateUrl = "https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}";
         else if (basemap === "petal") templateUrl = "https://tilemap.aloys23.link/petal/{z}/{x}/{y}";
         else if (basemap === "custom") templateUrl = app.settings.customBasemapUrl;
         let url = templateUrl.replace("{x}", x).replace("{y}", y).replace("{z}", z);
@@ -393,6 +498,8 @@ Item {
     Rectangle {
         anchors.fill: parent
         color: root.theme.surfaceContainerLow
+        // 压到瓦片之下：底衬层要用负 z，背景必须比底衬更低。
+        z: -2
     }
 
     Repeater {
@@ -405,6 +512,9 @@ Item {
             /// 该瓦片在当前（连续）缩放下的屏幕边长：底衬层 tz 更小 → 放大顶替，新层 tz 更大 → 缩小。
             readonly property real size: root.tileSize * Math.pow(2, root.zoom - tz)
             readonly property int side: Math.pow(2, tz)
+            /// Repeater 按 model 行序绘制。缩小跨层时旧层（更大的 z）在尾部，
+            /// 若不显式压 z，底衬会盖在当前（更小 z）层之上，出现「大 z 瓦片拼到小 z 位置」。
+            z: (tz === root.underlayZ && tz !== root.tileModelZoom) ? -1 : 0
             x: tx * size - root.originX
             y: ty * size - root.originY
             width: size + 1
@@ -418,19 +528,26 @@ Item {
                 asynchronous: true
                 cache: true
                 smooth: true
+                /// 就绪后淡入：底衬（旧层）在下方透出，跨层切换因此是渐变而非整块突变。
+                opacity: status === Image.Ready ? 1 : 0
+                Behavior on opacity {
+                    NumberAnimation { duration: root.tileFadeMs; easing.type: Easing.OutCubic }
+                }
                 onStatusChanged: root.noteTileStatus(tileCell.tz, tileCell.tx, tileCell.ty, status)
             }
         }
     }
 
-    // P/S 波前圆：半径由 AppController 反解走时表得到（km），-1 表示不画。
+    // P/S 波前圆：半径由 AppController 反解走时表得到（km），-1 表示不画；
+    // 透明度按烈度影响半径渐隐（对齐 kanameishi），归零即隐藏。
     Rectangle {
         id: pWaveRing
         readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.pKm : -1
         visible: radiusKm > 0
+        opacity: app.waveRadii.pOpacity === undefined ? 0 : app.waveRadii.pOpacity
         x: root.hypocenterX - width / 2
         y: root.hypocenterY - height / 2
-        width: Math.max(2, 2 * Math.max(0, radiusKm) * root.pxPerKmValue)
+        width: Math.max(2, 2 * root.wavePKmShown * root.pxPerKmValue)
         height: width
         radius: width / 2
         color: "transparent"
@@ -438,13 +555,51 @@ Item {
         border.color: root.theme.pWave
     }
 
+    // S 波径向渐变填充（对齐 kanameishi 的 sWaveFill）：中心透明、边缘着色，
+    // 叠加在 S 波描边之下；仅在"影响半径"内可见，透明度随半径由 0.25 渐隐到 0。
+    Shape {
+        id: sWaveFill
+        objectName: "sWaveFill"
+        readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.sKm : -1
+        readonly property real fillOpacity: app.waveRadii.sFillOpacity === undefined ? 0 : app.waveRadii.sFillOpacity
+        visible: radiusKm > 0 && fillOpacity > 0
+        opacity: fillOpacity
+        x: root.hypocenterX - width / 2
+        y: root.hypocenterY - height / 2
+        width: Math.max(2, 2 * root.waveSKmShown * root.pxPerKmValue)
+        height: width
+        ShapePath {
+            strokeColor: "transparent"
+            startX: sWaveFill.width / 2
+            startY: 0
+            PathAngleArc {
+                centerX: sWaveFill.width / 2
+                centerY: sWaveFill.height / 2
+                radiusX: sWaveFill.width / 2
+                radiusY: sWaveFill.height / 2
+                startAngle: -90
+                sweepAngle: 360
+            }
+            fillGradient: RadialGradient {
+                centerX: sWaveFill.width / 2
+                centerY: sWaveFill.height / 2
+                centerRadius: sWaveFill.width / 2
+                focalX: sWaveFill.width / 2
+                focalY: sWaveFill.height / 2
+                GradientStop { position: 0.0; color: "transparent" }
+                GradientStop { position: 1.0; color: root.theme.sWave }
+            }
+        }
+    }
+
     Rectangle {
         id: sWaveRing
         readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.sKm : -1
         visible: radiusKm > 0
+        opacity: app.waveRadii.sOpacity === undefined ? 0 : app.waveRadii.sOpacity
         x: root.hypocenterX - width / 2
         y: root.hypocenterY - height / 2
-        width: Math.max(2, 2 * Math.max(0, radiusKm) * root.pxPerKmValue)
+        width: Math.max(2, 2 * root.waveSKmShown * root.pxPerKmValue)
         height: width
         radius: width / 2
         color: "transparent"
@@ -476,24 +631,6 @@ Item {
             };
             cross(root.theme.hypocenterHalo, 10);
             cross(root.theme.hypocenterCross, 6);
-        }
-    }
-
-    // 震中距离参考同心圆环 (50km, 100km, 200km, 300km)
-    Repeater {
-        model: [50, 100, 200, 300]
-        delegate: Rectangle {
-            required property int modelData
-            visible: root.hasEvent
-            readonly property real r: modelData * root.pxPerKmValue
-            x: root.hypocenterX - r
-            y: root.hypocenterY - r
-            width: r * 2
-            height: r * 2
-            radius: r
-            color: "transparent"
-            border.width: 1
-            border.color: Qt.rgba(1, 1, 1, 0.15)
         }
     }
 
@@ -550,6 +687,7 @@ Item {
             if (!pressed) return;
             root.following = false;
             root.userMovedCamera = true;
+            root.noteCameraInteraction();
             const dx = mouse.x - lastX;
             const dy = mouse.y - lastY;
             lastX = mouse.x;
@@ -616,7 +754,7 @@ Item {
             GlassButton {
                 theme: root.theme; iconName: "layers"; accessibleName: "切换底图"; flat: true
                 onClicked: {
-                    const list = ["amap_vector", "amap_satellite", "petal", "osm"];
+                    const list = ["amap_vector", "petal", "osm"];
                     app.settings.basemapId = list[(list.indexOf(root.basemap) + 1) % list.length];
                 }
             }

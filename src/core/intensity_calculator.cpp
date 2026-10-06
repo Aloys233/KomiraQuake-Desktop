@@ -17,6 +17,17 @@ constexpr int kRomanCount = 13;
 double ceaCsis(double magnitude, double distanceKm) {
     return 1.297 * magnitude - 4.368 * std::log10(distanceKm + 15.0) + 5.363;
 }
+
+/// 在 [minRadius, maxRadius] 上从 maxOpacity 过渡到 minOpacity（对齐 kanameishi 的 calcOpacity）。
+double rampedOpacity(double radius, double minRadius, double maxRadius, double minOpacity, double maxOpacity) {
+    if (maxRadius <= minRadius) return radius <= minRadius ? maxOpacity : minOpacity;
+    if (radius <= minRadius * 0.2 + maxRadius * 0.8) return maxOpacity;
+    if (radius >= maxRadius) return minOpacity;
+    const double k = 5.0 * (minOpacity - maxOpacity) / (maxRadius - minRadius);
+    const double b = (5.0 * maxOpacity * maxRadius - 4.0 * minOpacity * maxRadius - minOpacity * minRadius) /
+                     (maxRadius - minRadius);
+    return k * radius + b;
+}
 } // namespace
 
 double IntensityCalculator::rawCsis(double magnitude, double distanceKm, double depthKm) {
@@ -36,24 +47,84 @@ double IntensityCalculator::rawCsis(double magnitude, double distanceKm, double 
     return std::max(0.0, (ceaCsis(magnitude, distanceKm) + ceaCsis(magnitude, hypoDistance)) / 2.0);
 }
 
+double IntensityCalculator::distanceForCsis(double magnitude, double depthKm, double level) {
+    if (magnitude <= 0.0) return 0.0;
+    if (rawCsis(magnitude, 0.0, depthKm) < level) return 0.0;
+    // rawCsis 关于距离单调不增，二分求交；量程上限对齐走时表 10000 km。
+    double lo = 0.0;
+    double hi = 10000.0;
+    for (int i = 0; i < 40; ++i) {
+        const double mid = (lo + hi) / 2.0;
+        if (rawCsis(magnitude, mid, depthKm) >= level) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+double IntensityCalculator::waveOpacity(double radiusKm, double fadeKm, double hardMaxKm) {
+    if (radiusKm <= 0.0 || fadeKm <= 0.0 || radiusKm >= hardMaxKm) return 0.0;
+    return radiusKm <= fadeKm ? rampedOpacity(radiusKm, 0.0, fadeKm, 0.25, 1.0)
+                              : rampedOpacity(radiusKm, fadeKm, hardMaxKm, 0.0, 0.25);
+}
+
+double IntensityCalculator::waveFillOpacity(double radiusKm, double fadeKm) {
+    // 与描边不同：填充只画在影响半径内（与 kanameishi 的 sWaveFill 一致），且由 0.25 递减到 0。
+    if (radiusKm <= 0.0 || fadeKm <= 0.0 || radiusKm > fadeKm) return 0.0;
+    return rampedOpacity(radiusKm, 0.0, fadeKm, 0.0, 0.25);
+}
+
+int IntensityCalculator::displayLevel(double raw) {
+    return std::clamp(static_cast<int>(std::lround(raw)), 0, kRomanCount - 1);
+}
+
 std::string IntensityCalculator::formatCsis(double raw) {
-    int idx = static_cast<int>(std::lround(raw));
-    idx = std::clamp(idx, 0, kRomanCount - 1);
-    return kRoman[idx];
+    return kRoman[displayLevel(raw)];
+}
+
+double IntensityCalculator::jmaValue(double magnitude, double distanceKm, double depthKm) {
+    const double r = std::max(1e-6, std::sqrt(distanceKm * distanceKm + depthKm * depthKm));
+    return 2.0 * magnitude - 4.68 * std::log10(r) - 0.007 * r - 1.66;
+}
+
+namespace {
+/// JMA 分档表：上界、显示文本、级数。formatJma 与 jmaLevel 共用这一张表，
+/// 保证「显示成什么」与「过滤按几级比较」不可能分叉。
+/// 5弱/5强 同为 5 级、6弱/6强 同为 6 级（过滤不区分强弱，与阈值滑块的 0.5 步长无关）。
+struct JmaBand {
+    double upper;
+    const char* text;
+    int level;
+};
+constexpr JmaBand kJmaBands[] = {
+    {0.5, "0", 0},   {1.5, "1", 1},   {2.5, "2", 2},   {3.5, "3", 3},   {4.5, "4", 4},
+    {5.0, "5弱", 5}, {5.5, "5强", 5}, {6.0, "6弱", 6}, {6.5, "6强", 6},
+};
+constexpr int kJmaMaxLevel = 7;
+} // namespace
+
+int IntensityCalculator::jmaLevel(double magnitude, double distanceKm, double depthKm) {
+    const double s = jmaValue(magnitude, distanceKm, depthKm);
+    for (const auto& band : kJmaBands) {
+        if (s < band.upper) return band.level;
+    }
+    return kJmaMaxLevel;
+}
+
+double IntensityCalculator::displayedLevel(double magnitude, double rawCsis, double distanceKm,
+                                           double depthKm, IntensityStandard standard) {
+    return standard == IntensityStandard::Jma
+               ? static_cast<double>(jmaLevel(magnitude, distanceKm, depthKm))
+               : static_cast<double>(displayLevel(rawCsis));
 }
 
 std::string IntensityCalculator::formatJma(double magnitude, double distanceKm, double depthKm) {
-    const double r = std::max(1e-6, std::sqrt(distanceKm * distanceKm + depthKm * depthKm));
-    const double s = 2.0 * magnitude - 4.68 * std::log10(r) - 0.007 * r - 1.66;
-    if (s < 0.5) return "0";
-    if (s < 1.5) return "1";
-    if (s < 2.5) return "2";
-    if (s < 3.5) return "3";
-    if (s < 4.5) return "4";
-    if (s < 5.0) return "5弱";
-    if (s < 5.5) return "5强";
-    if (s < 6.0) return "6弱";
-    if (s < 6.5) return "6强";
+    const double s = jmaValue(magnitude, distanceKm, depthKm);
+    for (const auto& band : kJmaBands) {
+        if (s < band.upper) return band.text;
+    }
     return "7";
 }
 

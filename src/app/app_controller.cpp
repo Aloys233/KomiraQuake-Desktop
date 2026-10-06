@@ -5,9 +5,11 @@
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QList>
 #include <QStandardPaths>
 #include <QStringList>
+#include <QStyleHints>
 #include <QTimeZone>
 
 #include <algorithm>
@@ -23,10 +25,13 @@
 #include "service/autostart.h"
 #include "service/location_service.h"
 #include "service/ntp_clock.h"
-#include "service/speech_service.h"
 #include "service/update_service.h"
 #include "source/eew_parser.h"
+#include "source/earthquake_source.h"
+#include "source/jian_source.h"
 #include "source/pancakes_source.h"
+#include "source/simulated_source.h"
+#include "source/whews_source.h"
 #include "source/wolfx_source.h"
 #include "store/history_store.h"
 #include "theme/seismic_colors.h"
@@ -61,7 +66,7 @@ QVariantMap toMap(const EarthquakeEvent& e, IntensityStandard standard = Intensi
     m["distance"] = hasDistance ? e.distanceKm : -1.0;
     m["distanceText"] = hasDistance ? QString::number(e.distanceKm, 'f', 0) : QStringLiteral("--");
     m["hasDistance"] = hasDistance;
-    // 烈度：有定位用本地预估，否则退回数据源报的最大烈度（HUD / 全屏预警 / 语音沿用本组字段）。
+    // 烈度：有定位用本地预估，否则退回数据源报的最大烈度（HUD / 全屏预警沿用本组字段）。
     const QString localText = QString::fromStdString(e.estimatedIntensity);
     const QString maxText = QString::fromStdString(e.maxIntensityText);
     const bool hasLocalIntensity =
@@ -120,6 +125,17 @@ int statusRank(ConnectionStatus s) {
     case ConnectionStatus::Disconnected: return 0;
     }
     return 0;
+}
+
+/// 目录刷新状态 → severity 标签，供设置页给目录行上色。
+QString directoryTag(ConnectionStatus s) {
+    switch (s) {
+    case ConnectionStatus::Connected: return QStringLiteral("NORMAL");
+    case ConnectionStatus::Connecting: return QStringLiteral("WATCH");
+    case ConnectionStatus::Error: return QStringLiteral("WARNING");
+    case ConnectionStatus::Disconnected: return QStringLiteral("CRITICAL");
+    }
+    return QStringLiteral("CRITICAL");
 }
 
 /// 聚合多数据源的链路状态：任一启用源在线即视为在线（状态栏单条展示）。
@@ -181,21 +197,36 @@ AppController::AppController(QObject* parent, bool startServices)
             << "| city coords:" << (CityCoordTable::instance().isLoaded() ? "loaded" : "MISSING");
 
     settings_ = new SettingsStore(this);
-    darkMode_ = settings_->darkMode();
+    systemDark_ = QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
+    darkMode_ = resolveDarkMode();
+    // themeMode 是唯一的用户意图来源；系统配色只在「跟随系统」时参与判定。
     connect(settings_, &SettingsStore::changed, this, [this]() {
-        if (darkMode_ != settings_->darkMode()) {
-            darkMode_ = settings_->darkMode();
+        if (darkMode_ != resolveDarkMode()) {
+            darkMode_ = resolveDarkMode();
             emit darkModeChanged();
         }
     });
+    if (QGuiApplication::styleHints()) {
+        connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this](Qt::ColorScheme) {
+            systemDark_ = QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
+            if (darkMode_ != resolveDarkMode()) {
+                darkMode_ = resolveDarkMode();
+                emit darkModeChanged();
+            }
+        });
+    }
     location_ = new LocationService(this);
     sound_ = new AlertSoundService(this);
     sound_->setAssetRoot(assetRoot);
-    speech_ = new SpeechService(this);
-    announcer_ = new AlertAnnouncer(settings_, sound_, speech_, this);
+    announcer_ = new AlertAnnouncer(settings_, sound_, this);
 
-    source_ = new WolfxSource(this);
-    pancakes_ = new PancakesSource(this);
+    // 数据源注册表：Wolfx / Pancakes / Jian / Whews … 平级、互为备份。新增源在此登记一行即可，
+    // 接线、启停、状态聚合与跨源合并都由通用逻辑处理。
+    jian_ = new JianSource(this);
+    whews_ = new WhewsSource(this);
+    simulated_ = new SimulatedSource(this);
+    sources_ << new WolfxSource(this) << new PancakesSource(this) << jian_ << whews_
+             << simulated_;
     clock_ = new NtpClock(this);
     autoStart_ = new AutoStartService(this);
     updater_ = new UpdateService(this);
@@ -231,32 +262,40 @@ AppController::~AppController() {
 
 void AppController::wire() {
     // 校时：数据源与告警编排都走 clock_ 的时间基准。《NATIVE_PORT_SPEC》 §13。
-    source_->setNowProvider([this]() { return nowMs(); });
-    source_->setMonoProvider([this]() { return clock_->elapsedMs(); });
-    pancakes_->setNowProvider([this]() { return nowMs(); });
-    pancakes_->setMonoProvider([this]() { return clock_->elapsedMs(); });
     connect(clock_, &NtpClock::changed, this, &AppController::clockChanged);
+    // 逐源接线：校时注入、事件与状态回调；新增源无需改这里。
+    for (EarthquakeSource* source : sources_) {
+        source->setNowProvider([this]() { return nowMs(); });
+        source->setMonoProvider([this]() { return clock_->elapsedMs(); });
+        connect(source, &EarthquakeSource::eventReceived, this,
+                [this, source](const EarthquakeEvent& e, SourceEventKind kind) {
+                    handleEvent(e, false, kind == SourceEventKind::Directory, source);
+                });
+        connect(source, &EarthquakeSource::infoChanged, this, &AppController::statusChanged);
+    }
 
-    connect(source_, &WolfxSource::eventReceived, this,
-            [this](const EarthquakeEvent& e, WolfxEventKind kind) {
-                handleEvent(e, false, kind == WolfxEventKind::Directory);
-            });
-    connect(source_, &WolfxSource::infoChanged, this, &AppController::statusChanged);
-    connect(pancakes_, &PancakesSource::eventReceived, this,
-            [this](const EarthquakeEvent& e, PancakesKind kind) {
-                handleEvent(e, false, kind == PancakesKind::Directory);
-            });
-    connect(pancakes_, &PancakesSource::infoChanged, this, &AppController::statusChanged);
+    // Jian 需登录令牌：启动注入已持久化的 rt_；登录成功后持久化新 rt_ 并立即重新鉴权。
+    jian_->setRefreshToken(settings_->jianRefreshToken());
+    connect(jian_, &JianSource::refreshTokenObtained, this, [this](const QString& token) {
+        settings_->setJianRefreshToken(token);
+        jian_->setRefreshToken(token);
+    });
+
+    // Whews 需 wat_ 令牌：启动注入已持久化的令牌，设置页改动后立即生效。
+    whews_->setToken(settings_->whewsToken());
+
+    // 模拟源仅开发自测：需开发者模式开启且地址非空，否则 isConfigured() 为假、不会连接。
+    simulated_->setDevMode(settings_->developerMode());
+    simulated_->setUrl(settings_->simulatedUrl());
 
     // 定位只影响"本地烈度/倒计时/全屏预警"，不影响数据源连接。
     connect(location_, &LocationService::changed, this, [this]() {
         emit locationChanged();
-        if (location_->hasLocation()) {
-            source_->setUserLocation(location_->latitude(), location_->longitude());
-            pancakes_->setUserLocation(location_->latitude(), location_->longitude());
-        } else {
-            source_->clearUserLocation();
-            pancakes_->clearUserLocation();
+        for (EarthquakeSource* source : sources_) {
+            if (location_->hasLocation())
+                source->setUserLocation(location_->latitude(), location_->longitude());
+            else
+                source->clearUserLocation();
         }
         recomputeEvents();
     });
@@ -264,15 +303,18 @@ void AppController::wire() {
     connect(settings_, &SettingsStore::changed, this, [this]() {
         const IntensityStandard standard = settings_->intensityStandard() == 1
             ? IntensityStandard::Jma : IntensityStandard::Csis;
-        source_->setStandard(standard);
-        pancakes_->setStandard(standard);
-        speech_->setEnabled(settings_->enableSpeech());
-        speech_->setRate(settings_->speechRate());
-        speech_->setVolume(settings_->alertVolume());
+        // 开发者模式与地址须先于启停生效：否则刚开启开发者模式要等下次启动才连上。
+        simulated_->setDevMode(settings_->developerMode());
+        simulated_->setUrl(settings_->simulatedUrl());
+        for (EarthquakeSource* source : sources_) {
+            source->setStandard(standard);
+            // 未配置凭据的源不启动：不建立任何连接。
+            if (startServices_ && settings_->isSourceEnabled(source->id()) && source->isConfigured())
+                source->start();
+            else source->stop();
+        }
         sound_->setEnabled(settings_->enableSoundAlert());
         sound_->setVolume(settings_->alertVolume());
-        if (startServices_ && settings_->enabledWolfx()) source_->start(); else source_->stop();
-        if (startServices_ && settings_->enabledPancakes()) pancakes_->start(); else pancakes_->stop();
         clock_->setCustomServer(settings_->customNtpServer());
         clock_->setEnabled(startServices_ && settings_->enableNtpSync());
         announcer_->onMuteChanged();
@@ -282,9 +324,6 @@ void AppController::wire() {
     });
 
     // 启动时应用一次设置
-    speech_->setEnabled(settings_->enableSpeech());
-    speech_->setRate(settings_->speechRate());
-    speech_->setVolume(settings_->alertVolume());
     sound_->setEnabled(settings_->enableSoundAlert());
     sound_->setVolume(settings_->alertVolume());
 
@@ -302,11 +341,12 @@ void AppController::wire() {
     // 数据源与定位解耦：先连数据源，定位并行获取；校时并行后台进行。
     const IntensityStandard startStandard =
         settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis;
-    source_->setStandard(startStandard);
-    pancakes_->setStandard(startStandard);
+    for (EarthquakeSource* source : sources_) {
+        source->setStandard(startStandard);
+        if (startServices_ && settings_->isSourceEnabled(source->id()) && source->isConfigured())
+            source->start();
+    }
     if (startServices_) {
-        if (settings_->enabledWolfx()) source_->start();
-        if (settings_->enabledPancakes()) pancakes_->start();
         clock_->setCustomServer(settings_->customNtpServer());
         clock_->setEnabled(settings_->enableNtpSync());
         clock_->start();
@@ -325,9 +365,16 @@ bool AppController::alertEligible() const {
 
 QStringList AppController::enabledSourceIds() const {
     QStringList ids;
-    if (settings_->enabledWolfx()) ids << SourceIds::kWolfx;
-    if (settings_->enabledPancakes()) ids << SourceIds::kPancakes;
+    for (EarthquakeSource* source : sources_)
+        if (settings_->isSourceEnabled(source->id())) ids << source->id();
     return ids;
+}
+
+QList<DataSourceInfo> AppController::allSourceInfos() const {
+    QList<DataSourceInfo> infos;
+    infos.reserve(sources_.size());
+    for (EarthquakeSource* source : sources_) infos << source->info();
+    return infos;
 }
 
 void AppController::maybeAutoCheckUpdates() {
@@ -338,9 +385,7 @@ void AppController::maybeAutoCheckUpdates() {
 }
 
 QString AppController::statusText() const {
-    const DataSourceInfo info = combineSources(
-        {source_->info(), pancakes_->info()},
-        enabledSourceIds());
+    const DataSourceInfo info = combineSources(allSourceInfos(), enabledSourceIds());
     switch (info.status) {
     case ConnectionStatus::Connected: return QStringLiteral("源在线");
     case ConnectionStatus::Connecting: return QStringLiteral("连接中");
@@ -351,9 +396,7 @@ QString AppController::statusText() const {
 }
 
 QString AppController::statusLevelTag() const {
-    const DataSourceInfo info = combineSources(
-        {source_->info(), pancakes_->info()},
-        enabledSourceIds());
+    const DataSourceInfo info = combineSources(allSourceInfos(), enabledSourceIds());
     switch (info.status) {
     case ConnectionStatus::Connected: return QStringLiteral("NORMAL");
     case ConnectionStatus::Error: return QStringLiteral("WARNING");
@@ -382,23 +425,22 @@ QVariantList AppController::sources() const {
         case ConnectionStatus::Connecting: m["directory"] = QStringLiteral("目录刷新中"); break;
         case ConnectionStatus::Error:
             m["directory"] = QStringLiteral("目录刷新失败：") + info.directoryError; break;
-        default: m["directory"] = QStringLiteral("目录未刷新"); break;
+        default:         m["directory"] = QStringLiteral("目录未刷新"); break;
         }
+        m["directoryStatusTag"] = directoryTag(info.directoryStatus);
         m["directoryLatency"] = info.directoryLatencyMs >= 0
             ? QStringLiteral("%1 ms").arg(info.directoryLatencyMs) : QStringLiteral("— ms");
         m["description"] = info.description;
         return m;
     };
     QVariantList list;
-    list.push_back(describe(source_->info(), settings_->enabledWolfx()));
-    list.push_back(describe(pancakes_->info(), settings_->enabledPancakes()));
+    for (EarthquakeSource* source : sources_)
+        list.push_back(describe(source->info(), settings_->isSourceEnabled(source->id())));
     return list;
 }
 
 QVariantMap AppController::sourceInfo() const {
-    const DataSourceInfo info = combineSources(
-        {source_->info(), pancakes_->info()},
-        enabledSourceIds());
+    const DataSourceInfo info = combineSources(allSourceInfos(), enabledSourceIds());
     QVariantMap m;
     m["id"] = info.id;
     m["name"] = info.name;
@@ -605,6 +647,9 @@ QVariantMap AppController::waveRadii() const {
     QVariantMap m;
     m["pKm"] = wavePKm_;
     m["sKm"] = waveSKm_;
+    m["pOpacity"] = wavePOpacity_;
+    m["sOpacity"] = waveSOpacity_;
+    m["sFillOpacity"] = waveSFillOpacity_;
     return m;
 }
 
@@ -679,6 +724,9 @@ void AppController::updateWaveTimer() {
     if (wavePKm_ != -1.0 || waveSKm_ != -1.0) {
         wavePKm_ = -1.0;
         waveSKm_ = -1.0;
+        wavePOpacity_ = 0.0;
+        waveSOpacity_ = 0.0;
+        waveSFillOpacity_ = 0.0;
         emit waveRadiiChanged();
     }
 }
@@ -702,23 +750,22 @@ void AppController::updateWaveRadii() {
     // jb 表上限 10000 km 同样会 clamp，到端点即视为超出量程不再画。
     double pKm = p >= kWaveMaxRadiusKm ? -1.0 : p;
     double sKm = s >= kWaveMaxRadiusKm ? -1.0 : s;
-    // P、S 波都离开中国范围后一起隐藏，避免留下无意义的巨大波前圆。
-    if (QuakeCalculator::bothWavesBeyondChina(event->latitude, event->longitude, pKm, sKm)) {
-        pKm = -1.0;
-        sKm = -1.0;
-    }
+    // 波前"影响半径"：CSIS 降到可感下限（I）时的震中距。这是有意取代 kanameishi 的
+    // 经验式 clamp(50·M²,200,2000)。震级未知（<=0）时无法反解，退回量程上限，保证波前仍可见。
+    const double fadeKm = event->magnitude > 0.0
+                              ? IntensityCalculator::distanceForCsis(event->magnitude, event->depth, kCsisFadeLevel)
+                              : kWaveMaxRadiusKm;
+    // 透明度归零即视为隐藏：半径记 -1，取景与绘制都会跳过。
+    if (IntensityCalculator::waveOpacity(pKm, fadeKm, kWaveMaxRadiusKm) <= 0.0) pKm = -1.0;
+    if (IntensityCalculator::waveOpacity(sKm, fadeKm, kWaveMaxRadiusKm) <= 0.0) sKm = -1.0;
     if (pKm == wavePKm_ && sKm == waveSKm_) return;
     wavePKm_ = pKm;
     waveSKm_ = sKm;
+    wavePOpacity_ = pKm > 0.0 ? IntensityCalculator::waveOpacity(pKm, fadeKm, kWaveMaxRadiusKm) : 0.0;
+    waveSOpacity_ = sKm > 0.0 ? IntensityCalculator::waveOpacity(sKm, fadeKm, kWaveMaxRadiusKm) : 0.0;
+    waveSFillOpacity_ = sKm > 0.0 ? IntensityCalculator::waveFillOpacity(sKm, fadeKm) : 0.0;
     emit waveRadiiChanged();
     if (wavePKm_ < 0.0 && waveSKm_ < 0.0) waveTimer_.stop();
-}
-
-void AppController::setDarkMode(bool dark) {
-    if (darkMode_ == dark) return;
-    darkMode_ = dark;
-    if (settings_) settings_->setDarkMode(dark);
-    emit darkModeChanged();
 }
 
 void AppController::requestLocation() { location_->requestCurrentPosition(); }
@@ -728,8 +775,24 @@ void AppController::setManualLocation(double latitude, double longitude, const Q
 }
 
 void AppController::refreshCatalog() {
-    if (source_ && settings_->enabledWolfx()) source_->refreshDirectory();
-    if (pancakes_ && settings_->enabledPancakes()) pancakes_->refreshDirectory();
+    for (EarthquakeSource* source : sources_)
+        if (settings_->isSourceEnabled(source->id())) source->refreshDirectory();
+}
+
+void AppController::loginJian(const QString& loginKey) {
+    if (jian_) jian_->login(loginKey);
+}
+
+void AppController::setWhewsToken(const QString& token) {
+    settings_->setWhewsToken(token);
+    whews_->setToken(token);
+}
+
+void AppController::setSimulatedUrl(const QString& url) {
+    settings_->setSimulatedUrl(url);
+    // 写设置即触发 changed → 上面那段会把新地址推入源并按需启停；
+    // 这里再显式推一次，保证在 changed 已被节流或顺序变化时也立即生效。
+    simulated_->setUrl(settings_->simulatedUrl());
 }
 
 void AppController::refreshClock() {
@@ -782,10 +845,6 @@ QString AppController::severityColor(const QString& levelTag) const {
     return SeismicColors::severity(levelFromTag(levelTag), darkMode_).name();
 }
 
-bool AppController::speechAvailable() const { return speech_->available(); }
-
-void AppController::sampleSpeech() { speech_->speakSample(); }
-
 QString AppController::identityOf(const EarthquakeEvent& event) {
     return QString::fromStdString(event.identity());
 }
@@ -795,7 +854,12 @@ bool AppController::samePhysicalEvent(const EarthquakeEvent& a, const Earthquake
                                         b.timestamp, b.latitude, b.longitude);
 }
 
-void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bool inDirectory) {
+void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bool inDirectory,
+                                EarthquakeSource* source) {
+    // 处置结果回报给源：墓碑 / 重复这些在链路上不报错，不回报对自建源就等于静默丢弃。
+    const auto admit = [source](const EarthquakeEvent& e, AdmissionStatus status) {
+        if (source) source->onAdmission(e, status);
+    };
     EarthquakeEvent event = incoming;
     EewParser::UserLocation user;
     if (hasLocation()) user = std::make_pair(userLatitude(), userLongitude());
@@ -804,7 +868,10 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
     // Directory and warning gates are deliberately independent.
     if (inDirectory) {
         const auto decision = gate_.admit(event, nowMs());
-        if (decision == EventGateDecision::Duplicate || decision == EventGateDecision::Stale) return;
+        if (decision == EventGateDecision::Duplicate || decision == EventGateDecision::Stale) {
+            admit(event, AdmissionStatus::Duplicate);
+            return;
+        }
         if (isAlertLevel(event.warningLevel)) event.warningLevel = WarningLevel::Watch;
         upsertHistory(event);
         if (hasMapFocus_ && mapFocus_.identity() == event.identity() &&
@@ -821,12 +888,19 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         }
         rebuildHistory();
         emit hudEventChanged();
+        admit(event, AdmissionStatus::Applied);
         return;
     }
     // 不做震级过滤：所有实时事件都进入生命周期（用于展示/HUD/倒计时），
     // 是否提醒由 AlertAnnouncer 依据「预警总开关 + 本地烈度」决定。
     const auto change = sessions_.accept(event, nowMs());
-    if (change == WarningSession::Change::Ignored) return;
+    if (change == WarningSession::Change::Ignored) {
+        // 墓碑与门控去重都归为 Ignored，但成因不同：前者是「这个事件已结束过」，
+        // 后者是「这一报和已收的重复」。分开回报才能定位问题。
+        admit(event, sessions_.finished(event.identity()) ? AdmissionStatus::Tombstoned
+                                                          : AdmissionStatus::Duplicate);
+        return;
+    }
     if (change == WarningSession::Change::Ended) {
         historyStore_->saveTombstone(identityOf(event), nowMs());
         announcer_->finish(event, selectedWarning_ == event.identity());
@@ -836,6 +910,7 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
             emit hudEventChanged();
         }
         syncWarning();
+        admit(event, AdmissionStatus::Ended);
         return;
     }
     const bool added = change == WarningSession::Change::Added;
@@ -855,6 +930,7 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
     if (!replay && !state.muted && selectedWarning_ == event.identity() &&
         change != WarningSession::Change::Corrected)
         announcer_->onWarning(event);
+    admit(event, AdmissionStatus::Applied);
 }
 
 void AppController::upsertHistory(const EarthquakeEvent& event) {

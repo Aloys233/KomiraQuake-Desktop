@@ -18,6 +18,7 @@ struct WolfxProtocol {
         return urls;
     }
     static QString eqListUrl() { return QStringLiteral("https://api.wolfx.jp/cenc_eqlist.json"); }
+    static QString jmaEqListUrl() { return QStringLiteral("https://api.wolfx.jp/jma_eqlist.json"); }
 
     static const QStringList& queries() {
         static const QStringList q = {
@@ -39,13 +40,14 @@ struct WolfxProtocol {
         return types.contains(type);
     }
 
+    /// 报文展示名（HUD 标题）。对齐 Wolfx Open API 文档的接口名。
     static QString titleFor(const QString& type) {
-        if (type == "cenc_eew") return QStringLiteral("中国地震预警网 (CEA)");
-        if (type == "sc_eew") return QStringLiteral("四川省地震局 (SC_EEW)");
-        if (type == "jma_eew") return QStringLiteral("日本气象厅 (JMA)");
-        if (type == "cwa_eew") return QStringLiteral("台湾气象署 (CWA)");
-        if (type == "fj_eew") return QStringLiteral("福建省地震局 (FJ_EEW)");
-        if (type == "cq_eew") return QStringLiteral("重庆市地震局 (CQ_EEW)");
+        if (type == "cenc_eew") return QStringLiteral("中国地震预警网 地震预警");
+        if (type == "sc_eew") return QStringLiteral("四川省地震局 地震预警");
+        if (type == "jma_eew") return QStringLiteral("JMA 紧急地震速报");
+        if (type == "cwa_eew") return QStringLiteral("CWA 地震预警");
+        if (type == "fj_eew") return QStringLiteral("福建省地震局 地震预警");
+        if (type == "cq_eew") return QStringLiteral("重庆市地震局 地震预警");
         return type;
     }
 
@@ -66,6 +68,9 @@ struct WolfxProtocol {
 
     /// HTTP 目录（cenc_eqlist）统一由中国地震台网发布。
     static QString directoryAgency() { return QStringLiteral("CENC"); }
+
+    /// HTTP 目录（jma_eqlist）由日本气象厅发布。
+    static QString jmaDirectoryAgency() { return QStringLiteral("JMA"); }
 
     static constexpr int kQueryIntervalMs = 15000;
     static constexpr int kPollIntervalMs = 90000;

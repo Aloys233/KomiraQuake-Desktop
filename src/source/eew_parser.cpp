@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QJsonValue>
 #include <QStringList>
+#include <QTimeZone>
 
 #include <cmath>
 
@@ -222,13 +223,57 @@ long long EewParser::parseTime(const QString& raw, bool* ok) {
     return 0;
 }
 
+long long EewParser::parseUtc8Time(const QString& raw, bool* ok) {
+    // Whews 的 cenc / cea / usgs 等端点时刻是无时区墙钟（UTC+8）。
+    return parseFixedOffsetTime(raw, 8 * 3600, ok);
+}
+
+long long EewParser::parseJstTime(const QString& raw, bool* ok) {
+    // Wolfx 的 JMA 报文时刻是无时区墙钟（JST）。
+    return parseFixedOffsetTime(raw, 9 * 3600, ok);
+}
+
+long long EewParser::parseFixedOffsetTime(const QString& raw, int offsetSeconds, bool* ok) {
+    if (ok) *ok = false;
+    const QString trimmed = raw.trimmed();
+    if (trimmed.isEmpty()) return 0;
+    // 纯数字时间戳（epoch 秒/毫秒）本身不含时区歧义，交给 parseTime。
+    bool allDigits = true;
+    for (const QChar& c : trimmed) {
+        if (!c.isDigit()) { allDigits = false; break; }
+    }
+    if (allDigits) return parseTime(trimmed, ok);
+    // fromString 默认按本地时区解释，必须显式改判偏移，否则非 UTC+8 机器会整体偏移。
+    static const QStringList formats = {
+        QStringLiteral("yyyy/MM/dd HH:mm:ss"),
+        QStringLiteral("yyyy/MM/dd HH:mm"),
+        QStringLiteral("yyyy-MM-dd HH:mm:ss"),
+        QStringLiteral("yyyy-MM-dd HH:mm"),
+    };
+    for (const QString& fmt : formats) {
+        QDateTime dt = QDateTime::fromString(trimmed, fmt);
+        if (!dt.isValid()) continue;
+        dt.setTimeZone(QTimeZone(offsetSeconds));   // 墙钟不变，重解释时区
+        if (ok) *ok = true;
+        return dt.toMSecsSinceEpoch();
+    }
+    return 0;
+}
+
 std::optional<EarthquakeEvent> EewParser::parse(const QJsonObject& obj,
                                                 const UserLocation& user,
                                                 IntensityStandard standard,
                                                 const QString& sourceTitle,
                                                 const QString& idPrefix,
-                                                long long nowMs) {
+                                                long long nowMs,
+                                                bool originTimeIsJst,
+                                                const QString& eventNamespace) {
     if (obj.value("isTraining").toBool(false)) return std::nullopt;
+
+    // 日本气象厅的报文时刻是 JST 墙钟，中国各局是本机时区（UTC+8）墙钟。
+    const auto parseReportTime = [originTimeIsJst](const QString& raw) {
+        return originTimeIsJst ? EewParser::parseJstTime(raw) : EewParser::parseTime(raw);
+    };
 
     const bool magnitudeUnknown = obj.value("magnitudeUnknown").toBool(false);
     auto magnitude = firstDouble(obj, {"Magnitude", "Magunitude"});
@@ -248,13 +293,17 @@ std::optional<EarthquakeEvent> EewParser::parse(const QJsonObject& obj,
     const bool isFinal = obj.value("isFinal").toBool(false);
     const bool isCanceled = obj.value("isCancel").toBool(obj.value("isCanceled").toBool(false));
     const long long originTime =
-        parseTime(firstString(obj, {"OriginTime", "originTime", "shockTime", "time"}).value_or(QString()));
+        parseReportTime(firstString(obj, {"OriginTime", "originTime", "shockTime", "time"}).value_or(QString()));
 
     const MaxIntensity maxIntensity = parseMaxIntensityImpl(obj, standard);
-    EarthquakeEvent event = buildEvent(idPrefix + rawId, rawId, *magnitude, *latitude, *longitude, depth, location,
+    // 频道化 eventId：跨聚合商对齐合并键（见 EarthquakeEvent::identity）。
+    const QString eventId = eventNamespace.isEmpty()
+                                ? rawId
+                                : eventNamespace + QLatin1Char(':') + rawId;
+    EarthquakeEvent event = buildEvent(idPrefix + rawId, eventId, *magnitude, *latitude, *longitude, depth, location,
                       originTime != 0 ? originTime : nowMs, sourceTitle, user, standard,
                       maxIntensity.text, maxIntensity.raw, reportNum, isFinal, isCanceled);
-    event.reportTime = parseTime(firstString(obj, {"ReportTime", "reportTime", "updateTime"}).value_or(QString()));
+    event.reportTime = parseReportTime(firstString(obj, {"ReportTime", "reportTime", "updateTime"}).value_or(QString()));
     return event;
 }
 
@@ -273,8 +322,7 @@ std::optional<EarthquakeEvent> EewParser::parseCencDirectory(const QJsonObject& 
     long long origin = parseTime(firstString(obj, {"time", "originTime"}).value_or(QString()));
     if (origin == 0) origin = nowMs;
 
-    const bool reviewed = firstString(obj, {"type"}) == QStringLiteral("reviewed");
-    const QString sourceTitle = reviewed ? QStringLiteral("CENC 正式测定") : QStringLiteral("CENC 自动测定");
+    const QString sourceTitle = QStringLiteral("中国地震台网 地震信息");
     // 优先用数据源自带的 EventID（跨报次稳定，且可与 WS 预警链路对齐）
     const QString rawEventId = firstString(obj, {"EventID", "id"}).value_or(QString());
     const QString id = rawEventId.isEmpty()
@@ -296,6 +344,68 @@ EewParser::MaxIntensityValue EewParser::parseMaxIntensity(const QJsonObject& obj
                                                           IntensityStandard standard) {
     const MaxIntensity m = parseMaxIntensityImpl(obj, standard);
     return MaxIntensityValue{m.raw, m.text};
+}
+
+std::optional<EarthquakeEvent> EewParser::parseJmaDirectory(const QJsonObject& obj,
+                                                            const UserLocation& user,
+                                                            IntensityStandard standard) {
+    const auto latitude = firstDouble(obj, {"latitude", "Latitude"});
+    const auto longitude = firstDouble(obj, {"longitude", "Longitude"});
+    if (!latitude || !longitude) return std::nullopt;
+    const double magnitude = firstDouble(obj, {"magnitude", "Magnitude"}).value_or(0.0);
+
+    // depth 形如 "10km"，需去掉单位后缀再解析。
+    double depth = kDefaultDepth;
+    if (const auto raw = firstString(obj, {"depth", "Depth"})) {
+        int end = 0;
+        while (end < raw->size()) {
+            const QChar c = raw->at(end);
+            if (c.isDigit() || c == QLatin1Char('.') || c == QLatin1Char('-')) ++end;
+            else break;
+        }
+        bool depthOk = false;
+        const double d = raw->left(end).toDouble(&depthOk);
+        if (depthOk && std::isfinite(d) && d >= 0.0) depth = d;
+    }
+
+    QString location = firstString(obj, {"location", "placeName"}).value_or(QStringLiteral("未知震源"));
+    if (location.isEmpty()) location = QStringLiteral("未知震源");
+
+    // time_full 含秒，time 只到分钟；两者都是 JST 墙钟。解析失败则丢弃，不退回 now。
+    bool timeOk = false;
+    const long long origin = parseJstTime(firstString(obj, {"time_full", "time"}).value_or(QString()), &timeOk);
+    if (!timeOk || origin == 0) return std::nullopt;
+
+    const QString rawEventId = firstString(obj, {"EventID", "id"}).value_or(QString());
+    const QString id = rawEventId.isEmpty()
+                           ? QStringLiteral("wolfx_jmaeqlist_%1_%2").arg(origin).arg(*latitude, 0, 'f', 2)
+                           : QStringLiteral("wolfx_jmaeqlist_") + rawEventId;
+    // 与 Pancakes 的 jma_eqlist 共用事件命名空间，源内去重/合并口径一致。
+    const QString eventId = rawEventId.isEmpty()
+                                ? QStringLiteral("jma_eqlist:%1").arg(origin)
+                                : QStringLiteral("jma_eqlist:") + rawEventId;
+
+    // shindo 为 JMA 震度（"1"/"5-"/"5+"/"7"）：固定按 JMA 展示，不随用户烈度标准转换。
+    QString shindoText;
+    double shindoRaw = 0.0;
+    if (const auto shindo = firstString(obj, {"shindo", "Shindo"})) {
+        const QString t = shindo->trimmed();
+        if (!t.isEmpty() && t != QStringLiteral("-") && t != QStringLiteral("null")) {
+            bool numOk = false;
+            const double d = t.toDouble(&numOk);
+            shindoText = t;
+            shindoRaw = numOk ? d : jmaTextToRaw(t);
+        }
+    }
+
+    EarthquakeEvent event = buildEvent(id, eventId, magnitude, *latitude, *longitude, depth,
+                                       location, origin, QStringLiteral("JMA 地震情报"), user, standard,
+                                       shindoText, shindoRaw, 1, true, false);
+    // 目录永不产生 warning/critical
+    if (event.warningLevel == WarningLevel::Critical || event.warningLevel == WarningLevel::Warning) {
+        event.warningLevel = WarningLevel::Watch;
+    }
+    return event;
 }
 
 } // namespace komira

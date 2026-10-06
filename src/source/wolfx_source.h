@@ -11,37 +11,33 @@
 #include "model/data_source_info.h"
 #include "model/earthquake_event.h"
 #include "source/eew_parser.h"
+#include "source/earthquake_source.h"
 
 namespace komira {
 
-/// 事件类别：EEW 实时预警走 WebSocket；地震列表只由 HTTP 目录轮询填充。《NATIVE_PORT_SPEC》 §2。
-enum class WolfxEventKind { Eew, Directory };
-
-/// Wolfx 数据源：WebSocket 预警 + CENC 目录 HTTP 轮询。《NATIVE_PORT_SPEC》 §2。
-class WolfxSource : public QObject {
+/// Wolfx 数据源：WebSocket 预警 + CENC / JMA 目录 HTTP 轮询。《NATIVE_PORT_SPEC》 §2。
+class WolfxSource : public EarthquakeSource {
     Q_OBJECT
 public:
     explicit WolfxSource(QObject* parent = nullptr);
 
-    void start();
-    void stop();
-    void setUserLocation(double lat, double lon);
-    void clearUserLocation();
-    void setStandard(IntensityStandard standard) { standard_ = standard; }
+    QString id() const override { return SourceIds::kWolfx; }
+
+    void start() override;
+    void stop() override;
+    void setUserLocation(double lat, double lon) override;
+    void clearUserLocation() override;
+    void setStandard(IntensityStandard standard) override { standard_ = standard; }
     /// Explicit directory refresh; ignored while disabled. Location changes are local only.
-    void refreshDirectory();
+    void refreshDirectory() override;
 
     /// 校时后的墙钟（epoch ms）：新鲜度判定、pong、心跳展示走它。《NATIVE_PORT_SPEC》 §13。
-    void setNowProvider(std::function<long long()> provider) { nowProvider_ = std::move(provider); }
+    void setNowProvider(std::function<long long()> provider) override { nowProvider_ = std::move(provider); }
     /// 单调耗时（ms）：目录轮询 RTT 量测走它，不受系统时间影响。
-    void setMonoProvider(std::function<long long()> provider) { monoProvider_ = std::move(provider); }
+    void setMonoProvider(std::function<long long()> provider) override { monoProvider_ = std::move(provider); }
 
     bool hasLocation() const { return hasLocation_; }
-    DataSourceInfo info() const { return info_; }
-
-signals:
-    void eventReceived(const komira::EarthquakeEvent& event, WolfxEventKind kind);
-    void infoChanged();
+    DataSourceInfo info() const override { return info_; }
 
 private:
     void connectSocket();
@@ -53,6 +49,8 @@ private:
     void handleJsonObject(const QJsonObject& obj);
     void sendQueries();
     void pollDirectory();
+    /// 一个轮询周期内链式拉取第 index 个目录端点；全部结束后聚合目录状态。
+    void fetchDirectoryEndpoint(int index);
     void setStatus(ConnectionStatus status, const QString& note = QString());
     EewParser::UserLocation userLocation() const;
     /// 校时后的墙钟；未注入时回退系统时间。
@@ -76,6 +74,11 @@ private:
     double userLon_ = 0.0;
     bool hasLocation_ = false;
     bool running_ = false;
+    /// 当前目录轮询周期的进度与结果（单一 directoryStatus 汇总全部端点）。
+    int directoryIndex_ = 0;
+    bool directoryFailed_ = false;
+    QString directoryError_;
+    long long directoryCycleStart_ = 0;
     int urlIndex_ = 0;
     int retryCount_ = 0;
     std::function<long long()> nowProvider_;
