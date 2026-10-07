@@ -18,6 +18,7 @@
 #define private public
 #include "app/app_controller.h"
 #include "service/alert_announcer.h"
+#include "service/tray_controller.h"
 #undef private
 
 using namespace komira;
@@ -404,6 +405,47 @@ private slots:
         // 任何 QML 布局回调形成绑定环都会打印 "Detected recursive rearrange"；不得出现。
         for (const auto& warning : qmlWarnings)
             QVERIFY2(!warning.contains("recursive rearrange"), qPrintable(warning));
+    }
+
+    // 托盘闪烁必须与通知 / 音效 / HUD 同门槛：未达本地烈度过滤的预警级事件
+    // 只展示、不闪托盘（曾只按 levelTag 判断，导致全球任意 M4.5+ 都闪红）。
+    void trayBlinkRespectsLocalIntensityFilter() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("TrayBlinkTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(3.0);
+        controller.setManualLocation(30.9, 104.3, "测试定位");
+        TrayController tray(&controller);
+        QVERIFY(!tray.blinkTimer_.isActive());
+
+        // 远源M5.0：震级判WARNING，但本地烈度远低于阈值。
+        EarthquakeEvent e;
+        e.id = e.eventId = "TRAY-1";
+        e.sourceProvider = "Pancakes"; e.sourceAgency = "USGS";
+        e.source = "GlobalQuake地震信息";
+        e.timestamp = controller.nowMs();
+        e.latitude = 35.0; e.longitude = 139.0; e.depth = 20;
+        e.magnitude = 5.0; e.location = "日本东京附近";
+        controller.handleEvent(e, false, false);
+        QCOMPARE(controller.activeWarning().toMap()["levelTag"].toString(), QStringLiteral("WARNING"));
+        QVERIFY(!controller.alertEligible());
+        QVERIFY2(!tray.blinkTimer_.isActive(), "未达烈度过滤阈值时托盘不应闪烁");
+
+        // 调低阈值至放行，同一事件应立即开始闪烁（设置变更经recompute → syncWarning 生效）。
+        controller.settings()->setLocalIntensityFilter(0.0);
+        QVERIFY(controller.alertEligible());
+        QVERIFY2(tray.blinkTimer_.isActive(), "通过烈度过滤后托盘应闪烁");
+
+        // 总开关关闭同样不该闪。
+        controller.settings()->setEnableWarnings(false);
+        QVERIFY(!tray.blinkTimer_.isActive());
     }
 
     void settingsNavigationAndTheme() {

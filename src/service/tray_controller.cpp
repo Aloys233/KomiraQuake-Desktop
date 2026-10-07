@@ -97,7 +97,10 @@ void TrayController::announceAlert(const QVariantMap& warning) {
 void TrayController::refresh() {
     const QVariantMap warning = app_->activeWarning().toMap();
     const QString tag = warning.value("levelTag").toString();
-    const bool alert = tag == QLatin1String("WARNING") || tag == QLatin1String("CRITICAL");
+    // 闪烁门槛与通知 / 音效 / HUD 一致：必须是通过烈度过滤的预警级事件。
+    // 只看 levelTag 会让全球任意M4.5+ 事件都把托盘闪红，与用户的过滤设置矛盾。
+    const bool alert = app_->alertEligible()
+        && (tag == QLatin1String("WARNING") || tag == QLatin1String("CRITICAL"));
 
     if (alert) {
         announceAlert(warning);
