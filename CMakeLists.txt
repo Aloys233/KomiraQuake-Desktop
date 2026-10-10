@@ -15,6 +15,8 @@ qt_add_executable(komiraquake
     src/main.cpp
 
     # model / core
+    src/model/event_list_model.h
+    src/model/event_list_model.cpp
     src/core/quake_calculator.cpp
     src/core/intensity_calculator.cpp
     src/core/coordinate_transform.cpp
@@ -185,7 +187,7 @@ if(BUILD_TESTING)
     list(FILTER GUI_TEST_SOURCES EXCLUDE REGEX "/main.cpp$")
     # GLOB 只收 .cpp；含 Q_OBJECT 的接口头需显式列出，AUTOMOC 才会处理其 moc。
     qt_add_executable(gui_test tests/gui_test.cpp ${GUI_TEST_SOURCES} src/source/earthquake_source.h
-        src/source/simulated_source.h)
+        src/source/simulated_source.h src/model/event_list_model.h)
     target_include_directories(gui_test PRIVATE src)
     target_compile_definitions(gui_test PRIVATE KOMIRA_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         KOMIRA_VERSION="${PROJECT_VERSION}")

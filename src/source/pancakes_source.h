@@ -30,6 +30,7 @@ public:
 
     void start() override;
     void stop() override;
+    void setDirectoryPollingEnabled(bool enabled) override;
     void setUserLocation(double lat, double lon) override;
     void clearUserLocation() override;
     void setStandard(IntensityStandard standard) override { standard_ = standard; }
@@ -62,6 +63,7 @@ private:
 
     QWebSocket* socket_ = nullptr;
     quint64 generation_ = 0;
+    quint64 directoryGeneration_ = 0;
     /// 每次连接尝试递增。过期尝试的迟到回调据此被丢弃，避免重复调度重连。
     quint64 attempt_ = 0;
     QNetworkAccessManager network_;
@@ -74,6 +76,7 @@ private:
     double userLon_ = 0.0;
     bool hasLocation_ = false;
     bool running_ = false;
+    bool directoryPollingEnabled_ = true;
     int retryCount_ = 0;
     /// 本轮目录轮询在途的请求数；归零时结算目录状态。
     int pendingDirectory_ = 0;

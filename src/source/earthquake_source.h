@@ -35,6 +35,9 @@ public:
 
     virtual void start() = 0;
     virtual void stop() = 0;
+    /// Pause/resume background directory polling without interrupting realtime transport.
+    /// Sources without a directory poll may keep the default no-op implementation.
+    virtual void setDirectoryPollingEnabled(bool enabled) { (void)enabled; }
     /// 显式刷新目录；未启用时应忽略。
     virtual void refreshDirectory() = 0;
     virtual void setUserLocation(double lat, double lon) = 0;

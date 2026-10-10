@@ -8,7 +8,6 @@ Item {
     property Theme theme: Theme {}
     property bool expanded: true
     property bool compact: false
-    property var events
     property bool hasLocation: false
     signal toggleRequested()
     readonly property int panelWidth: compact ? parent.width : 400
@@ -18,21 +17,12 @@ Item {
     clip: true
     property string searchQuery: ""
     property string activeFilter: "ALL"
-    readonly property var filteredEvents: {
-        if (!events) return [];
-        let list = events.slice();
-        if (activeFilter === "WITHIN_500") list = list.filter(e => e.hasDistance && e.distance <= 500);
-        else if (activeFilter === "M4_PLUS") list = list.filter(e => e.magnitude >= 4.0);
-        else if (activeFilter === "RECENT_24H") {
-            const now = Date.now();
-            list = list.filter(e => (now - e.timestamp) <= 24 * 3600 * 1000);
-        }
-        if (searchQuery.trim().length) {
-            const q = searchQuery.trim().toLowerCase();
-            list = list.filter(e => (e.location && e.location.toLowerCase().indexOf(q) >= 0) || (e.source && e.source.toLowerCase().indexOf(q) >= 0));
-        }
-        return list;
+    function updateFilter() {
+        app.eventModel.setFilter(root.activeFilter, root.searchQuery)
     }
+    onActiveFilterChanged: updateFilter()
+    onSearchQueryChanged: updateFilter()
+    Component.onCompleted: updateFilter()
     Rectangle {
         anchors.top: parent.top; anchors.bottom: parent.bottom; anchors.right: parent.right
         anchors.rightMargin: -root.panelWidth * root.collapse
@@ -83,21 +73,23 @@ Item {
             RowLayout {
                 width: parent.width
                 Text { Layout.fillWidth: true; text: "事件记录"; font.pixelSize: 11; color: root.theme.outline }
-                Text { text: root.filteredEvents.length + " 条"; font.pixelSize: 11; color: root.theme.outline }
+                Text { text: eventList.count + " 条"; font.pixelSize: 11; color: root.theme.outline }
             }
             ListView {
+                id: eventList
                 width: parent.width
                 height: Math.max(0, column.height - y)
                 spacing: 10
                 clip: true
-                model: root.filteredEvents
+                reuseItems: true
+                model: app.eventModel
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                delegate: EventTile { width: ListView.view.width; theme: root.theme; event: modelData }
+                delegate: EventTile { width: ListView.view.width; theme: root.theme; event: model.event }
                 Column {
                     anchors.centerIn: parent
                     width: parent.width - 32
                     spacing: 16
-                    visible: !root.filteredEvents.length
+                    visible: eventList.count === 0
                     AppIcon { anchors.horizontalCenter: parent.horizontalCenter; name: "radio"; size: 32; color: root.theme.outline }
                     Text {
                         width: parent.width

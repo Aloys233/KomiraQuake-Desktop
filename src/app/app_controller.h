@@ -14,6 +14,7 @@
 
 #include "core/event_gate.h"
 #include "model/data_source_info.h"
+#include "model/event_list_model.h"
 #include "model/earthquake_event.h"
 #include "prefs/settings_store.h"
 #include "service/autostart.h"
@@ -55,6 +56,8 @@ class AppController : public QObject {
     Q_PROPERTY(QVariantList history READ history NOTIFY historyChanged)
     /// 右侧列表数据：目录条目用权威数据，并与实时预警按「发震时刻 + 震中」合并为一条。
     Q_PROPERTY(QVariantList eventList READ eventList NOTIFY eventListChanged)
+    /// 稳定的侧栏模型；避免 QML 每次目录事件都替换 JS 数组并重建 delegate 上下文。
+    Q_PROPERTY(QAbstractItemModel* eventModel READ eventModel CONSTANT)
     Q_PROPERTY(bool hasWarning READ hasWarning NOTIFY warningChanged)
     /// 当前活动预警是否达到提醒门槛（总开关 + 本地烈度过滤）；未达标只展示、不出现预警卡/倒计时。
     Q_PROPERTY(bool alertEligible READ alertEligible NOTIFY warningChanged)
@@ -102,6 +105,7 @@ public:
     Q_INVOKABLE QString clockTextUtc8() const;
     QVariantList history() const;
     QVariantList eventList() const;
+    QAbstractItemModel* eventModel() const { return eventModel_; }
     bool hasWarning() const { return hasActiveWarning_; }
     bool alertEligible() const;
     bool warningOverlayVisible() const { return overlayVisible_; }
@@ -135,6 +139,8 @@ public:
 
     Q_INVOKABLE void requestLocation();
     Q_INVOKABLE void setManualLocation(double latitude, double longitude, const QString& label = QString());
+    /// 主窗口隐藏时暂停目录 HTTP 轮询；实时 WebSocket 连接保持运行。
+    Q_INVOKABLE void setWindowVisible(bool visible);
     Q_INVOKABLE void refreshCatalog();
     /// Jian 数据源登录：用登录密钥 `lk_…` 换取刷新令牌并持久化。
     Q_INVOKABLE void loginJian(const QString& loginKey);
@@ -206,6 +212,8 @@ private:
     /// 焦点事件"还年轻"（发震时刻在窗口内）时跑 100ms 波前定时器，否则停。
     void updateWaveTimer();
     void updateWaveRadii();
+    void refreshEventModel();
+    void scheduleDirectoryUiRefresh();
     /// 开启自动检查时，本次会话安排一次静默检查更新（只做一次）。
     void maybeAutoCheckUpdates();
     /// 同一地震的跨链路/跨报次标识（用于合并 WS 预警与 HTTP 目录）。
@@ -214,6 +222,7 @@ private:
     static bool samePhysicalEvent(const EarthquakeEvent& a, const EarthquakeEvent& b);
 
     bool startServices_ = true;
+    bool directoryRefreshEnabled_ = true;
     std::function<long long()> nowProvider_;
     long long nowMs() const;
     SettingsStore* settings_ = nullptr;
@@ -221,6 +230,8 @@ private:
     HistoryStore* historyStore_ = nullptr;
     /// 数据源注册表：所有源平级、互为备份。接线/启停/聚合都按本列表循环，不逐源硬编码。
     QList<EarthquakeSource*> sources_;
+    EventListModel* eventListModel_ = nullptr;
+    EventFilterModel* eventModel_ = nullptr;
     /// Jian 源需要登录凭据交换，保留具体类型访问登录/令牌注入入口。
     JianSource* jian_ = nullptr;
     /// Whews 源需注入 `wat_…` 令牌，保留具体类型访问令牌注入入口。
@@ -256,6 +267,7 @@ private:
     bool mapFocusManual_ = false;
     QTimer waveTimer_;
     QTimer hudRefreshTimer_;
+    QTimer directoryUiTimer_;
     double wavePKm_ = -1.0;
     double waveSKm_ = -1.0;
     double wavePOpacity_ = 0.0;

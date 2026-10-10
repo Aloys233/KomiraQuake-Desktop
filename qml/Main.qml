@@ -12,6 +12,7 @@ ApplicationWindow {
     Theme { id: appTheme }
     color: appTheme.surface
     onClosing: function(close) { close.accepted = false; window.hide(); }
+    onVisibleChanged: app.setWindowVisible(visible)
     readonly property bool desktop: width >= 1024
     onDesktopChanged: if (!desktop) showList = false
     property bool showSettings: false
@@ -67,7 +68,7 @@ ApplicationWindow {
         window.x = Math.round(Math.max(Screen.virtualX, Screen.virtualX + (screenW - window.width) / 2))
         window.y = Math.round(Math.max(Screen.virtualY, Screen.virtualY + (screenH - window.height) / 2))
     }
-    Component.onCompleted: { centerOnScreen(); applyDefaultView() }
+    Component.onCompleted: { centerOnScreen(); applyDefaultView(); app.setWindowVisible(window.visible) }
     Connections {
         target: app
         function onLocationChanged() { window.applyDefaultView(); }
@@ -152,7 +153,6 @@ ApplicationWindow {
         theme: appTheme
         compact: !window.desktop
         expanded: window.showList && !window.showSettings
-        events: app.eventList
         hasLocation: app.hasLocation
         onToggleRequested: window.showList = !window.showList
     }

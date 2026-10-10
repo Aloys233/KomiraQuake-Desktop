@@ -197,6 +197,10 @@ AppController::AppController(QObject* parent, bool startServices)
             << "| city coords:" << (CityCoordTable::instance().isLoaded() ? "loaded" : "MISSING");
 
     settings_ = new SettingsStore(this);
+    directoryRefreshEnabled_ = !startHidden();
+    eventListModel_ = new EventListModel(this);
+    eventModel_ = new EventFilterModel(this);
+    eventModel_->setSourceModel(eventListModel_);
     systemDark_ = QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
     darkMode_ = resolveDarkMode();
     // themeMode 是唯一的用户意图来源；系统配色只在「跟随系统」时参与判定。
@@ -250,6 +254,12 @@ AppController::AppController(QObject* parent, bool startServices)
     // 自动焦点跨过 10 分钟窗口时刷新一次 HUD 可见性（无需等下一次数据/告警）。
     hudRefreshTimer_.setSingleShot(true);
     connect(&hudRefreshTimer_, &QTimer::timeout, this, [this]() { emit hudEventChanged(); });
+
+    directoryUiTimer_.setSingleShot(true);
+    connect(&directoryUiTimer_, &QTimer::timeout, this, [this]() {
+        refreshEventModel();
+        emit hudEventChanged();
+    });
 }
 
 long long AppController::nowMs() const {
@@ -343,6 +353,7 @@ void AppController::wire() {
         settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis;
     for (EarthquakeSource* source : sources_) {
         source->setStandard(startStandard);
+        source->setDirectoryPollingEnabled(directoryRefreshEnabled_);
         if (startServices_ && settings_->isSourceEnabled(source->id()) && source->isConfigured())
             source->start();
     }
@@ -774,7 +785,15 @@ void AppController::setManualLocation(double latitude, double longitude, const Q
     location_->setManual(latitude, longitude, label);
 }
 
+void AppController::setWindowVisible(bool visible) {
+    if (directoryRefreshEnabled_ == visible) return;
+    directoryRefreshEnabled_ = visible;
+    for (EarthquakeSource* source : sources_) source->setDirectoryPollingEnabled(visible);
+    if (visible) refreshCatalog();
+}
+
 void AppController::refreshCatalog() {
+    if (!directoryRefreshEnabled_) return;
     for (EarthquakeSource* source : sources_)
         if (settings_->isSourceEnabled(source->id())) source->refreshDirectory();
 }
@@ -886,8 +905,7 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
             historyStore_->upsertAll({event});
             historyStore_->prune(400);
         }
-        rebuildHistory();
-        emit hudEventChanged();
+        scheduleDirectoryUiRefresh();
         admit(event, AdmissionStatus::Applied);
         return;
     }
@@ -970,6 +988,7 @@ void AppController::syncWarning() {
     emit countdownChanged();
     emit warningOverlayChanged();
     emit hudEventChanged();
+    refreshEventModel();
     emit eventListChanged();
 }
 
@@ -1032,11 +1051,20 @@ void AppController::rebuildHistory() {
                   return a.timestamp > b.timestamp;
               });
     while (history_.size() > 200) history_.removeLast();
+    refreshEventModel();
     // 无焦点时地图画的就是 history_[0]，列表一变就要重画。
     updateWaveTimer();
     emit mapEventChanged();
     emit historyChanged();
     emit eventListChanged();
+}
+
+void AppController::refreshEventModel() {
+    if (eventListModel_) eventListModel_->setEvents(eventList());
+}
+
+void AppController::scheduleDirectoryUiRefresh() {
+    if (!directoryUiTimer_.isActive()) directoryUiTimer_.start(0);
 }
 
 } // namespace komira

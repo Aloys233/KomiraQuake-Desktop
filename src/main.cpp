@@ -55,7 +55,7 @@ public:
         auto* cache = new QNetworkDiskCache(nam);
         cache->setCacheDirectory(
             QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/tiles"));
-        cache->setMaximumCacheSize(64LL * 1024 * 1024);
+        cache->setMaximumCacheSize(1024LL * 1024 * 1024);
         nam->setCache(cache);
         return nam;
     }

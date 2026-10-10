@@ -106,13 +106,16 @@ void WolfxSource::start() {
     const quint64 generation = ++generation_;
     connectSocket();
     if (!running_ || generation != generation_) return;
-    pollTimer_.start(WolfxProtocol::kPollIntervalMs);
-    pollDirectory();
+    if (directoryPollingEnabled_) {
+        pollTimer_.start(WolfxProtocol::kPollIntervalMs);
+        pollDirectory();
+    }
 }
 
 void WolfxSource::stop() {
     running_ = false;
     ++generation_;
+    ++directoryGeneration_;
     ++attempt_;
     queryTimer_.stop();
     pollTimer_.stop();
@@ -129,8 +132,24 @@ void WolfxSource::stop() {
 }
 
 void WolfxSource::refreshDirectory() {
-    if (!running_) return;
+    if (!running_ || !directoryPollingEnabled_) return;
     pollDirectory();
+}
+
+void WolfxSource::setDirectoryPollingEnabled(bool enabled) {
+    if (directoryPollingEnabled_ == enabled) return;
+    directoryPollingEnabled_ = enabled;
+    if (!enabled) {
+        ++directoryGeneration_;
+        pollTimer_.stop();
+        if (info_.directoryStatus == ConnectionStatus::Connecting) {
+            info_.directoryStatus = ConnectionStatus::Disconnected;
+            info_.directoryError.clear();
+            emit infoChanged();
+        }
+        return;
+    }
+    if (running_) pollTimer_.start(WolfxProtocol::kPollIntervalMs);
 }
 
 void WolfxSource::connectSocket() {
@@ -267,12 +286,13 @@ void WolfxSource::handleJsonObject(const QJsonObject& obj) {
 
 void WolfxSource::pollDirectory() {
     // 地震列表完全由本 HTTP 轮询填充；WS 只负责实时预警。无定位也照常拉取（仅距离/烈度为未知）。
-    if (!running_ || info_.directoryStatus == ConnectionStatus::Connecting) return;
-    const quint64 generation = generation_;
+    if (!running_ || !directoryPollingEnabled_
+        || info_.directoryStatus == ConnectionStatus::Connecting) return;
+    const quint64 generation = ++directoryGeneration_;
     info_.directoryStatus = ConnectionStatus::Connecting;
     info_.directoryError.clear();
     emit infoChanged();
-    if (!running_ || generation != generation_) return;
+    if (!running_ || generation != directoryGeneration_) return;
     directoryIndex_ = 0;
     directoryFailed_ = false;
     directoryError_.clear();
@@ -281,12 +301,12 @@ void WolfxSource::pollDirectory() {
 }
 
 void WolfxSource::fetchDirectoryEndpoint(int index) {
-    if (!running_) return;
-    const quint64 generation = generation_;
+    if (!running_ || !directoryPollingEnabled_) return;
+    const quint64 generation = directoryGeneration_;
     const auto& endpoints = directoryEndpoints();
     if (index >= static_cast<int>(endpoints.size())) {
         // 周期结束：全部成功才算目录健康，否则记录首个失败端点。
-        if (!running_ || generation != generation_) return;
+        if (!running_ || !directoryPollingEnabled_ || generation != directoryGeneration_) return;
         if (directoryFailed_) {
             info_.directoryStatus = ConnectionStatus::Error;
             info_.directoryError = directoryError_;
@@ -308,7 +328,7 @@ void WolfxSource::fetchDirectoryEndpoint(int index) {
     connect(reply, &QNetworkReply::finished, this,
             [this, reply, endpoint, index, generation]() {
         reply->deleteLater();
-        if (!running_ || generation != generation_) return;
+        if (!running_ || !directoryPollingEnabled_ || generation != directoryGeneration_) return;
 
         const auto fail = [this](const QString& reason) {
             directoryFailed_ = true;
@@ -331,7 +351,7 @@ void WolfxSource::fetchDirectoryEndpoint(int index) {
         }
         const QJsonObject root = doc.object();
         for (auto it = root.begin(); it != root.end(); ++it) {
-            if (!running_ || generation != generation_) return;
+            if (!running_ || !directoryPollingEnabled_ || generation != directoryGeneration_) return;
             if (!it.key().startsWith(QLatin1String("No"))) continue;
             auto event = endpoint.parse(it.value().toObject(), userLocation(), standard_, nowMs());
             if (event) {

@@ -60,13 +60,16 @@ void PancakesSource::start() {
     const quint64 generation = ++generation_;
     connectSocket();
     if (!running_ || generation != generation_) return;
-    pollTimer_.start(PancakesProtocol::kPollIntervalMs);
-    pollDirectory();
+    if (directoryPollingEnabled_) {
+        pollTimer_.start(PancakesProtocol::kPollIntervalMs);
+        pollDirectory();
+    }
 }
 
 void PancakesSource::stop() {
     running_ = false;
     ++generation_;
+    ++directoryGeneration_;
     ++attempt_;
     pollTimer_.stop();
     reconnectTimer_.stop();
@@ -84,8 +87,24 @@ void PancakesSource::stop() {
 }
 
 void PancakesSource::refreshDirectory() {
-    if (!running_) return;
+    if (!running_ || !directoryPollingEnabled_) return;
     pollDirectory();
+}
+
+void PancakesSource::setDirectoryPollingEnabled(bool enabled) {
+    if (directoryPollingEnabled_ == enabled) return;
+    directoryPollingEnabled_ = enabled;
+    if (!enabled) {
+        ++directoryGeneration_;
+        pollTimer_.stop();
+        if (info_.directoryStatus == ConnectionStatus::Connecting) {
+            info_.directoryStatus = ConnectionStatus::Disconnected;
+            info_.directoryError.clear();
+            emit infoChanged();
+        }
+        return;
+    }
+    if (running_) pollTimer_.start(PancakesProtocol::kPollIntervalMs);
 }
 
 void PancakesSource::connectSocket() {
@@ -178,14 +197,15 @@ void PancakesSource::handleJsonObject(const QJsonObject& obj) {
 }
 
 void PancakesSource::pollDirectory() {
-    if (!running_ || info_.directoryStatus == ConnectionStatus::Connecting) return;
-    const quint64 generation = generation_;
+    if (!running_ || !directoryPollingEnabled_
+        || info_.directoryStatus == ConnectionStatus::Connecting) return;
+    const quint64 generation = ++directoryGeneration_;
     info_.directoryStatus = ConnectionStatus::Connecting;
     info_.directoryError.clear();
     directoryError_.clear();
     pendingDirectory_ = 0;
     emit infoChanged();
-    if (!running_ || generation != generation_) return;
+    if (!running_ || !directoryPollingEnabled_ || generation != directoryGeneration_) return;
     for (const QString& source : PancakesProtocol::quakeSources()) {
         fetchList(source, generation);
     }
@@ -201,7 +221,7 @@ void PancakesSource::fetchList(const QString& source, quint64 generation) {
     const qint64 started = monoMs();
     connect(reply, &QNetworkReply::finished, this, [this, reply, started, generation]() {
         reply->deleteLater();
-        if (!running_ || generation != generation_) return;
+        if (!running_ || !directoryPollingEnabled_ || generation != directoryGeneration_) return;
         if (reply->error() != QNetworkReply::NoError) {
             if (directoryError_.isEmpty()) {
                 directoryError_ = QStringLiteral("目录请求失败：%1").arg(reply->errorString());
@@ -218,7 +238,7 @@ void PancakesSource::fetchList(const QString& source, quint64 generation) {
         }
         const long long now = nowMs();
         for (const auto& v : doc.array()) {
-            if (!running_ || generation != generation_) return;
+            if (!running_ || !directoryPollingEnabled_ || generation != directoryGeneration_) return;
             auto event = PancakesParser::parseListItem(v.toObject(), userLocation(), standard_, now);
             if (event) emit eventReceived(*event, SourceEventKind::Directory);
         }
