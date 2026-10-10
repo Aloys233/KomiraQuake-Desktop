@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(KomiraQuake VERSION 1.1.1 LANGUAGES CXX)
+project(KomiraQuake VERSION 1.1.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -172,6 +172,7 @@ if(BUILD_TESTING)
         src/core/intensity_calculator.cpp src/core/quake_calculator.cpp
         src/core/ip_geo_lookup.cpp src/service/location_service.cpp
         src/core/travel_table.cpp src/core/travel_time_service.cpp
+        src/service/autostart.cpp
         src/source/eew_parser.cpp src/source/wolfx_source.cpp
         src/source/earthquake_source.h
         src/source/pancakes_parser.cpp src/source/pancakes_source.cpp

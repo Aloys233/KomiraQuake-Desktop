@@ -1,6 +1,8 @@
 #include <QtTest>
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkAccessManager>
@@ -9,6 +11,7 @@
 #include <QSignalSpy>
 #include <QSqlDatabase>
 #include <QSqlQuery>
+#include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QWebSocket>
@@ -22,6 +25,7 @@
 #include "core/warning_session.h"
 #include "model/data_source_info.h"
 #include "prefs/settings_store.h"
+#include "service/autostart.h"
 #include "source/eew_parser.h"
 #include "source/jian_parser.h"
 #include "source/pancakes_parser.h"
@@ -78,6 +82,7 @@ private:
 private slots:
     void initTestCase() {
         QVERIFY(settingsDir_.isValid());
+        qputenv("XDG_CONFIG_HOME", (settingsDir_.path() + "/xdg-config").toUtf8());
         QCoreApplication::setOrganizationName("KomiraQuakeBusinessTests");
         QCoreApplication::setApplicationName("IsolatedSettings");
         QSettings::setDefaultFormat(QSettings::IniFormat);
@@ -89,6 +94,34 @@ private slots:
         QVERIFY2(!asset.isEmpty(), "The real travel asset must be available; do not silently use fallback speeds");
         QVERIFY(TravelTimeService::instance().loadFromFile(asset));
         QVERIFY(TravelTimeService::instance().isLoaded());
+    }
+
+    void linuxAutostartMigratesStorePath() {
+#if defined(Q_OS_LINUX) || defined(Q_OS_FREEBSD)
+        qunsetenv("APPIMAGE");
+        const QString configHome = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
+        QVERIFY2(configHome.startsWith(settingsDir_.path()), qPrintable(configHome));
+        const QString path = configHome + "/autostart/komiraquake.desktop";
+        QVERIFY(QDir().mkpath(QFileInfo(path).absolutePath()));
+
+        QFile legacy(path);
+        QVERIFY(legacy.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate));
+        legacy.write("[Desktop Entry]\n"
+                     "Type=Application\n"
+                     "Name=KomiraQuake\n"
+                     "Exec=\"/nix/store/old-komiraquake/bin/.komiraquake-wrapped\"\n"
+                     "Icon=komiraquake\n");
+        legacy.close();
+
+        AutoStartService service;
+        QVERIFY(service.isEnabled());
+
+        QFile migrated(path);
+        QVERIFY(migrated.open(QIODevice::ReadOnly | QIODevice::Text));
+        const QString content = QString::fromUtf8(migrated.readAll());
+        QVERIFY(content.contains(QStringLiteral("Exec=komiraquake\n")));
+        QVERIFY(!content.contains(QStringLiteral("/nix/store/old-komiraquake")));
+#endif
     }
 
     void realTravelAsset() {

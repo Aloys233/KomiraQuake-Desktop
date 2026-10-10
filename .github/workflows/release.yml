@@ -87,7 +87,7 @@ jobs:
           QT_SQLDRIVERS="$("$QMAKE" -query QT_INSTALL_PLUGINS)/sqldrivers"
           find "$QT_SQLDRIVERS" -maxdepth 1 -type f -name 'libqsql*.so' ! -name 'libqsqlite.so' -delete
           tools/linuxdeploy --appdir AppDir --plugin qt --output appimage
-          mv ./*.AppImage "dist/komiraquake_${VERSION}_amd64.AppImage"
+          mv ./*.AppImage "dist/KomiraQuake-${VERSION}-linux-x64.AppImage"
           ls -lh dist/
 
       # deb 由 AppDir 打包：Qt 依赖已随 linuxdeploy 收进 /opt/komiraquake，
@@ -123,12 +123,12 @@ jobs:
            and real-time seismic monitoring, built with Qt 6 and QML.
           EOF
           mkdir -p dist
-          dpkg-deb --build --root-owner-group "$root" "dist/komiraquake_${VERSION}_amd64.deb"
+          dpkg-deb --build --root-owner-group "$root" "dist/KomiraQuake-${VERSION}-linux-x64.deb"
 
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
         with:
-          name: linux-packages
+          name: linux-x64-packages
           path: |
             dist/*.deb
             dist/*.AppImage
@@ -170,12 +170,17 @@ jobs:
       - name: Collect installer
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Move-Item build\*.exe dist\
+          # 只收集 CPack 生成的安装包，避免把 build\komiraquake.exe 一并上传。
+          $installers = @(Get-ChildItem build\komiraquake-*.exe)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)"
+          }
+          Move-Item $installers[0].FullName "dist\KomiraQuake-${{ needs.version.outputs.version }}-windows-x64-setup.exe"
 
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
-          name: windows-packages
+          name: windows-x64-installer
           path: dist/*.exe
           if-no-files-found: error
 
