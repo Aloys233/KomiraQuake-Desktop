@@ -47,12 +47,15 @@ Column {
                     onToggled: app.settings.setSourceEnabled(card.modelData.id, checked)
                 }
 
-                // 连接状态点 + 文案 + 延迟。状态点用 severity 配色，一眼可辨。
+                // 连接状态点 + 文案 + 延迟。状态点用连接状态配色，一眼可辨。
                 RowLayout {
                     width: parent.width; spacing: 8
                     Rectangle {
                         Layout.preferredWidth: 8; Layout.preferredHeight: 8; radius: 4
-                        color: root.theme.severity(card.modelData.statusTag)
+                        // statusTag 是连接态标签（CONNECTED/CONNECTING/…），须走 connectionColor；
+                        // 若误用 severity()（它只认 NORMAL/WATCH/WARNING/CRITICAL），
+                        // 所有状态都会落到默认中性色，圆点永远看不出在线/断开。
+                        color: root.theme.connectionColor(card.modelData.statusTag)
                         Layout.alignment: Qt.AlignVCenter
                     }
                     Text {

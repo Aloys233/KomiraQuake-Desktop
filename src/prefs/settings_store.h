@@ -12,6 +12,10 @@ class SettingsStore : public QObject {
     Q_PROPERTY(QString basemapId READ basemapId WRITE setBasemapId NOTIFY changed)
     Q_PROPERTY(QString customBasemapUrl READ customBasemapUrl WRITE setCustomBasemapUrl NOTIFY changed)
     Q_PROPERTY(int customBasemapDatum READ customBasemapDatum WRITE setCustomBasemapDatum NOTIFY changed)
+    /// 在栅格底图之上叠加矢量层（省界 / 区县着色）。
+    Q_PROPERTY(bool vectorOverlay READ vectorOverlay WRITE setVectorOverlay NOTIFY changed)
+    /// 区县 EEW 烈度着色。
+    Q_PROPERTY(bool districtShading READ districtShading WRITE setDistrictShading NOTIFY changed)
     Q_PROPERTY(int intensityStandard READ intensityStandard WRITE setIntensityStandard NOTIFY changed)
     Q_PROPERTY(double localIntensityFilter READ localIntensityFilter WRITE setLocalIntensityFilter NOTIFY changed)
     Q_PROPERTY(bool enableWarnings READ enableWarnings WRITE setEnableWarnings NOTIFY changed)
@@ -56,6 +60,14 @@ public:
 
     int customBasemapDatum() const { return s_.value("customBasemapDatum", 1).toInt(); } // 0 wgs84, 1 gcj02
     void setCustomBasemapDatum(int v) { set("customBasemapDatum", v); }
+
+    /// 在栅格底图之上叠加矢量层（省界 / 区县着色）。默认关闭：叠加是 opt-in。
+    bool vectorOverlay() const { return s_.value("vectorOverlay", false).toBool(); }
+    void setVectorOverlay(bool v) { set("vectorOverlay", v); }
+
+    /// 区县 EEW 烈度着色（矢量底图 / 叠加模式下按烈度给 1011 个区县面填色）。
+    bool districtShading() const { return s_.value("districtShading", true).toBool(); }
+    void setDistrictShading(bool v) { set("districtShading", v); }
 
     int intensityStandard() const { return s_.value("intensityStandard", 0).toInt(); } // 0 csis, 1 jma
     void setIntensityStandard(int v) { set("intensityStandard", v); }

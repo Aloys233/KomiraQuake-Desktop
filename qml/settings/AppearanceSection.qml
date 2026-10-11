@@ -96,11 +96,36 @@ Column {
             GlassComboBox {
                 objectName: "basemapCombo"
                 width: parent.width; theme: root.theme; Accessible.name: "底图"
-                model: ["高德标准 · GCJ-02", "Petal · GCJ-02", "OpenStreetMap · WGS-84", "自定义底图"]
-                readonly property var ids: ["amap_vector", "petal", "osm", "custom"]
+                model: ["高德标准 · GCJ-02", "Petal · GCJ-02", "OpenStreetMap · WGS-84", "矢量 · WGS-84", "自定义底图"]
+                readonly property var ids: ["amap_vector", "petal", "osm", "vector", "custom"]
                 // 未知 id（旧版残留，如已下线的卫星图）回落到第一项而不是空白。
                 currentIndex: Math.max(0, ids.indexOf(app.settings.basemapId))
                 onActivated: index => app.settings.basemapId = ids[index]
+            }
+            // 栅格底图上叠加矢量层：选纯矢量底图时本就画矢量，无需再叠一层。
+            Row {
+                width: parent.width; spacing: 10; visible: app.settings.basemapId !== "vector"
+                Text {
+                    width: parent.width - 52; color: root.theme.textPrimary; font.pixelSize: 14
+                    text: "叠加矢量层（省界 / 区县）"
+                }
+                GlassSwitch {
+                    theme: root.theme; checked: app.settings.vectorOverlay
+                    Accessible.name: "叠加矢量层"
+                    onToggled: app.settings.vectorOverlay = checked
+                }
+            }
+            Row {
+                width: parent.width; spacing: 10
+                Text {
+                    width: parent.width - 52; color: root.theme.textPrimary; font.pixelSize: 14
+                    text: "区县烈度着色"
+                }
+                GlassSwitch {
+                    theme: root.theme; checked: app.settings.districtShading
+                    Accessible.name: "区县烈度着色"
+                    onToggled: app.settings.districtShading = checked
+                }
             }
         }
         Column {

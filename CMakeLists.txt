@@ -11,7 +11,7 @@ find_package(Qt6 6.5 REQUIRED COMPONENTS
 
 qt_standard_project_setup(REQUIRES 6.5)
 
-qt_add_executable(komiraquake
+qt_add_executable(komiraquake WIN32
     src/main.cpp
 
     # model / core
@@ -24,7 +24,9 @@ qt_add_executable(komiraquake
     src/core/travel_table.cpp
     src/core/travel_time_service.cpp
     src/core/event_gate.cpp
+    src/core/geo_geometry.cpp
     src/core/time_sync.cpp
+    src/core/vector_map_data.cpp
 
     # source
     src/source/earthquake_source.h
@@ -57,9 +59,15 @@ qt_add_executable(komiraquake
 
     # app
     src/app/app_controller.cpp
+
+    # map
+    src/map/vector_map_item.cpp
 )
 
 target_include_directories(komiraquake PRIVATE src)
+# 生成的 qmltyperegistrations.cpp 以 `#include <vector_map_item.h>` 引入 SOURCES 里的头
+# （无路径），故 src/map 必须也在头文件搜索路径中，否则注册代码找不到类型。
+target_include_directories(komiraquake PRIVATE src/map)
 
 # 供 C++ 与 QML 展示的版本号，唯一来源是 project() 的 VERSION。
 target_compile_definitions(komiraquake PRIVATE KOMIRA_VERSION="${PROJECT_VERSION}")
@@ -118,6 +126,11 @@ qt_add_qml_module(komiraquake
     URI KomiraQuake
     VERSION 1.0
     QML_FILES ${KOMIRA_QML_FILES}
+    # 矢量地图渲染项：用 QML_ELEMENT 注册（由 qt_add_qml_module 生成注册代码，
+    # 无需也不应再手写 qmlRegisterType，否则与模块系统冲突）。
+    SOURCES
+        src/map/vector_map_item.h
+        src/map/vector_map_item.cpp
 )
 
 file(GLOB KOMIRA_ICON_FILES CONFIGURE_DEPENDS qml/icons/*.svg qml/icons/LICENSE.txt)
@@ -163,12 +176,14 @@ if(BUILD_TESTING)
     find_package(Qt6 REQUIRED COMPONENTS Test)
     qt_add_executable(core_engine_test tests/core_engine_test.cpp
         src/core/coordinate_transform.cpp src/core/event_gate.cpp
+        src/core/geo_geometry.cpp src/core/vector_map_data.cpp
         src/core/intensity_calculator.cpp src/core/quake_calculator.cpp
         src/core/time_sync.cpp src/core/travel_table.cpp)
     target_include_directories(core_engine_test PRIVATE src)
     add_test(NAME core_engine COMMAND core_engine_test)
     qt_add_executable(qt_business_test tests/qt_business_test.cpp
         src/core/coordinate_transform.cpp src/core/event_gate.cpp
+        src/core/geo_geometry.cpp src/core/vector_map_data.cpp
         src/core/intensity_calculator.cpp src/core/quake_calculator.cpp
         src/core/ip_geo_lookup.cpp src/service/location_service.cpp
         src/core/travel_table.cpp src/core/travel_time_service.cpp
@@ -190,6 +205,9 @@ if(BUILD_TESTING)
     qt_add_executable(gui_test tests/gui_test.cpp ${GUI_TEST_SOURCES} src/source/earthquake_source.h
         src/source/simulated_source.h src/model/event_list_model.h)
     target_include_directories(gui_test PRIVATE src)
+    # gui_test 用 qt_add_resources 打包 QML 而非 qt_add_qml_module，故拿不到 QML_ELEMENT
+    # 自动生成的注册代码；这里显式注册 VectorMapItem，否则 MapView.qml 加载失败。
+    target_include_directories(gui_test PRIVATE src/map)
     target_compile_definitions(gui_test PRIVATE KOMIRA_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         KOMIRA_VERSION="${PROJECT_VERSION}")
     target_link_libraries(gui_test PRIVATE Qt6::Test Qt6::Core Qt6::Gui Qt6::Widgets

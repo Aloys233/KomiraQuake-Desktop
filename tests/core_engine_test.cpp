@@ -5,16 +5,20 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
 #include "core/coordinate_transform.h"
 #include "core/event_gate.h"
+#include "core/geo_geometry.h"
 #include "core/intensity_calculator.h"
 #include "core/quake_calculator.h"
 #include "core/sound_queue.h"
 #include "core/time_sync.h"
 #include "core/travel_table.h"
+#include "core/vector_map_data.h"
 #include "model/earthquake_event.h"
 
 using namespace komira;
@@ -30,7 +34,8 @@ void check(bool ok, const std::string& name) {
 bool near(double a, double b, double eps = 1e-6) { return std::fabs(a - b) < eps; }
 } // namespace
 
-int main() {
+/// argv[1] 可选，为 .kvb 矢量数据路径；缺省则跳过该段。
+int main(int argc, char** argv) {
     // ---- QuakeCalculator -------------------------------------------------
     check(near(QuakeCalculator::hypocenterDistance(3.0, 4.0), 5.0), "hypocenter 3-4-5");
     const double beijingShanghai =
@@ -250,6 +255,160 @@ int main() {
         check(backlog.take() == "issue", "first statement plays first");
         check(backlog.take() == "warn", "second statement is not cut off");
         check(backlog.take() == "hypocenter", "third statement is not cut off");
+    }
+
+    // ---- GeoGeometry -----------------------------------------------------
+    {
+        // 1° 见方的闭合环（首尾点相同）。
+        GeoRing square = {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}};
+        GeoPolygon face = {square};
+
+        check(GeoGeometry::pointInPolygon(face, 0.5, 0.5), "PIP: centre is inside");
+        check(!GeoGeometry::pointInPolygon(face, 1.5, 0.5), "PIP: north of face is outside");
+        check(!GeoGeometry::pointInPolygon(face, 0.5, -0.5), "PIP: west of face is outside");
+        // 顶点与边上的点：射线法在恰好落在边上的情形是任意的（测度为零），
+        // 故只断言明显在面外的点，不锁定边界语义。
+        check(!GeoGeometry::pointInPolygon(face, -0.1, 0.5), "PIP: below bottom edge is outside");
+        check(!GeoGeometry::pointInPolygon(face, 0.5, 1.1), "PIP: right of face is outside");
+
+        // 洞：外环 0..3，其内挖一个 1..2 的洞。洞内必须判为「不在」——
+        // 若用「任一环命中即命中」会误判为在内，区县着色就会把洞画成实心。
+        GeoRing outer = {{0.0, 0.0}, {0.0, 3.0}, {3.0, 3.0}, {3.0, 0.0}, {0.0, 0.0}};
+        GeoRing hole = {{1.0, 1.0}, {1.0, 2.0}, {2.0, 2.0}, {2.0, 1.0}, {1.0, 1.0}};
+        GeoPolygon withHole = {outer, hole};
+        check(GeoGeometry::pointInPolygon(withHole, 0.5, 0.5), "PIP: solid part is inside");
+        check(!GeoGeometry::pointInPolygon(withHole, 1.5, 1.5), "PIP: inside hole is NOT inside");
+        // 洞不属于该区县，故距离取到洞边界（0.5°）而非 0。
+        check(near(GeoGeometry::distanceToPolygonKm(withHole, 1.5, 1.5), 0.5 * 111.32, 0.5),
+              "distance: point in hole measures to hole boundary");
+
+        // 距离：正北 0.5° ≈ 55.66 km（区内则为 0）。
+        check(near(GeoGeometry::distanceToPolygonKm(face, 0.5, 0.5), 0.0), "distance: inside is 0");
+        const double north = GeoGeometry::distanceToPolygonKm(face, 0.5, 1.5);
+        check(near(north, 0.5 * 111.32, 0.5), "distance: 0.5deg north ~55.7km");
+        // 角点外侧：到最近角点的距离。
+        const double corner = GeoGeometry::distanceToPolygonKm(face, -0.5, -0.5);
+        check(near(corner, std::sqrt(2.0) * 0.5 * 111.32, 0.5), "distance: diagonal to corner");
+        // 经度方向按 cos(lat) 收缩：同一 0.5° 经差，高纬比赤道短。
+        // 面须跨过查询点所在纬度，否则最近点是角点而非正东的边。
+        const double eastEquator = GeoGeometry::distanceToPolygonKm(face, 0.0, 1.5);
+        check(near(eastEquator, 0.5 * 111.32, 0.5), "distance: east at equator has no shrink");
+        GeoRing midLat = {{40.0, 0.0}, {40.0, 1.0}, {41.0, 1.0}, {41.0, 0.0}, {40.0, 0.0}};
+        GeoPolygon midFace = {midLat};
+        const double east40 = GeoGeometry::distanceToPolygonKm(midFace, 40.5, 1.5);
+        check(near(east40, 0.5 * 111.32 * std::cos(40.5 * M_PI / 180.0), 0.5),
+              "distance: east at 40N shrinks by cos(lat)");
+
+        // 点到线段：投影落在线段内部 vs 落在延长线上（后者应夹到端点）。
+        check(near(GeoGeometry::distanceToSegmentKm(0.0, 0.0, 1.0, 0.0, 0.5, 0.5),
+                   0.5 * 111.32, 0.5), "segment: perpendicular foot inside");
+        // 点 (5,0) 在段 (0,0)-(1,0) 的延长线上：应夹到端点 (1,0)，距离 4° ≈ 445 km。
+        check(near(GeoGeometry::distanceToSegmentKm(0.0, 0.0, 1.0, 0.0, 5.0, 0.0),
+                   4.0 * 111.32, 0.5),
+              "segment: collinear extension clamps to endpoint");
+
+        // 包围盒与保守距离上界。
+        const GeoBounds bounds = boundsOf(face);
+        check(bounds.minLat == 0.0 && bounds.maxLat == 1.0 && bounds.minLon == 0.0 &&
+                  bounds.maxLon == 1.0,
+              "bounds: square extent");
+        check(bounds.contains(0.5, 0.5) && !bounds.contains(1.5, 0.5), "bounds: contains test");
+        // 上界必须 >= 真实距离，否则剪枝会漏掉受影响区县；它是包围盒对角线，刻意保守。
+        check(bounds.maxDistanceKm(0.5, 1.5) >= north, "bounds: upper bound covers real distance");
+        check(bounds.maxDistanceKm(0.5, 1.5) < north * 4.0, "bounds: upper bound stays bounded");
+        // 远离本面的查询点，上界应显著大于 0（否则剪枝会误杀）。
+        check(boundsOf(face).maxDistanceKm(30.0, 120.0) > 1000.0, "bounds: far query is large");
+    }
+
+    // ---- VectorMapData ----------------------------------------------------
+    // 矢量数据文件路径由命令行传入（argv[1]）：core 层刻意不依赖 Qt，
+    // 故不能在测试里用 QCoreApplication 推导 assets/ 位置。
+    if (argc > 1) {
+        VectorMapData map;
+        check(map.loadFromFile(argv[1]), "kvb: loads real asset file");
+        check(map.loaded(), "kvb: reports loaded");
+        check(map.featureCount() == 1285, "kvb: 1285 features (239+35+1011)");
+        check(map.layers().size() == 3, "kvb: 3 layers");
+
+        // 区县层是 EEW 烈度着色的数据源，结构须符合预期。
+        const VectorLayer* district = map.layer("district");
+        check(district != nullptr, "kvb: district layer present");
+        if (district) {
+            check(district->features.size() == 1011, "kvb: 1011 districts");
+            check(!district->features.empty() && district->features[0].name == "东城区",
+                  "kvb: first district name round-trips");
+            // 洞必须保留：175 个区县是多环，填洞会让底图出现错误色块。
+            int multiRing = 0;
+            for (const VectorFeature& f : district->features) {
+                if (f.polygon.size() > 1) ++multiRing;
+            }
+            check(multiRing == 176, "kvb: multi-ring districts preserved (holes kept)");
+            // 全部环显式闭合，且点数 >= 4。
+            bool allClosed = true;
+            for (const VectorFeature& f : district->features) {
+                for (const GeoRing& r : f.polygon) {
+                    if (r.size() < 4 || r.front() != r.back()) allClosed = false;
+                }
+            }
+            check(allClosed, "kvb: every ring explicitly closed");
+            // 坐标落在中国的经纬范围内，且经度为正（量化原点减法未出错）。
+            bool inRange = true;
+            for (const VectorFeature& f : district->features) {
+                for (const GeoRing& r : f.polygon) {
+                    for (const auto& pt : r) {
+                        if (pt.first < 3.0 || pt.first > 54.0 || pt.second < 73.0 ||
+                            pt.second > 136.0)
+                            inRange = false;
+                    }
+                }
+            }
+            check(inRange, "kvb: district coords dequantize into China's bbox");
+        }
+
+        // 世界层：不再输出日界 +360° 副本（改由两端渲染按视口环绕），
+        // 并补齐了上游 global 剔除、需单独渲染的中/日陆地。
+        const VectorLayer* world = map.layer("world");
+        check(world != nullptr, "kvb: world layer present");
+        if (world) {
+            bool anyBeyond = false;
+            for (const VectorFeature& f : world->features)
+                for (const GeoRing& r : f.polygon)
+                    for (const auto& pt : r)
+                        if (pt.second > 180.0001 || pt.second < -180.0001) anyBeyond = true;
+            check(!anyBeyond, "kvb: world layer has no antimeridian duplicates (>180)");
+
+            const VectorFeature* cn = map.findFeature("world", "中国");
+            const VectorFeature* jp = map.findFeature("world", "日本");
+            check(cn != nullptr, "kvb: world layer includes China land");
+            check(jp != nullptr, "kvb: world layer includes Japan land");
+            if (cn) check(GeoGeometry::pointInPolygon(cn->polygon, 25.0, 121.5),  // 台北
+                          "kvb: China land covers Taiwan");
+            if (jp) check(GeoGeometry::pointInPolygon(jp->polygon, 35.7, 139.7),  // 东京
+                          "kvb: Japan land covers Tokyo");
+        }
+
+        check(map.findFeature("district", "东城区") != nullptr, "kvb: findFeature by name");
+        check(map.findFeature("district", "不存在的区") == nullptr,
+              "kvb: findFeature misses cleanly");
+        check(map.layer("nope") == nullptr, "kvb: unknown layer returns nullptr");
+
+        // 损坏输入必须干净地失败，而不是越界读。assets/ 是用户可写目录。
+        VectorMapData bad;
+        check(!bad.loadFromFile("/nonexistent/map_bounds.kvb"), "kvb: missing file rejected");
+        check(!bad.loaded(), "kvb: failed load leaves unloaded state");
+        const uint8_t junk[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+        check(!bad.loadFromMemory(junk, sizeof(junk)), "kvb: bad magic rejected");
+        check(!bad.loadFromMemory(nullptr, 0), "kvb: null buffer rejected");
+        // 真文件截断到一半：各字段长度不再自洽，必须失败。
+        std::ifstream real(argv[1], std::ios::binary);
+        std::vector<uint8_t> all((std::istreambuf_iterator<char>(real)),
+                                 std::istreambuf_iterator<char>());
+        if (all.size() > 4096) {
+            VectorMapData trunc;
+            check(!trunc.loadFromMemory(all.data(), all.size() / 2), "kvb: truncated file rejected");
+            VectorMapData headerOnly;
+            check(!headerOnly.loadFromMemory(all.data(), 12), "kvb: header-only file rejected");
+        }
     }
 
     std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES",

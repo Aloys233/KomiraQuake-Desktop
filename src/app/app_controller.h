@@ -13,6 +13,7 @@
 #include <QVariantMap>
 
 #include "core/event_gate.h"
+#include "core/vector_map_data.h"
 #include "model/data_source_info.h"
 #include "model/event_list_model.h"
 #include "model/earthquake_event.h"
@@ -41,15 +42,13 @@ class AppController : public QObject {
     Q_PROPERTY(komira::UpdateService* updater READ updater CONSTANT)
     /// 本次启动是否应隐藏主窗口（静默启动）。常量：只取启动时读到的设置。
     Q_PROPERTY(bool startHidden READ startHidden CONSTANT)
-    Q_PROPERTY(QString statusText READ statusText NOTIFY statusChanged)
-    Q_PROPERTY(QString statusLevelTag READ statusLevelTag NOTIFY statusChanged)
     Q_PROPERTY(bool hasLocation READ hasLocation NOTIFY locationChanged)
     Q_PROPERTY(QString locationName READ locationName NOTIFY locationChanged)
     Q_PROPERTY(double userLatitude READ userLatitude NOTIFY locationChanged)
     Q_PROPERTY(double userLongitude READ userLongitude NOTIFY locationChanged)
     Q_PROPERTY(QString locationStatusText READ locationStatusText NOTIFY locationChanged)
-    Q_PROPERTY(QVariantMap sourceInfo READ sourceInfo NOTIFY statusChanged)
-    /// 逐数据源的状态列表：`[{ id, name, enabled, status, statusTag, latency, directory, directoryLatency, description }]`。
+    /// 逐数据源的状态列表：`[{ id, name, enabled, configured, status, statusTag, latency, directory, directoryLatency, description }]`。
+    /// 左下角徽章据此逐源着色（只取 enabled && configured）。
     Q_PROPERTY(QVariantList sources READ sources NOTIFY statusChanged)
     /// 校时状态：`{ enabled, state, detail }`。设置页展示；地震时间语义走 NtpClock::now()。
     Q_PROPERTY(QVariantMap clockInfo READ clockInfo NOTIFY clockChanged)
@@ -80,6 +79,8 @@ class AppController : public QObject {
     Q_PROPERTY(int hudCount READ hudCount NOTIFY hudEventChanged)
     /// P/S 波前圆半径（km），-1 表示不画。
     Q_PROPERTY(QVariantMap waveRadii READ waveRadii NOTIFY waveRadiiChanged)
+    /// 区县名 -> CSIS 烈度原始值，供矢量地图按烈度给区县面填色。
+    Q_PROPERTY(QVariantMap districtIntensity READ districtIntensity NOTIFY districtIntensityChanged)
 
 public:
     explicit AppController(QObject* parent = nullptr, bool startServices = true);
@@ -90,14 +91,11 @@ public:
     UpdateService* updater() const { return updater_; }
     bool startHidden() const;
 
-    QString statusText() const;
-    QString statusLevelTag() const;
     bool hasLocation() const;
     QString locationName() const;
     double userLatitude() const;
     double userLongitude() const;
     QString locationStatusText() const;
-    QVariantMap sourceInfo() const;
     QVariantList sources() const;
     QVariantMap clockInfo() const;
     /// 校时后的当前时刻，固定渲染为 UTC+8 的 `yyyy-MM-dd HH:mm:ss`（与设备时区无关）。
@@ -128,6 +126,7 @@ public:
     int hudIndex() const;
     int hudCount() const;
     QVariantMap waveRadii() const;
+    QVariantMap districtIntensity() const { return districtIntensity_; }
 
     /// HUD 左右切换：在全部活动事件间循环（按发震时刻倒序，0 为最新）。
     Q_INVOKABLE void hudPrev();
@@ -173,6 +172,7 @@ signals:
     void mapFocusChanged();
     void hudEventChanged();
     void waveRadiiChanged();
+    void districtIntensityChanged();
     /// 实时 EEW 到达：请求把地图移到该震中。
     void centerMapRequested(double latitude, double longitude);
     /// 取消焦点（再次点击同一事件）：请求把镜头还原到默认视野。
@@ -180,10 +180,6 @@ signals:
 
 private:
     void wire();
-    /// 当前启用的数据源 id 列表（用于聚合状态展示）。
-    QStringList enabledSourceIds() const;
-    /// 注册表内全部源的链路状态（顺序即展示顺序）。
-    QList<DataSourceInfo> allSourceInfos() const;
     /// inDirectory：事件来自 HTTP 目录（进入列表/历史）；否则为 WS 实时预警（只告警不入列表）。
     /// source：发出该帧的源，用于把仓库层的处置结果回传给需要它的数据源（见 EarthquakeSource::onAdmission）。
     void handleEvent(const EarthquakeEvent& event, bool replay, bool inDirectory,
@@ -212,6 +208,13 @@ private:
     /// 焦点事件"还年轻"（发震时刻在窗口内）时跑 100ms 波前定时器，否则停。
     void updateWaveTimer();
     void updateWaveRadii();
+    /// 安排一次区县烈度重算：合并 100 ms 内的多次事件变更，只算最后一��。
+    void scheduleDistrictRefresh();
+    /// 区县烈度重算本体（在 worker 线程跑；1011 个面约 3 ms，但仍不占 UI 线程）。
+    void recomputeDistrictIntensity();
+    /// 在给定事件参数下算出「区县名 -> CSIS 烈度」，纯函数，供 worker 线程调用。
+    static QVariantMap computeDistrictIntensity(const VectorMapData& data, double magnitude,
+                                                double depthKm, double lat, double lon);
     void refreshEventModel();
     void scheduleDirectoryUiRefresh();
     /// 开启自动检查时，本次会话安排一次静默检查更新（只做一次）。
@@ -268,6 +271,11 @@ private:
     QTimer waveTimer_;
     QTimer hudRefreshTimer_;
     QTimer directoryUiTimer_;
+    /// 区县烈度重算的合并定时器 + 最近一次计算结果。
+    QTimer districtTimer_;
+    QVariantMap districtIntensity_;
+    /// 区县矢量数据（首次需要着色时才加载 3.7 MiB）。
+    VectorMapData districtData_;
     double wavePKm_ = -1.0;
     double waveSKm_ = -1.0;
     double wavePOpacity_ = 0.0;

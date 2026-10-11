@@ -1,4 +1,6 @@
 #include <QtTest>
+#include <QImage>
+#include <QSet>
 #include <QApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -15,6 +17,8 @@
 #include "theme/native_ui.h"
 #include <QQuickStyle>
 #include <QSGRendererInterface>
+#include <QQmlEngine>
+#include "map/vector_map_item.h"
 #define private public
 #include "app/app_controller.h"
 #include "service/alert_announcer.h"
@@ -65,8 +69,20 @@ static QString evidenceDirectory(QQuickWindow* window) {
 
 class GuiTest : public QObject {
     Q_OBJECT
+private:
+    /// 主程序用 qt_add_qml_module 自动注册 QML_ELEMENT 类型；gui_test 走 qt_add_resources +
+    /// 直接按 qrc URL 加载 QML，拿不到那段注册代码，故在此显式注册一次。
+    /// MapView.qml 有 `import KomiraQuake`，因此注册到该 URI 即可见。
+    static void registerQmlTypes() {
+        static bool done = false;
+        if (done) return;
+        done = true;
+        qmlRegisterType<komira::VectorMapItem>("KomiraQuake", 1, 0, "VectorMapItem");
+    }
+
 private slots:
     void initTestCase() {
+        registerQmlTypes();
         // qrc 资源没有可靠的 mtime，Qt 的 QML 磁盘缓存会跨重建复用旧字节码，
         // 让本用例静默地跑在旧 QML 上。测试必须始终执行本次构建的 QML。
         qputenv("QML_DISABLE_DISK_CACHE", "1");
@@ -446,6 +462,360 @@ private slots:
         // 总开关关闭同样不该闪。
         controller.settings()->setEnableWarnings(false);
         QVERIFY(!tray.blinkTimer_.isActive());
+    }
+
+    /// 矢量底图：必须真的不再请求栅格瓦片。
+    ///
+    /// 回归点：basemapId="vector" 时若 tileUrl/syncTiles 不早退，会沿用默认的
+    /// 高德模板，用户看到「选了矢量却还是高德」。
+    ///
+    /// 断言走 QML 侧暴露的 tileCount：ListModel 只有 id，C++ 侧 property() 取不到它。
+    /// 注意 Main.qml 用 Loader { active: window.visible }，故必须先 show() 让 Loader
+    /// 激活、syncTiles 跑完，再取属性 —— 否则读到的是尚未完成 Component.onCompleted 的实例。
+    void vectorBasemapSuppressesRasterTiles() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("VectorBasemapTest");
+        AppController controller(nullptr, false);
+        // 通过 SettingsStore 自身的 API 设置：预置 QSettings 的 org/app 名可能与
+        // QSettings 默认构造不一致，会写到别的文件，让断言建立在假前提上。
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setVectorOverlay(false);
+        controller.settings()->setDistrictShading(true);
+        QCOMPARE(controller.settings()->basemapId(), QStringLiteral("vector"));
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        QTest::qWait(400);
+
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(mapView);
+        QCOMPARE(mapView->property("basemap").toString(), QStringLiteral("vector"));
+        // 矢量底图下不应残留任何栅格瓦片（否则用户看到的就是高德/OSM）。
+        QCOMPARE(mapView->property("tileCount").toInt(), 0);
+        QCOMPARE(mapView->property("vectorOnly").toBool(), true);
+        // 矢量层必须是 mapRenderLayer 的后代：它既是渲染内容，也是模糊的
+        // backdropSource（BackdropBlur 用它采样）。若被提到 root 之下，模糊就
+        // 捕获不到地图内容 → 用户看到「组件的模糊没了」。
+        auto* renderLayer = window->findChild<QQuickItem*>("mapRenderLayer");
+        QVERIFY2(renderLayer, "mapRenderLayer");
+        for (const char* name : {"vectorWorldLayer", "vectorProvinceLayer", "vectorDistrictLayer"}) {
+            auto* layer = window->findChild<QQuickItem*>(name);
+            QVERIFY2(layer, name);
+            QVERIFY2(layer->parentItem() == renderLayer,
+                     "vector layer must be a child of mapRenderLayer (blur backdrop)");
+        }
+        // 世界/区县层始终参与渲染；省级分界线只在拉近后画（见下个断言）。
+        QVERIFY(window->findChild<QQuickItem*>("vectorWorldLayer")->property("visible").toBool());
+        QVERIFY(window->findChild<QQuickItem*>("vectorDistrictLayer")->property("visible").toBool());
+        // 全国概览（z4）时省界隐藏 —— 35 条线会糊成噪声；拉近到 z5 才出现。
+        auto* province = window->findChild<QQuickItem*>("vectorProvinceLayer");
+        QVERIFY(province);
+        QVERIFY2(!province->property("visible").toBool(),
+                 "province borders must be hidden at national overview zoom");
+        mapView->setProperty("zoom", 5.0);
+        QTRY_VERIFY_WITH_TIMEOUT(province->property("visible").toBool(), 1000);
+        mapView->setProperty("zoom", 4.0);
+        QTRY_VERIFY_WITH_TIMEOUT(!province->property("visible").toBool(), 1000);
+        // 且矢量数据确实加载成功（3.7 MiB 的 .kvb）。
+        auto* world = window->findChild<QQuickItem*>("vectorWorldLayer");
+        QVERIFY2(world->property("ready").toBool(), "vector data (.kvb) failed to load");
+        QCOMPARE(world->property("featureCount").toInt(), 1285);
+
+        // 端到端护栏：矢量图必须真的画出东西。
+        // 曾经因视口裁剪把纬度写反 —— 属性全部正确、画面却一片空白，
+        // 只断言属性抓不到，必须看像素。
+        {
+            // 采样地图区域左侧（避开右侧控件栏与左下角徽章）的不同颜色数。
+            auto mapColours = [&]() {
+                const QImage img = window->grabWindow();
+                QSet<QRgb> colors;
+                for (int y = img.height() / 4; y < img.height() * 3 / 4; y += 7) {
+                    for (int x = img.width() / 10; x < img.width() / 2; x += 7) {
+                        colors.insert(img.pixel(x, y));
+                    }
+                }
+                return colors.size();
+            };
+            // VectorMapItem 首次 paint 才建离屏缓存（~90 ms/三层），且绘制结果要下一帧
+            // 才进场景图。用 QTRY 反复抓帧直到出现内容 —— 若始终空白则超时失败，
+            // 真·空白 bug 依然会被抓到。
+            QTRY_VERIFY_WITH_TIMEOUT(mapColours() > 5, 5000);
+        }
+
+        // 截图存证：属性对不代表画得出来。设 KOMIRA_EVIDENCE_DIR 才落盘。
+        // 这一步曾经抓到「视口裁剪把纬度写反导致整图空白」的 bug。
+        const QString evidence = qEnvironmentVariable("KOMIRA_EVIDENCE_DIR");
+        if (!evidence.isEmpty()) {
+            QTest::qWait(300);
+            QVERIFY(window->grabWindow().save(evidence + "/vector-basemap.png"));
+        }
+    }
+
+    /// 跨日界线时矢量底图两半都要有内容。
+    ///
+    /// 回归点：相机经度被 QML 夹在 ±180，但视口可越界；数据只含 [-180,180] 一份几何。
+    /// 若渲染不按 ±360 环绕，从中国向东平移到美国途中，视口一跨 ±180° 就有半幅是空的
+    /// （用户看到的「地图突然消失一半」）。
+    void vectorBasemapWrapsAcrossAntimeridian() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("VectorAntimeridianTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setVectorOverlay(false);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        auto* world = window->findChild<QQuickItem*>("vectorWorldLayer");
+        QVERIFY(mapView && world);
+        QVERIFY2(world->property("ready").toBool(), "vector data (.kvb) failed to load");
+        QTest::qWait(500);
+
+        // 贴近日界线、位于中国与北美之间：视口同时跨过 ±180°。
+        // 左半应见堪察加半岛（东半球），右半应见阿拉斯加/阿留申（西半球的 +360° 副本）。
+        mapView->setProperty("centerLat", 45.0);
+        mapView->setProperty("centerLon", 179.0);
+        mapView->setProperty("zoom", 4.0);
+        QTest::qWait(200);
+
+        // 采样左右两半的地图区域（避开右侧工具条与底部徽章）的陆地像素数：
+        // 陆地填充明显比背景暗，修复前半幅为 0。
+        auto landCounts = [&](int& left, int& right) {
+            const QImage img = window->grabWindow();
+            left = right = 0;
+            for (int y = 60; y < img.height() - 140; ++y) {
+                for (int x = 8; x < img.width() - 100; ++x) {
+                    const QRgb c = img.pixel(x, y);
+                    if (qRed(c) >= 248 && qGreen(c) >= 250) continue;   // 背景/空白
+                    if (x < img.width() / 2) ++left;
+                    else ++right;
+                }
+            }
+        };
+        int left = 0, right = 0;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] { landCounts(left, right); return left > 150 && right > 150; })(),
+                                 5000);
+        qInfo() << "PROBE antimeridian land pixels: left" << left << "right" << right;
+
+        const QString evidence = qEnvironmentVariable("KOMIRA_EVIDENCE_DIR");
+        if (!evidence.isEmpty()) {
+            QTest::qWait(200);
+            QVERIFY(window->grabWindow().save(evidence + "/vector-antimeridian.png"));
+        }
+    }
+
+    /// 缩放时矢量层必须与震中/定位标记同源。
+    ///
+    /// 回归点：离屏位图缓存曾只做平移、不随 scale 重渲 —— 缩放时矢量层停在旧比例上，
+    /// 与标记逐渐错位，并在平移量超出缓存 margin 触发重渲时整屏跳变（即用户看到的
+    /// “缩放抖动、震中和我的位置定不住”）。这里在分数 zoom 下比对「矢量层实际绘制的
+    /// 投影」(VectorMapItem::screenPosForTest) 与「标记所用的 QML 投影」(screenX/screenY)。
+    void vectorZoomStaysAlignedWithMarkers() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("VectorZoomAlignTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setVectorOverlay(false);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        auto* world = window->findChild<QQuickItem*>("vectorWorldLayer");
+        QVERIFY(mapView && world);
+        QVERIFY2(world->property("ready").toBool(), "vector data (.kvb) failed to load");
+        QTest::qWait(900);   // 等初始自动取景补间结束，避免动画中途改相机
+
+        // 先在整数层级画一帧，让离屏缓存在 scale=1 的比例下建好。
+        mapView->setProperty("centerLat", 35.0);
+        mapView->setProperty("centerLon", 105.0);
+        mapView->setProperty("zoom", 6.0);
+        window->grabWindow();
+
+        // 再做一次很小的缩放变化：旧实现里它的平移量落在缓存 margin 内（≈165px < 192），
+        // 会复用旧比例的位图而不重渲，于是矢量层与标记立刻错位。
+        mapView->setProperty("zoom", 6.02);
+        window->grabWindow();
+
+        auto qmlNum = [&](const char* fn, double arg) -> double {
+            QVariant ret;
+            const bool ok = QMetaObject::invokeMethod(mapView, fn, Q_RETURN_ARG(QVariant, ret),
+                                                      Q_ARG(QVariant, QVariant(arg)));
+            return ok ? ret.toDouble() : qQNaN();
+        };
+        auto aligned = [&]() -> bool {
+            for (const QPointF& p : {QPointF(116.4, 39.9), QPointF(121.5, 31.2),
+                                     QPointF(104.1, 30.6)}) {
+                QPointF got;
+                QMetaObject::invokeMethod(world, "screenPosForTest", Q_RETURN_ARG(QPointF, got),
+                                          Q_ARG(double, p.y()), Q_ARG(double, p.x()));
+                const double expX = qmlNum("screenX", p.x());
+                const double expY = qmlNum("screenY", p.y());
+                if (!(std::hypot(got.x() - expX, got.y() - expY) < 1.0)) {
+                    qWarning() << "misaligned" << p << "got" << got << "exp" << expX << expY;
+                    return false;
+                }
+            }
+            return true;
+        };
+        // 抓帧要等渲染线程把新的 paint 结果落地，故重试若干帧。
+        bool ok = false;
+        for (int i = 0; i < 50 && !ok; ++i) {
+            QTest::qWait(20);
+            window->grabWindow();
+            ok = aligned();
+        }
+        QVERIFY2(ok, "矢量层在缩放后与震中/定位标记错位");
+    }
+
+    /// 拖动性能基准：模拟连续平移，测量每帧渲染耗时。
+    /// 只记录不硬性断言（阈值随机器/后端差异大），用于定位卡顿来源。
+    void vectorDragPerformance() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("VectorDragPerf");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("vector");
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(mapView);
+        QTest::qWait(300);
+
+        window->grabWindow();   // 预热：首次会加载 .kvb 并建投影缓存
+
+        qint64 worst = 0, total = 0;
+        const int frames = 40;
+        QElapsedTimer t;
+        for (int i = 0; i < frames; ++i) {
+            t.restart();
+            mapView->setProperty("centerLon", 116.4 - i * 0.05);
+            window->grabWindow();
+            const qint64 ms = t.elapsed();
+            worst = qMax(worst, ms);
+            total += ms;
+        }
+        qInfo() << "PROBE drag:" << frames << "frames, avg" << (total / frames) << "ms, worst"
+                << worst << "ms";
+    }
+
+    /// 回归：波前淡出后「跟随震中」按钮仍然生效。
+    ///
+    /// 曾经 `frameEvent` 在 `hasWaves && faded` 时直接 return —— 而 faded 自 P 波超过 CSIS
+    /// 可感半径（opacity 降到 0.25）后**一直为真**。于是按钮只把 following 置真、镜头纹丝
+    /// 不动，用户看到的就是「按钮失效」。显式聚焦（toggleFollowEvent -> focusEvent）现在
+    /// 不受该冻结限制（该冻结只用于自动逐帧跟随）。
+    void followButtonReframesWhenWavesFaded() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("FollowFadedTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(map);
+        QTest::qWait(400);
+
+        EarthquakeEvent e;
+        e.id = e.eventId = "FOLLOW-A";
+        e.timestamp = now;
+        e.latitude = 30.6;
+        e.longitude = 104.0;
+        e.magnitude = 5.0;
+        e.depth = 10.0;
+        e.rawIntensity = 3.0;
+        controller.handleEvent(e, false, false);
+        QTest::qWait(700);   // 等入场取景补间结束
+        QVERIFY(map->property("hasEvent").toBool());
+
+        // 推进到波前已淡出的时刻：pOpacity 落到 0.25（<=0.25 即 faded）。
+        now += 60'000;
+        controller.updateWaveRadii();
+        const auto wr = controller.property("waveRadii").toMap();
+        QVERIFY2(wr.value("pOpacity").toDouble() <= 0.25,
+                 qPrintable(QStringLiteral("前置条件失败：波前未淡出 opacity=%1")
+                                .arg(wr.value("pOpacity").toDouble())));
+
+        // 用户手动拖远并退出跟随。
+        map->setProperty("following", false);
+        map->setProperty("centerLon", 120.0);
+        map->setProperty("centerLat", 20.0);
+        QTest::qWait(60);
+        QVERIFY(!map->property("following").toBool());
+        QVERIFY(std::abs(map->property("centerLon").toDouble() - 120.0) < 1.0);
+
+        // 点击「跟随震中」按钮对应 toggleFollowEvent -> focusEvent。
+        QVERIFY(QMetaObject::invokeMethod(map, "toggleFollowEvent"));
+        QTest::qWait(700);
+        QVERIFY(map->property("following").toBool());
+        const double hypoLon = map->property("shiftedHypo").toMap().value("lon").toDouble();
+        QVERIFY2(std::abs(map->property("centerLon").toDouble() - hypoLon) < 3.0,
+                 qPrintable(QStringLiteral("跟随按钮未把镜头带回震中: center=%1 hypo=%2")
+                                .arg(map->property("centerLon").toDouble()).arg(hypoLon)));
     }
 
     void settingsNavigationAndTheme() {

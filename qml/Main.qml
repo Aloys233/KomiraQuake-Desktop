@@ -27,26 +27,39 @@ ApplicationWindow {
     // 地图标记仍画最近一次事件，但不作为默认取景中心；取景只跟随显式焦点。
     readonly property var mapEvent: app.mapEvent
     readonly property bool hudActive: sameEvent(hudEvent, app.activeWarning)
-    MapView {
-        id: map
+    Loader {
+        id: mapLoader
+        objectName: "mapLoader"
         anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom
         width: window.desktop ? window.width - listSidebar.width : window.width
-        theme: appTheme
-        hasUser: app.hasLocation
-        userLat: app.userLatitude; userLon: app.userLongitude
-        event: window.mapEvent
-        hasFocus: app.hasMapFocus
-        warningActive: !!app.activeWarning
-        hudInset: hud.visible ? hud.width : 0
-        zoom: 6
-        listExpanded: window.showList && !window.showSettings
-        onWavesFinished: if (window.hudEvent) window.wavesDoneId = window.hudEvent.id
-        onWavesStarted: window.wavesDoneId = ""
-        onToggleListRequested: { window.showSettings = false; window.showList = !window.showList }
-        onOpenSettingsRequested: window.showSettings = true
-        onLocationPicked: (lat, lon) => { app.setManualLocation(lat, lon, "地图选点"); globalToast.show("基准位置已更新"); }
+        active: window.visible
+        visible: window.visible
+        asynchronous: false
+        sourceComponent: MapView {
+            id: mapItem
+            anchors.fill: parent
+            theme: appTheme
+            hasUser: app.hasLocation
+            userLat: app.userLatitude; userLon: app.userLongitude
+            event: window.mapEvent
+            hasFocus: app.hasMapFocus
+            warningActive: !!app.activeWarning
+            hudWidth: hud.visible ? hud.width : 0
+            // 取景用的顶部/底部遮挡：HUD 实际高度（含余量）与左下徽章合计高度。
+            hudHeight: hud.visible ? hud.height + 32 : 0
+            zoom: 6
+            listExpanded: window.showList && !window.showSettings
+            onWavesFinished: if (window.hudEvent) window.wavesDoneId = window.hudEvent.id
+            onWavesStarted: window.wavesDoneId = ""
+            onToggleListRequested: { window.showSettings = false; window.showList = !window.showList }
+            onOpenSettingsRequested: window.showSettings = true
+            onLocationPicked: (lat, lon) => { app.setManualLocation(lat, lon, "地图选点"); globalToast.show("基准位置已更新"); }
+        }
+        onLoaded: window.applyDefaultView()
     }
+    readonly property var map: mapLoader.item
     function applyDefaultView() {
+        if (!map) return;
         // 用户若已手动控制过镜头，定位到达时不再抢镜头。
         if (!initialLocationApplied && !hudEvent && app.hasLocation && !map.userMovedCamera) {
             const pt = map.shiftCoord(app.userLatitude, app.userLongitude);
@@ -75,18 +88,19 @@ ApplicationWindow {
         function onCenterMapRequested(latitude, longitude) {
             // 显式聚焦/选中（含再次选中同一事件）应恢复 HUD。
             window.wavesDoneId = "";
-            Qt.callLater(map.frameEvent);
+            // 显式聚焦：波前一淡出也要把镜头带过去（见 MapView.focusEvent）。
+            if (map) Qt.callLater(map.focusEvent);
         }
-        function onResetMapRequested() { map.resetView(); }
+        function onResetMapRequested() { if (map) map.resetView(); }
     }
     HudCard {
         id: hud
-        width: Math.min(352, map.width - 88)
-        visible: !!window.hudEvent && !window.hudSuppressed && !window.showSettings && !map.pickingLocation
+        width: Math.min(352, (map ? map.width : window.width) - 88)
+        visible: !!window.hudEvent && !window.hudSuppressed && !window.showSettings && !(map && map.pickingLocation)
         anchors.left: parent.left; anchors.top: parent.top
         anchors.leftMargin: 16; anchors.topMargin: 16
         theme: appTheme
-        backdropSource: map.renderLayer
+        backdropSource: map ? map.renderLayer : null
         event: window.hudEvent; active: window.hudActive
         selected: !!event && app.isMapFocused(event.id)
         pageIndex: app.hudIndex
@@ -94,38 +108,59 @@ ApplicationWindow {
         onPrevPage: app.hudPrev()
         onNextPage: app.hudNext()
     }
-    // 左下角数据源状态：名称按连接状态着色（对齐 kanameishi）。
+    // 左下角数据源状态：逐源展示各自的连接状态，不再把多个源名合并成一条同色。
+    // 之前用聚合状态给整串源名上色，会出现「模拟源没连上、却因别的源在线而被染绿」。
     GlassCard {
         id: sourceBadge
         objectName: "sourceBadge"
         anchors.left: parent.left; anchors.bottom: clockBadge.top
         anchors.leftMargin: 16; anchors.bottomMargin: 8
-        theme: appTheme; backdropSource: map.renderLayer
+        theme: appTheme; backdropSource: map ? map.renderLayer : null
         width: sourceRow.implicitWidth + 24; height: 34; radius: 10
         visible: !window.showSettings
-        readonly property color statusColor: appTheme.connectionColor(app.sourceInfo.statusTag)
+        // 只展示真正在跑的源：已启用且已配置（与启动门控一致）。
+        readonly property var activeSources: app.sources.filter(function (s) {
+            return s.enabled && s.configured
+        })
         RowLayout {
             id: sourceRow
-            anchors.centerIn: parent; spacing: 8
-            AppIcon {
-                Layout.alignment: Qt.AlignVCenter
-                Layout.preferredWidth: 13; Layout.preferredHeight: 13
-                name: "radio"; size: 13; color: sourceBadge.statusColor
-            }
+            anchors.centerIn: parent; spacing: 7
             Text { Layout.alignment: Qt.AlignVCenter; text: "数据源"; color: appTheme.outline; font.pixelSize: 11 }
-            Text { Layout.alignment: Qt.AlignVCenter; text: app.sourceInfo.name; color: sourceBadge.statusColor; font.pixelSize: 11; font.weight: Font.Medium }
-            Text { Layout.alignment: Qt.AlignVCenter; text: app.sourceInfo.status; color: appTheme.outline; font.pixelSize: 10 }
+            Text {
+                Layout.alignment: Qt.AlignVCenter
+                visible: sourceBadge.activeSources.length === 0
+                text: "无启用数据源"; color: appTheme.outline; font.pixelSize: 11
+            }
+            Repeater {
+                model: sourceBadge.activeSources
+                delegate: RowLayout {
+                    required property var modelData
+                    required property int index
+                    spacing: 7
+                    Text {
+                        Layout.alignment: Qt.AlignVCenter
+                        visible: index > 0
+                        text: "·"; color: appTheme.outline; font.pixelSize: 11
+                    }
+                    Text {
+                        Layout.alignment: Qt.AlignVCenter
+                        text: modelData.name
+                        color: appTheme.connectionColor(modelData.statusTag)
+                        font.pixelSize: 11; font.weight: Font.Medium
+                    }
+                }
+            }
         }
     }
     GlassCard {
         id: clockBadge
         objectName: "clockBadge"
         anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 16
-        theme: appTheme; backdropSource: map.renderLayer
+        theme: appTheme; backdropSource: map ? map.renderLayer : null
         width: badgeRow.implicitWidth + 24; height: 34; radius: 10
         readonly property bool synced: app.clockInfo.synced === true
         property string timeText: ""
-        Timer { interval: 1000; running: true; repeat: true; triggeredOnStart: true; onTriggered: clockBadge.timeText = app.clockTextUtc8() }
+        Timer { interval: 1000; running: window.visible; repeat: true; triggeredOnStart: true; onTriggered: clockBadge.timeText = app.clockTextUtc8() }
         RowLayout {
             id: badgeRow
             anchors.centerIn: parent; spacing: 8
@@ -159,7 +194,7 @@ ApplicationWindow {
     SettingsPage {
         anchors.fill: parent; visible: window.showSettings; theme: appTheme
         onBack: window.showSettings = false
-        onPickLocationRequested: { window.showSettings = false; map.pickingLocation = true; globalToast.show("点击地图设置基准位置"); }
+        onPickLocationRequested: { window.showSettings = false; if (map) map.pickingLocation = true; globalToast.show("点击地图设置基准位置"); }
     }
     // 桌面端不使用全屏预警：主 HUD 下方再放一张预警卡承载本地到时与操作。
     WarningHud {
@@ -170,7 +205,7 @@ ApplicationWindow {
         width: hud.width
         visible: !!app.activeWarning && hud.visible && app.alertEligible
         theme: appTheme
-        backdropSource: map.renderLayer
+        backdropSource: map ? map.renderLayer : null
         event: app.activeWarning
         countdown: app.countdown
         onMuted: app.muteWarning()

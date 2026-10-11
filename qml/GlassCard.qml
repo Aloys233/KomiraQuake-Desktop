@@ -9,10 +9,12 @@ Rectangle {
     property string accessibleName: ""
     readonly property bool hovered: interactive && mouseArea.containsMouse
     readonly property bool pressed: interactive && mouseArea.pressed
+    readonly property bool windowVisible: Window.window ? Window.window.visible : true
     readonly property bool blurSupported: GraphicsInfo.api !== GraphicsInfo.Software
                                           && GraphicsInfo.api !== GraphicsInfo.Unknown
     readonly property bool blurActive: blurSupported && theme.backgroundBlur && !!backdropSource
                                       && backdropSource.width > 0 && backdropSource.height > 0
+                                      && windowVisible
     signal clicked()
     radius: 16
     color: pressed ? theme.glassCardPressed : hovered || active ? theme.glassCardHover
@@ -30,7 +32,7 @@ Rectangle {
     Loader {
         anchors.fill: parent
         z: -1
-        active: root.blurActive && root.visible
+        active: root.blurActive && root.visible && root.windowVisible
         sourceComponent: Component {
             BackdropBlur { sourceItem: root.backdropSource; cornerRadius: root.radius }
         }

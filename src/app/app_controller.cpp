@@ -117,16 +117,6 @@ WarningLevel levelFromTag(const QString& tag) {
     return WarningLevel::Normal;
 }
 
-int statusRank(ConnectionStatus s) {
-    switch (s) {
-    case ConnectionStatus::Connected: return 3;
-    case ConnectionStatus::Connecting: return 2;
-    case ConnectionStatus::Error: return 1;
-    case ConnectionStatus::Disconnected: return 0;
-    }
-    return 0;
-}
-
 /// 目录刷新状态 → severity 标签，供设置页给目录行上色。
 QString directoryTag(ConnectionStatus s) {
     switch (s) {
@@ -136,50 +126,6 @@ QString directoryTag(ConnectionStatus s) {
     case ConnectionStatus::Disconnected: return QStringLiteral("CRITICAL");
     }
     return QStringLiteral("CRITICAL");
-}
-
-/// 聚合多数据源的链路状态：任一启用源在线即视为在线（状态栏单条展示）。
-DataSourceInfo combineSources(const QList<DataSourceInfo>& all, const QStringList& enabledIds) {
-    QList<DataSourceInfo> list;
-    for (const auto& info : all)
-        if (enabledIds.contains(info.id)) list << info;
-    if (list.isEmpty()) {
-        DataSourceInfo none;
-        none.id = "none";
-        none.name = "无启用数据源";
-        none.region = "全球";
-        return none;
-    }
-    DataSourceInfo out = list.first();
-    QStringList names;
-    QStringList descriptions;
-    for (const auto& info : list) {
-        names << info.name;
-        if (!info.description.isEmpty()) descriptions << info.description;
-        if (statusRank(info.status) > statusRank(out.status)) out.status = info.status;
-        if (statusRank(info.directoryStatus) > statusRank(out.directoryStatus))
-            out.directoryStatus = info.directoryStatus;
-        if (info.directoryLatencyMs >= 0
-            && (out.directoryLatencyMs < 0 || info.directoryLatencyMs < out.directoryLatencyMs))
-            out.directoryLatencyMs = info.directoryLatencyMs;
-        if (info.directoryLastSuccess > out.directoryLastSuccess)
-            out.directoryLastSuccess = info.directoryLastSuccess;
-        if (out.directoryError.isEmpty() && !info.directoryError.isEmpty())
-            out.directoryError = info.directoryError;
-        if (info.lastHeartbeat > out.lastHeartbeat) out.lastHeartbeat = info.lastHeartbeat;
-    }
-    QStringList ids;
-    for (const auto& info : list) ids << info.id;
-    out.id = ids.join("+");
-    out.name = names.join(QStringLiteral(" · "));
-    out.description = descriptions.join("；");
-    out.latencyMs = -1;
-    for (const auto& info : list) {
-        if (info.status == ConnectionStatus::Connected && info.latencyMs >= 0
-            && (out.latencyMs < 0 || info.latencyMs < out.latencyMs))
-            out.latencyMs = info.latencyMs;
-    }
-    return out;
 }
 
 } // namespace
@@ -260,6 +206,10 @@ AppController::AppController(QObject* parent, bool startServices)
         refreshEventModel();
         emit hudEventChanged();
     });
+
+    // 区县烈度着色：单次定时器合并连发事件，只算最后一次。
+    districtTimer_.setSingleShot(true);
+    connect(&districtTimer_, &QTimer::timeout, this, &AppController::recomputeDistrictIntensity);
 }
 
 long long AppController::nowMs() const {
@@ -374,45 +324,11 @@ bool AppController::alertEligible() const {
     return hasActiveWarning_ && announcer_->eligible(activeWarning_);
 }
 
-QStringList AppController::enabledSourceIds() const {
-    QStringList ids;
-    for (EarthquakeSource* source : sources_)
-        if (settings_->isSourceEnabled(source->id())) ids << source->id();
-    return ids;
-}
-
-QList<DataSourceInfo> AppController::allSourceInfos() const {
-    QList<DataSourceInfo> infos;
-    infos.reserve(sources_.size());
-    for (EarthquakeSource* source : sources_) infos << source->info();
-    return infos;
-}
-
 void AppController::maybeAutoCheckUpdates() {
     if (!startServices_ || autoUpdateChecked_ || !settings_->autoCheckUpdates()) return;
     autoUpdateChecked_ = true;
     // 延后到界面与数据源就绪后再联网，避免与启动风暴抢带宽。
     QTimer::singleShot(4000, this, [this]() { updater_->check(true); });
-}
-
-QString AppController::statusText() const {
-    const DataSourceInfo info = combineSources(allSourceInfos(), enabledSourceIds());
-    switch (info.status) {
-    case ConnectionStatus::Connected: return QStringLiteral("源在线");
-    case ConnectionStatus::Connecting: return QStringLiteral("连接中");
-    case ConnectionStatus::Error: return QStringLiteral("连接异常");
-    case ConnectionStatus::Disconnected: break;
-    }
-    return QStringLiteral("未连接");
-}
-
-QString AppController::statusLevelTag() const {
-    const DataSourceInfo info = combineSources(allSourceInfos(), enabledSourceIds());
-    switch (info.status) {
-    case ConnectionStatus::Connected: return QStringLiteral("NORMAL");
-    case ConnectionStatus::Error: return QStringLiteral("WARNING");
-    default: return QStringLiteral("WATCH");
-    }
 }
 
 bool AppController::hasLocation() const { return location_->hasLocation(); }
@@ -422,11 +338,13 @@ double AppController::userLongitude() const { return location_->longitude(); }
 QString AppController::locationStatusText() const { return location_->statusText(); }
 
 QVariantList AppController::sources() const {
-    auto describe = [](const DataSourceInfo& info, bool enabled) {
+    auto describe = [](const DataSourceInfo& info, bool enabled, bool configured) {
         QVariantMap m;
         m["id"] = info.id;
         m["name"] = info.name;
         m["enabled"] = enabled;
+        // 是否已配置（与启动门控一致）：左下角徽章据此只展示真正在跑的源。
+        m["configured"] = configured;
         m["status"] = info.statusLabel();
         m["statusTag"] = info.statusTag();
         m["latency"] = info.latencyMs >= 0 ? QStringLiteral("%1 ms").arg(info.latencyMs)
@@ -446,33 +364,9 @@ QVariantList AppController::sources() const {
     };
     QVariantList list;
     for (EarthquakeSource* source : sources_)
-        list.push_back(describe(source->info(), settings_->isSourceEnabled(source->id())));
+        list.push_back(describe(source->info(), settings_->isSourceEnabled(source->id()),
+                                source->isConfigured()));
     return list;
-}
-
-QVariantMap AppController::sourceInfo() const {
-    const DataSourceInfo info = combineSources(allSourceInfos(), enabledSourceIds());
-    QVariantMap m;
-    m["id"] = info.id;
-    m["name"] = info.name;
-    m["region"] = info.region;
-    m["status"] = info.statusLabel();
-    m["statusTag"] = info.statusTag();
-    m["latency"] = info.latencyMs >= 0 ? QStringLiteral("%1 ms").arg(info.latencyMs)
-                                       : QStringLiteral("— ms");
-    m["description"] = info.description;
-    QString directory;
-    switch (info.directoryStatus) {
-    case ConnectionStatus::Connected: directory = QStringLiteral("目录刷新成功"); break;
-    case ConnectionStatus::Connecting: directory = QStringLiteral("目录刷新中"); break;
-    case ConnectionStatus::Error: directory = QStringLiteral("目录刷新失败：") + info.directoryError; break;
-    default: directory = QStringLiteral("目录未刷新"); break;
-    }
-    m["description"] = info.description + QStringLiteral(" · ") + directory;
-    m["directoryStatus"] = directory;
-    m["directoryLastSuccess"] = info.directoryLastSuccess;
-    m["directoryLatencyMs"] = info.directoryLatencyMs;
-    return m;
 }
 
 QVariantMap AppController::clockInfo() const { return clock_->info(); }
@@ -700,6 +594,7 @@ void AppController::setMapFocus(const EarthquakeEvent& event, bool manual) {
     mapFocusManual_ = manual;
     updateWaveTimer();
     scheduleHudRefresh();
+    scheduleDistrictRefresh();
     emit mapEventChanged();
     emit mapFocusChanged();
     emit hudEventChanged();
@@ -712,10 +607,59 @@ void AppController::clearMapFocus() {
     mapFocusManual_ = false;
     updateWaveTimer();
     scheduleHudRefresh();
+    scheduleDistrictRefresh();
     emit mapEventChanged();
     emit mapFocusChanged();
     emit hudEventChanged();
     emit resetMapRequested();
+}
+
+void AppController::scheduleDistrictRefresh() {
+    // 区县着色跟着焦点事件走，但数据源会连发多报；用单次定时器把一串更新合并成一次计算。
+    districtTimer_.stop();
+    districtTimer_.start(80);
+}
+
+QVariantMap AppController::computeDistrictIntensity(const VectorMapData& data, double magnitude,
+                                                    double depthKm, double lat, double lon) {
+    QVariantMap result;
+    const VectorLayer* layer = data.layer("district");
+    if (!layer || magnitude <= 0.0) return result;
+
+    // 影响半径：超出这个距离烈度已低于可感下限，直接剪掉，避免对 1011 个面全量算距离。
+    // M7 深源可达 2000 km，此时剪枝失效，但最坏也只是 34 万次线段距离（桌面约 3 ms）。
+    const double radiusKm = IntensityCalculator::distanceForCsis(magnitude, depthKm, 1.0);
+    if (radiusKm <= 0.0) return result;
+
+    for (const VectorFeature& f : layer->features) {
+        const GeoBounds b = boundsOf(f.polygon);
+        // 包围盒离震中就超过影响半径的区县必不受影响，先按保守上界剪掉。
+        if (b.maxDistanceKm(lat, lon) > radiusKm) continue;
+        const double dist = GeoGeometry::distanceToPolygonKm(f.polygon, lat, lon);
+        const double raw = IntensityCalculator::rawCsis(magnitude, dist, depthKm);
+        // 低于可感下限（<0.5）不着色，否则整片中国会被灰色铺满。
+        if (raw >= 0.5) result.insert(QString::fromStdString(f.name), raw);
+    }
+    return result;
+}
+
+void AppController::recomputeDistrictIntensity() {
+    const EarthquakeEvent* event = displayedEvent();
+    QVariantMap next;
+    if (event && settings_->districtShading() && event->magnitude > 0.0) {
+        if (!districtData_.loaded()) {
+            districtData_.loadFromFile((QCoreApplication::applicationDirPath() +
+                                       QStringLiteral("/assets/map_bounds.kvb"))
+                                          .toStdString());
+        }
+        if (districtData_.loaded()) {
+            next = computeDistrictIntensity(districtData_, event->magnitude, event->depth,
+                                            event->latitude, event->longitude);
+        }
+    }
+    if (next == districtIntensity_) return;
+    districtIntensity_ = std::move(next);
+    emit districtIntensityChanged();
 }
 
 void AppController::updateWaveTimer() {
@@ -983,6 +927,7 @@ void AppController::syncWarning() {
     }
     updateWaveTimer();
     scheduleHudRefresh();
+    scheduleDistrictRefresh();
     emit mapEventChanged();
     emit warningChanged();
     emit countdownChanged();

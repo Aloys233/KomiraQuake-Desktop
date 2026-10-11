@@ -2,6 +2,10 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Shapes
+// 本模块的 C++ 类型（VectorMapItem）。显式导入而非依赖同目录隐式解析：
+// 主程序由 loadFromModule 走模块系统，gui_test 则按 qrc URL 直接加载，
+// 显式导入在两种加载方式下都成立。
+import KomiraQuake
 
 // 原生栅格瓦片地图（slippy map）。《NATIVE_PORT_SPEC》 §8 / §12。
 // 默认只画"最近一次地震"的 X 十字；有焦点事件时画焦点事件，并按走时表反解画 P/S 波前圆。
@@ -30,7 +34,12 @@ Item {
     property bool following: false
     /// 用户是否手动控制过镜头（拖动/缩放/回到我的位置/复位）。用于避免定位到达时抢镜头。
     property bool userMovedCamera: false
-    property real hudInset: 0
+    /// 左侧 HUD 的**宽度**（px）：取景时按它让开左侧竖栏。
+    property real hudWidth: 0
+    /// 左侧 HUD 的**高度**（px，含余量）：取景时按它让开顶部。
+    property real hudHeight: 80
+    /// 左下角徽章（数据源 + 时钟）合计占用的高度（px）。
+    property real bottomBadgeHeight: 92
     readonly property string basemap: app.settings.basemapId
     readonly property bool gcjDatum: basemap === "amap_vector" ||
                                      basemap === "petal" ||
@@ -79,7 +88,7 @@ Item {
     // 跟随波前时，波前半径每 100ms 才更新一次；若把目标值直接赋值，缩放会一格一格地跳。
     // 用 Behavior 把目标值插值到显示帧率，跟随才够细腻。拖动（following=false）、
     // 程序化补间（cameraMove 进行中）或"减少动态效果"时禁用，保持 1:1 跟手。
-    readonly property bool followSmoothing: following && !cameraMove.running && !theme.reduceMotion
+    readonly property bool followSmoothing: following && !cameraMove.running && !theme.reduceMotion && root.visible
     readonly property int followSmoothMs: 120
     Behavior on zoom {
         enabled: root.followSmoothing
@@ -101,7 +110,7 @@ Item {
     // 波前结束（半径归 -1）时 Behavior 关闭，半径立即归零：此时圆已 visible:false，
     // 没必要再补一段收缩动画，也不必担心残值被下一个事件继承。
     // 不按 hasFocus 门控：切换焦点时半径已是当前值，重新聚焦不会出现"从0 涨出来"的动画。
-    readonly property bool waveSmoothing: !theme.reduceMotion
+    readonly property bool waveSmoothing: !theme.reduceMotion && root.visible
     readonly property bool wavePActive: (app.waveRadii.pKm || 0) > 0
     readonly property bool waveSActive: (app.waveRadii.sKm || 0) > 0
     property real wavePKmShown: Math.max(0, app.waveRadii.pKm || 0)
@@ -155,7 +164,7 @@ Item {
     /// 震中跟随开关：未跟随时取景震中；跟随时再次点击退出，回到默认视野（无定位即全国概览）。
     function toggleFollowEvent() {
         if (following) resetView();
-        else frameEvent();
+        else focusEvent();
     }
     /// 中国版图范围（大陆 + 海南 + 台湾，含四至点），用于无定位时的全国概览取景。
     readonly property var chinaBounds: ({ lonMin: 73.5, lonMax: 135.1, latMin: 18.0, latMax: 53.6 })
@@ -167,8 +176,9 @@ Item {
         const b = chinaBounds;
         const x0 = projX(b.lonMin, 0), x1 = projX(b.lonMax, 0);
         const y0 = projY(b.latMax, 0), y1 = projY(b.latMin, 0);
-        const left = Math.min(hudInset + 24, width * 0.5);
-        const right = 76, top = 80, bottom = 64;
+        // 与 frameEvent 用同一组遮挡常量，否则两套取景会给出不一致的视野。
+        const left = Math.min(hudWidth + 24, width * 0.5);
+        const right = 76, top = hudHeight, bottom = bottomBadgeHeight;
         const availableW = Math.max(80, width - left - right);
         const availableH = Math.max(80, height - top - bottom);
         const z = Math.max(1, Math.min(12, Math.floor(Math.log2(Math.min(availableW / (x1 - x0), availableH / (y1 - y0))))));
@@ -187,24 +197,43 @@ Item {
         following = false;
         frameChina(false);
     }
-    /// 聚焦震中区域（不并入用户所在地）：半径跟随 P/S 波前，连续（无级）缩放。
+    /// **显式**聚焦震中：工具条「跟随震中」按钮与「选中事件」都走这里。
+    /// 与自动跟随（frameEvent）不同，显式动作必须始终把镜头带过去 —— 否则波前一淡出
+    /// （faded 早退）按钮就只会点亮状态却不动镜头，看着就是「失效」。
+    function focusEvent() {
+        frameEventImpl(undefined, true);
+    }
+    /// 自动聚焦震中区域（不并入用户所在地）：半径跟随 P/S 波前，连续（无级）缩放。
     /// animate === false 用于波前逐帧重取景，避免与 420ms 补间互相追赶。
     function frameEvent(animate) {
+        frameEventImpl(animate, false);
+    }
+    function frameEventImpl(animate, explicitFocus) {
         following = true;
         idleResetTimer.stop();
         if (!hasEvent || width <= 0 || height <= 0) return;
         const x = projX(shiftedHypo.lon, 0);
         const y = projY(shiftedHypo.lat, 0);
+        // 取景必须读**平滑后**的半径（wavePKmShown），与实际画出来的圆同源。
+        // 读 app.waveRadii 的原始值会让镜头永远比看到的圆宽一圈，zoom 曲线也自带噪声。
         // 波前很小（t≈0）时保底 100 km；P/S 全部隐藏（历史事件/已淡出）时固定 300 km。
-        // 不设半径上限：靠 zoom 下限与"烈度低于可感即淡出"自然收尾。
-        const pKm = app.waveRadii.pKm || 0;
-        const sKm = app.waveRadii.sKm || 0;
+        const pKm = root.wavePKmShown;
+        const sKm = root.waveSKmShown;
         const hasWaves = pKm > 0 || sKm > 0;
-        const radiusKm = hasWaves ? Math.max(100, pKm, sKm) : 300;
+        // 波前已大到看不见（opacity 降到 0.25，即超过 CSIS 可感半径）就冻住镜头，
+        // 不再继续缩小去装一个几乎透明的圈；等波前彻底消失再由 resetView 归位。
+        // C++ 侧已按 fadeKm 过滤并给出 pOpacity/sOpacity，这里直接用其等价判据。
+        // 注意：该冻结只针对**自动**跟随；显式聚焦（explicitFocus）不受它限制。
+        const faded = (app.waveRadii.pOpacity || 0) <= 0.25 || (app.waveRadii.sOpacity || 0) <= 0.25;
+        if (hasWaves && faded && !explicitFocus) return;
+        // 显式聚焦遇到已淡出的波前时，用一个可感范围半径（与无波前时同为 300 km），
+        // 免得为了一个几乎看不见的大圈把镜头一路拉到全国乃至半球。
+        const radiusKm = (hasWaves && faded) ? 300
+                                              : (hasWaves ? Math.max(100, pKm, sKm) : 300);
         const r = radiusKm * 256 / (360 * 111.32 * Math.max(0.01, Math.cos(shiftedHypo.lat * Math.PI / 180)));
         const minX = x - r, maxX = x + r, minY = y - r, maxY = y + r;
-        const left = Math.min(hudInset + 24, width * 0.5);
-        const right = 76, top = 80, bottom = 64;
+        const left = Math.min(hudWidth + 24, width * 0.5);
+        const right = 76, top = hudHeight, bottom = bottomBadgeHeight;
         const availableW = Math.max(80, width - left - right);
         const availableH = Math.max(80, height - top - bottom);
         // 无级缩放：不取整，随波前连续变化（clampZoom 已限制到 [1,18]）。
@@ -291,7 +320,10 @@ Item {
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
         else if (!hasFocus && !hasUser && !userMovedCamera) Qt.callLater(() => frameChina(false));
     }
-    onHudInsetChanged: {
+    onHudWidthChanged: reframeForLayout()
+    onHudHeightChanged: reframeForLayout()
+    /// HUD 尺寸或视口变化后重取景：与 onWidth/onHeight 同一套逻辑，抽出来避免三处重复。
+    function reframeForLayout() {
         applyDefaultOverview();
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
         else if (!hasFocus && !hasUser && !userMovedCamera) Qt.callLater(() => frameChina(false));
@@ -320,6 +352,9 @@ Item {
     /// 平移跨过瓦片边界时只增删边缘一圈，已有瓦片的 delegate 不重建、source 不变，不会整屏闪黑重载。
     /// 缩放跨层级时**保留旧层作为底衬**（underlayZ），新层加载完再移除，避免整层清空造成闪屏。
     ListModel { id: tileModel }
+    /// 当前已调度的栅格瓦片数。对外暴露以便测试断言「矢量底图下应为 0」——
+    /// tileModel 只有 id、没有 property，C++ 侧取不到它。
+    readonly property int tileCount: tileModel.count
     /// 顶层（当前层）的缩放级别；-1 表示尚未初始化。
     property int tileModelZoom: -1
     /// 过渡期保留的旧层级别；-1 表示没有底衬。
@@ -352,6 +387,7 @@ Item {
     onFirstTileYChanged: Qt.callLater(syncTiles)
     onLastTileXChanged: Qt.callLater(syncTiles)
     onLastTileYChanged: Qt.callLater(syncTiles)
+    // 切到/切出纯矢量底图时要立即重算瓦片集合（要么清空，要么按当前相机重建）。
     Component.onCompleted: {
         if (root.tileModelZoom < 0) root.tileModelZoom = root.tileZoom;
         Qt.callLater(syncTiles);
@@ -400,6 +436,14 @@ Item {
     /// 让 ListModel 与当前可视瓦片范围保持一致。只增删差集，保留已有瓦片与过渡底衬。
     function syncTiles() {
         if (width <= 0 || height <= 0) return;
+        // 纯矢量底图不加载栅格瓦片：直接清空并返回，避免为看不见的底图发请求。
+        if (root.isVectorOnly()) {
+            if (tileModel.count > 0) {
+                for (let i = tileModel.count - 1; i >= 0; --i) tileModel.remove(i);
+                retireUnderlay();
+            }
+            return;
+        }
         const z = tileZoom;
         if (tileModelZoom < 0) tileModelZoom = z;
         const n = Math.pow(2, z);
@@ -478,6 +522,8 @@ Item {
     function wrapTile(t, n) { return ((t % n) + n) % n; }
 
     function tileUrl(x, y, z) {
+        // 纯矢量底图没有栅格层：返回空串，避免拼出无效 URL 触发加载失败。
+        if (root.isVectorOnly()) return "";
         let templateUrl = tileUrlTemplate;
         if (basemap === "osm") templateUrl = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
         else if (basemap === "petal") templateUrl = "https://tilemap.aloys23.link/petal/{z}/{x}/{y}";
@@ -489,7 +535,30 @@ Item {
         return url;
     }
 
+    // ---- 矢量层参数 ------------------------------------------------------
+    // 这些属性属于 root，**必须放在 mapRenderLayer 之外**：mapRenderLayer 只是
+    // 承载渲染内容（供模糊捕获）的容器，属性挂在它上面就成了子对象属性，
+    // 上层读 root.vectorOnly 会得到 undefined。
+    //
+    // 纯矢量底图（basemap === "vector"）时矢量层作为唯一底图，z 更低；
+    // 叠加模式（vectorOverlay）时压在瓦片之上、波前之下。
+    readonly property bool vectorOnly: (basemap === "vector")
+    onVectorOnlyChanged: Qt.callLater(syncTiles)
+    readonly property bool vectorActive: (isVectorOnly() || app.settings.vectorOverlay)
+    /// 叠加到 GCJ-02 栅格底图时才对矢量顶点纠偏；纯矢量模式下不纠偏
+    //（矢量数据与震中同为 WGS-84，天然一致）。
+    readonly property bool vectorGcjShift: !isVectorOnly() && !!gcjDatum
+    /// 省级分界线（province 层）只在 z >= 5 时画：全国概览（z4~5 以下）时 35 条省界
+    /// 会糊成一团噪声，看不清底图。与 Android 的 PROVINCE_BORDER_MIN_ZOOM 对齐。
+    readonly property real provinceBorderMinZoom: 5
+    readonly property bool showProvinceBorders: root.vectorActive && root.zoom >= root.provinceBorderMinZoom
+    /// 底图是否为纯矢量（供 syncTiles / tileUrl 早退）。显式函数而非 bool 属性，
+    /// 避免属性在 Component.onCompleted 之前尚未求值时得到 undefined。
+    function isVectorOnly() { return basemap === "vector"; }
+
     // The sole backdrop capture target. Controls below are siblings, never captured.
+    // 背景、栅格瓦片、矢量层都必须是它的子项：它们既是渲染内容，也是模糊的
+    // backdropSource（见下方各 BackdropBlur 的 backdropSource: mapRenderLayer）。
     Item {
         id: mapRenderLayer
         objectName: "mapRenderLayer"
@@ -500,6 +569,63 @@ Item {
         color: root.theme.surfaceContainerLow
         // 压到瓦片之下：底衬层要用负 z，背景必须比底衬更低。
         z: -2
+    }
+
+    // ---- 矢量层 ----------------------------------------------------------
+    // 三层叠加：世界陆地 → 省界 → 区县（EEW 时按烈度着色）。
+    // 相机属性直接绑定 root 的中心/缩放：VectorMapItem 内部把几何投影到整数 zoom 缓存，
+    // 拖动时只做 translate+scale，不重建路径。
+
+    VectorMapItem {
+        id: vectorWorld
+        objectName: "vectorWorldLayer"
+        anchors.fill: parent
+        layerName: "world"
+        visible: !!root.vectorActive
+        z: root.isVectorOnly() ? -1 : 0
+        centerLat: root.centerLat
+        centerLon: root.centerLon
+        zoom: root.zoom
+        gcjShift: false   // 全球层强制不纠偏：outOfChina 是矩形 bbox，蒙古/印度会被误平移
+        fill: root.isVectorOnly() ? root.theme.surfaceContainer : "transparent"
+        strokeColor: root.isVectorOnly() ? root.theme.outlineVariant : "transparent"
+        strokeWidth: 1.0
+    }
+
+    VectorMapItem {
+        id: vectorProvince
+        objectName: "vectorProvinceLayer"
+        anchors.fill: parent
+        layerName: "province"
+        // 省级分界线只在拉近后才画（见 root.showProvinceBorders）：全国概览时线条糊成噪声。
+        visible: root.showProvinceBorders
+        z: root.isVectorOnly() ? 0 : 1
+        centerLat: root.centerLat
+        centerLon: root.centerLon
+        zoom: root.zoom
+        gcjShift: !!root.vectorGcjShift
+        fill: "transparent"
+        strokeColor: root.theme.outline
+        strokeWidth: 1.0
+    }
+
+    VectorMapItem {
+        id: vectorDistrict
+        objectName: "vectorDistrictLayer"
+        anchors.fill: parent
+        layerName: "district"
+        visible: !!root.vectorActive
+        z: root.isVectorOnly() ? 0 : 1
+        centerLat: root.centerLat
+        centerLon: root.centerLon
+        zoom: root.zoom
+        gcjShift: !!root.vectorGcjShift
+        // 区县层平时完全透明：只在有震度的区县才描边 + 填色（见 vector_map_item.cpp）。
+        fill: "transparent"
+        // #bbbbbb —— kanameishi 的 eewBaseMapActiveStroke。
+        strokeColor: "#bbbbbb"
+        strokeWidth: 1.0
+        districtIntensity: app.districtIntensity
     }
 
     Repeater {
@@ -754,7 +880,7 @@ Item {
             GlassButton {
                 theme: root.theme; iconName: "layers"; accessibleName: "切换底图"; flat: true
                 onClicked: {
-                    const list = ["amap_vector", "petal", "osm"];
+                    const list = ["amap_vector", "petal", "osm", "vector"];
                     app.settings.basemapId = list[(list.indexOf(root.basemap) + 1) % list.length];
                 }
             }

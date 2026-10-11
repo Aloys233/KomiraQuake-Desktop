@@ -49,7 +49,7 @@ Item {
                              Math.ceil((root.height + 2 * root.padding) / 2))
         width: root.width + 2 * root.padding
         height: root.height + 2 * root.padding
-        live: true
+        live: Window.window ? Window.window.visible : true
         recursive: false
         hideSource: false
         visible: false
