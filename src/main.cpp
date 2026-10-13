@@ -12,6 +12,7 @@
 
 #include "app/app_controller.h"
 #include "app/version.h"
+#include "service/sentry_service.h"
 #include "service/tray_controller.h"
 #include "theme/native_ui.h"
 
@@ -63,6 +64,8 @@ public:
 } // namespace
 
 int main(int argc, char* argv[]) {
+    komira::SentryService::initializeEarly();
+
     // 使用 QApplication（Qt Widgets），以便 QSystemTrayIcon / QMenu 可用。
     QApplication app(argc, argv);
     QQuickStyle::setStyle(QStringLiteral("Basic"));
@@ -72,8 +75,10 @@ int main(int argc, char* argv[]) {
     QGuiApplication::setApplicationDisplayName(QStringLiteral("KomiraQuake - 地震预警"));
 
     komira::AppController controller;
+    komira::SentryService::instance()->init();
 
     QQmlApplicationEngine engine;
+    komira::SentryService::instance()->attachQmlEngine(&engine);
     komira::configureNativeUi(engine);
     engine.rootContext()->setContextProperty(QStringLiteral("app"), &controller);
     engine.setNetworkAccessManagerFactory(new TileNetworkAccessManagerFactory);

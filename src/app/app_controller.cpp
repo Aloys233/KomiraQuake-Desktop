@@ -25,6 +25,7 @@
 #include "service/autostart.h"
 #include "service/location_service.h"
 #include "service/ntp_clock.h"
+#include "service/sentry_service.h"
 #include "service/update_service.h"
 #include "source/eew_parser.h"
 #include "source/earthquake_source.h"
@@ -828,6 +829,13 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
     if (hasLocation()) user = std::make_pair(userLatitude(), userLongitude());
     EewParser::recompute(event, user, settings_->intensityStandard() == 1
         ? IntensityStandard::Jma : IntensityStandard::Csis);
+    SentryService::instance()->addBreadcrumb(
+        QStringLiteral("quake.event"),
+        QStringLiteral("[%1] %2 M%3 (inDir=%4)")
+            .arg(QString::fromStdString(event.eventId), QString::fromStdString(event.location))
+            .arg(event.magnitude)
+            .arg(inDirectory ? QStringLiteral("true") : QStringLiteral("false")),
+        QStringLiteral("info"));
     // Directory and warning gates are deliberately independent.
     if (inDirectory) {
         const auto decision = gate_.admit(event, nowMs());

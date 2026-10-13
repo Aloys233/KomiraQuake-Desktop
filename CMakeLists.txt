@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Qt6 6.5 REQUIRED COMPONENTS
-    Core Gui Widgets Quick QuickControls2 Qml Network WebSockets Sql Multimedia Svg
+    Core Gui Widgets Quick QuickControls2 Qml Network WebSockets Sql Multimedia Svg Concurrent
 )
 
 qt_standard_project_setup(REQUIRES 6.5)
@@ -56,6 +56,7 @@ qt_add_executable(komiraquake WIN32
     src/service/tray_controller.cpp
     src/service/autostart.cpp
     src/service/update_service.cpp
+    src/service/sentry_service.cpp
 
     # app
     src/app/app_controller.cpp
@@ -83,6 +84,7 @@ target_link_libraries(komiraquake PRIVATE
     Qt6::Sql
     Qt6::Multimedia
     Qt6::Svg
+    Qt6::Concurrent
 )
 
 set(KOMIRA_QML_FILES
@@ -195,6 +197,7 @@ if(BUILD_TESTING)
         src/source/whews_protocol.cpp src/source/whews_parser.cpp src/source/whews_source.cpp
         src/source/simulated_protocol.cpp src/source/simulated_parser.cpp
         src/source/simulated_source.cpp
+        src/service/sentry_service.cpp
         src/store/history_store.cpp src/prefs/settings_store.cpp)
     target_include_directories(qt_business_test PRIVATE src)
     target_link_libraries(qt_business_test PRIVATE Qt6::Test Qt6::Network Qt6::WebSockets Qt6::Sql)
@@ -212,7 +215,7 @@ if(BUILD_TESTING)
         KOMIRA_VERSION="${PROJECT_VERSION}")
     target_link_libraries(gui_test PRIVATE Qt6::Test Qt6::Core Qt6::Gui Qt6::Widgets
         Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::WebSockets Qt6::Sql
-        Qt6::Multimedia Qt6::Svg)
+        Qt6::Multimedia Qt6::Svg Qt6::Concurrent)
     qt_add_resources(gui_test test_lucide_icons PREFIX "/icons" BASE "qml/icons" FILES ${KOMIRA_ICON_FILES})
     qt_add_resources(gui_test test_komira_fonts PREFIX "/fonts" BASE "fonts" FILES ${KOMIRA_FONT_FILES})
     qt_add_resources(gui_test test_qml PREFIX "/qt/qml/KomiraQuake" FILES ${KOMIRA_QML_FILES})

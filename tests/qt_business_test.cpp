@@ -26,6 +26,7 @@
 #include "model/data_source_info.h"
 #include "prefs/settings_store.h"
 #include "service/autostart.h"
+#include "service/sentry_service.h"
 #include "source/eew_parser.h"
 #include "source/jian_parser.h"
 #include "source/pancakes_parser.h"
@@ -1451,6 +1452,22 @@ private slots:
         QVERIFY(reloaded.developerMode());
         QCOMPARE(reloaded.simulatedUrl(), QStringLiteral("ws://10.0.2.2:8080/ws"));
         QSettings().clear();
+    }
+
+    void sentryServiceDsnAndBreadcrumbs() {
+        auto* sentry = SentryService::instance();
+        QVERIFY(sentry != nullptr);
+        QVERIFY(sentry->dsn().contains("48fb324081d84266d8f3f961022bb237"));
+        QVERIFY(sentry->dsn().contains("4512246266789888"));
+
+        sentry->init();
+        QVERIFY(sentry->isEnabled()); // 恒定开启，不允许用户关闭
+
+        sentry->addBreadcrumb("test", "test message 1", "info");
+        sentry->addBreadcrumb("test", "test message 2", "warning");
+
+        sentry->recordCrashImmediately("TestSignal", "SIGSEGV (Test crash)", "frame1\nframe2");
+        sentry->checkAndSendPendingCrashes();
     }
 };
 
