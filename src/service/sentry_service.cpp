@@ -99,7 +99,10 @@ void SentryService::initializeEarly() {
 #endif
 
 #ifdef Q_OS_WIN
-    SetUnhandledExceptionFilter(SentryService::winUnhandledExceptionFilter);
+    // 声明刻意用 void* 以免在头文件里暴露 windows.h；这里按 Win32 回调类型做一次
+    // 函数指针转换（实现只是写崩溃转储，不读 _EXCEPTION_POINTERS，转换是安全的）。
+    SetUnhandledExceptionFilter(
+        reinterpret_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(&SentryService::winUnhandledExceptionFilter));
 #endif
 
     // 安装 C++ 未捕获异常 terminate 钩子
