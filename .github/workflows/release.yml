@@ -46,7 +46,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
+            ninja-build libcurl4-openssl-dev libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xkb1 \
             libxcb-xinerama0
@@ -69,8 +69,8 @@ jobs:
           SENTRY_PROJECT: "4512246266789888"
         run: |
           if [ -z "${SENTRY_AUTH_TOKEN:-}" ]; then
-            echo "SENTRY_AUTH_TOKEN 未配置，跳过 Linux debug information 上传"
-            exit 0
+            echo "SENTRY_AUTH_TOKEN 未配置，不能发布没有 native symbols 的版本" >&2
+            exit 1
           fi
           npx --yes @sentry/cli@latest upload-dif \
             --org "$SENTRY_ORG" \
@@ -188,18 +188,23 @@ jobs:
         shell: pwsh
         run: |
           if ([string]::IsNullOrWhiteSpace($env:SENTRY_AUTH_TOKEN)) {
-            Write-Host "SENTRY_AUTH_TOKEN 未配置，跳过 Windows debug information 上传"
-            exit 0
+            Write-Error "SENTRY_AUTH_TOKEN 未配置，不能发布没有 native symbols 的版本"
+            exit 1
           }
-          $debugFiles = @(Get-ChildItem -Path build -Recurse -File |
-            Where-Object { $_.Extension -in @('.pdb', '.exe') })
-          if ($debugFiles.Count -eq 0) {
-            throw "未找到 Windows ELF/PDB debug information 文件"
+          $debugFiles = @(
+            'build\komiraquake.exe',
+            'build\komiraquake.pdb'
+          )
+          foreach ($debugFile in $debugFiles) {
+            if (-not (Test-Path -LiteralPath $debugFile -PathType Leaf)) {
+              throw "未找到 Windows native debug information 文件: $debugFile"
+            }
           }
           npx --yes @sentry/cli@latest upload-dif `
             --org $env:SENTRY_ORG `
             --project $env:SENTRY_PROJECT `
-            build
+            build\komiraquake.exe `
+            build\komiraquake.pdb
 
       - name: Build installer
         working-directory: build
