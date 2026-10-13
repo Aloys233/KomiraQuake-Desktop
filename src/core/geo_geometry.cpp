@@ -4,6 +4,8 @@
 #include <cmath>
 #include <limits>
 
+#include <QtMath>
+
 #include "core/quake_calculator.h"
 
 namespace komira {
