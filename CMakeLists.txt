@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(KomiraQuake VERSION 1.2.1 LANGUAGES CXX)
+project(KomiraQuake VERSION 1.2.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,6 +10,28 @@ find_package(Qt6 6.5 REQUIRED COMPONENTS
 )
 
 qt_standard_project_setup(REQUIRES 6.5)
+
+# Official Sentry Native SDK with its out-of-process Crashpad backend. The
+# handler executable is installed beside KomiraQuake below; the runtime points
+# to that absolute path instead of relying on PATH/current working directory.
+include(FetchContent)
+set(SENTRY_BUILD_SHARED_LIBS OFF CACHE BOOL "Build sentry-native statically" FORCE)
+set(SENTRY_BACKEND crashpad CACHE STRING "Sentry crash backend" FORCE)
+set(SENTRY_BUILD_TESTS OFF CACHE BOOL "Do not build sentry-native tests" FORCE)
+set(SENTRY_BUILD_EXAMPLES OFF CACHE BOOL "Do not build sentry-native examples" FORCE)
+set(SENTRY_ENABLE_INSTALL OFF CACHE BOOL "Install sentry-native as a separate package" FORCE)
+if(WIN32)
+    set(SENTRY_TRANSPORT winhttp CACHE STRING "Sentry transport" FORCE)
+else()
+    set(SENTRY_TRANSPORT curl CACHE STRING "Sentry transport" FORCE)
+endif()
+FetchContent_Declare(sentry_native
+    GIT_REPOSITORY https://github.com/getsentry/sentry-native.git
+    GIT_TAG 0.12.1
+    GIT_SHALLOW TRUE
+    GIT_SUBMODULES_RECURSE TRUE
+)
+FetchContent_MakeAvailable(sentry_native)
 
 qt_add_executable(komiraquake WIN32
     src/main.cpp
@@ -78,6 +100,7 @@ endif()
 target_compile_definitions(komiraquake PRIVATE KOMIRA_VERSION="${KOMIRA_VERSION_VALUE}")
 
 target_link_libraries(komiraquake PRIVATE
+    sentry
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -154,12 +177,33 @@ add_custom_command(TARGET komiraquake POST_BUILD
     COMMENT "Copying KomiraQuake assets next to the binary"
 )
 
+# Crashpad is an out-of-process handler, so it must be shipped with every
+# executable that can initialise Sentry (the app and the integration tests).
+function(komira_copy_crashpad_handler target_name)
+    if(TARGET crashpad_handler)
+        add_dependencies(${target_name} crashpad_handler)
+        add_custom_command(TARGET ${target_name} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:crashpad_handler>
+                    $<TARGET_FILE_DIR:${target_name}>
+            COMMENT "Copying Crashpad handler next to ${target_name}"
+        )
+    endif()
+endfunction()
+komira_copy_crashpad_handler(komiraquake)
+
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/assets/ DESTINATION share/komiraquake/assets)
 
 install(TARGETS komiraquake
     BUNDLE DESTINATION .
     RUNTIME DESTINATION bin
 )
+
+if(TARGET crashpad_handler)
+    install(TARGETS crashpad_handler
+        RUNTIME DESTINATION bin
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # Windows：install/CPack 阶段收集 Qt 运行时依赖（windeployqt + QML import 扫描），
@@ -204,7 +248,8 @@ if(BUILD_TESTING)
         src/service/sentry_service.cpp
         src/store/history_store.cpp src/prefs/settings_store.cpp)
     target_include_directories(qt_business_test PRIVATE src)
-    target_link_libraries(qt_business_test PRIVATE Qt6::Test Qt6::Network Qt6::WebSockets Qt6::Sql)
+    target_link_libraries(qt_business_test PRIVATE Qt6::Test Qt6::Network Qt6::WebSockets Qt6::Sql sentry)
+    komira_copy_crashpad_handler(qt_business_test)
     add_test(NAME qt_business COMMAND qt_business_test)
     file(GLOB_RECURSE GUI_TEST_SOURCES CONFIGURE_DEPENDS src/*.cpp)
     list(FILTER GUI_TEST_SOURCES EXCLUDE REGEX "/main.cpp$")
@@ -219,7 +264,8 @@ if(BUILD_TESTING)
         KOMIRA_VERSION="${PROJECT_VERSION}")
     target_link_libraries(gui_test PRIVATE Qt6::Test Qt6::Core Qt6::Gui Qt6::Widgets
         Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::WebSockets Qt6::Sql
-        Qt6::Multimedia Qt6::Svg Qt6::Concurrent)
+        Qt6::Multimedia Qt6::Svg Qt6::Concurrent sentry)
+    komira_copy_crashpad_handler(gui_test)
     qt_add_resources(gui_test test_lucide_icons PREFIX "/icons" BASE "qml/icons" FILES ${KOMIRA_ICON_FILES})
     qt_add_resources(gui_test test_komira_fonts PREFIX "/fonts" BASE "fonts" FILES ${KOMIRA_FONT_FILES})
     qt_add_resources(gui_test test_qml PREFIX "/qt/qml/KomiraQuake" FILES ${KOMIRA_QML_FILES})

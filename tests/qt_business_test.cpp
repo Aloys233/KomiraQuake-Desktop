@@ -1455,13 +1455,20 @@ private slots:
     }
 
     void sentryServiceDsnAndBreadcrumbs() {
+        SentryService::initializeEarly();
         auto* sentry = SentryService::instance();
         QVERIFY(sentry != nullptr);
         QVERIFY(sentry->dsn().contains("48fb324081d84266d8f3f961022bb237"));
         QVERIFY(sentry->dsn().contains("4512246266789888"));
 
+        QString handlerPath = QCoreApplication::applicationDirPath() + QStringLiteral("/crashpad_handler");
+#ifdef Q_OS_WIN
+        handlerPath += QStringLiteral(".exe");
+#endif
+        QVERIFY2(QFileInfo::exists(handlerPath), qPrintable(handlerPath));
+
         sentry->init();
-        QVERIFY(sentry->isEnabled()); // 恒定开启，不允许用户关闭
+        QVERIFY(sentry->isEnabled()); // SDK 与 Crashpad handler 均已初始化
 
         sentry->addBreadcrumb("test", "test message 1", "info");
         sentry->addBreadcrumb("test", "test message 2", "warning");

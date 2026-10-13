@@ -16,6 +16,10 @@ pkgs.mkShell {
     cmake
     ninja
     pkg-config
+    git
+    python3
+    curl
+    zlib
 
     qt6.qtbase
     qt6.qtdeclarative

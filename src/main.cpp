@@ -64,8 +64,6 @@ public:
 } // namespace
 
 int main(int argc, char* argv[]) {
-    komira::SentryService::initializeEarly();
-
     // 使用 QApplication（Qt Widgets），以便 QSystemTrayIcon / QMenu 可用。
     QApplication app(argc, argv);
     QQuickStyle::setStyle(QStringLiteral("Basic"));
@@ -74,8 +72,15 @@ int main(int argc, char* argv[]) {
     QCoreApplication::setApplicationVersion(QStringLiteral(KOMIRA_VERSION));
     QGuiApplication::setApplicationDisplayName(QStringLiteral("KomiraQuake - 地震预警"));
 
-    komira::AppController controller;
+    // Crashpad 需要在业务对象和 QML 创建前启动；应用元数据必须先设置，
+    // 这样 database path 会落到稳定的 CacheLocation。
+    komira::SentryService::initializeEarly();
     komira::SentryService::instance()->init();
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, &app, []() {
+        komira::SentryService::shutdown();
+    });
+
+    komira::AppController controller;
 
     QQmlApplicationEngine engine;
     komira::SentryService::instance()->attachQmlEngine(&engine);
