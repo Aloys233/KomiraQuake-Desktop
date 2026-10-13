@@ -52,6 +52,14 @@ QString resolveDataPath() {
 
 } // namespace
 
+QMutex VectorMapItem::sharedDataMutex_;
+std::shared_ptr<VectorMapData> VectorMapItem::sharedData_;
+QString VectorMapItem::sharedDataPath_;
+bool VectorMapItem::sharedDataLoadAttempted_ = false;
+QMutex VectorMapItem::geometryCacheMutex_;
+std::unordered_map<std::string, VectorMapItem::GeometryCachePtr>
+    VectorMapItem::geometryCaches_;
+
 VectorMapItem::VectorMapItem(QQuickPaintedItem* parent) : QQuickPaintedItem(parent) {
     // QML 里尺寸由 anchors 决定，这里不自己算。
     setFlag(ItemHasContents, true);
@@ -140,8 +148,21 @@ void VectorMapItem::setDistrictIntensity(const QVariantMap& v) {
 
 void VectorMapItem::ensureLoaded() {
     if (ready_) return;
-    if (data_.loadFromFile(resolveDataPath().toStdString())) {
-        featureCount_ = static_cast<int>(data_.featureCount());
+
+    const QString path = resolveDataPath();
+    {
+        QMutexLocker locker(&sharedDataMutex_);
+        if (!sharedDataLoadAttempted_ || sharedDataPath_ != path) {
+            auto data = std::make_shared<VectorMapData>();
+            sharedData_ = data->loadFromFile(path.toStdString()) ? std::move(data) : nullptr;
+            sharedDataPath_ = path;
+            sharedDataLoadAttempted_ = true;
+        }
+        data_ = sharedData_;
+    }
+
+    if (data_) {
+        featureCount_ = static_cast<int>(data_->featureCount());
         ready_ = true;
         invalidateCache();
         emit readyChanged();
@@ -150,88 +171,102 @@ void VectorMapItem::ensureLoaded() {
 
 void VectorMapItem::invalidateCache() {
     pathsBuilt_ = false;
+    geometryCache_.reset();
 }
 
 void VectorMapItem::rebuildCache() {
-    paths_.clear();
-    bounds_.clear();
-    names_.clear();
+    geometryCache_.reset();
     cachedLayer_ = layerName_;
     cachedGcjShift_ = gcjShift_;
     pathsBuilt_ = true;
 
     if (!ready_ || layerName_.isEmpty()) return;
-    const VectorLayer* layer = data_.layer(layerName_.toStdString());
+    const VectorLayer* layer = data_->layer(layerName_.toStdString());
     if (!layer) return;
 
-    // 所有几何按**固定参考层级**投影一次（见类注释）：墨卡托对 worldSize 线性，
-    // 绘制时乘 2^(zoom-kRefZoom) 即得任意连续 zoom 的精确结果。zoom 变化不再重建，
-    // 因此缩放动画不会在跨整数层级时卡一下。
-    const double size = worldSize(kRefZoom);
-    paths_.reserve(layer->features.size());
-    bounds_.reserve(layer->features.size());
-    names_.reserve(layer->features.size());
-
-    const bool isDistrict = layerName_ == QStringLiteral("district");
-
-    for (const VectorFeature& f : layer->features) {
-        // 视口外的要素不必建路径：全国范围下区县层几乎总是部分可见，
-        // 但世界层在 z>=8 时 95% 的要素都在屏外。
-        QPainterPath path;
-        bool any = false;
-        GeoBounds b;
-        bool first = true;
-
-        for (const GeoRing& ring : f.polygon) {
-            if (ring.size() < 3) continue;
-            path.moveTo(ring.front().second, ring.front().first);
-            for (std::size_t i = 1; i < ring.size(); ++i) {
-                double lon = ring[i].second;
-                double lat = ring[i].first;
-                // GCJ-02 纠偏只在预投影时施加一次，绝不放进绘制循环。
-                if (gcjShift_ && isDistrict) {
-                    const auto p = CoordinateTransform::wgs84ToGcj02(lat, lon);
-                    lat = p.first;
-                    lon = p.second;
-                }
-                path.lineTo(lon, lat);
-            }
-            any = true;
-
-            for (const auto& pt : ring) {
-                if (first) {
-                    b.minLat = b.maxLat = pt.first;
-                    b.minLon = b.maxLon = pt.second;
-                    first = false;
-                } else {
-                    b.minLat = std::min(b.minLat, pt.first);
-                    b.maxLat = std::max(b.maxLat, pt.first);
-                    b.minLon = std::min(b.minLon, pt.second);
-                    b.maxLon = std::max(b.maxLon, pt.second);
-                }
-            }
+    const std::string cacheKey = layerName_.toStdString() + (gcjShift_ ? ":gcj" : ":wgs");
+    {
+        QMutexLocker locker(&geometryCacheMutex_);
+        const auto cached = geometryCaches_.find(cacheKey);
+        if (cached != geometryCaches_.end()) {
+            geometryCache_ = cached->second;
+            return;
         }
-        if (!any) continue;
 
-        // 经纬度 -> 参考层级世界像素（绘制时再统一乘 2^(zoom-kRefZoom)）。
-        QPainterPath projected;
-        projected.setFillRule(Qt::OddEvenFill);  // 洞靠 even-odd 自然镂空
-        projected.reserve(path.elementCount());
-        for (int i = 0; i < path.elementCount(); ++i) {
-            const auto& e = path.elementAt(i);
-            if (e.isMoveTo()) {
-                const double lon = e.x;
-                const double lat = qBound(-kLatLimit, e.y, kLatLimit);
-                projected.moveTo((lon + 180.0) / 360.0 * size, projY(lat, size));
-            } else if (e.isLineTo()) {
-                const double lon = e.x;
-                const double lat = qBound(-kLatLimit, e.y, kLatLimit);
-                projected.lineTo((lon + 180.0) / 360.0 * size, projY(lat, size));
+        auto built = std::make_shared<GeometryCache>();
+
+        // 所有几何按**固定参考层级**投影一次（见类注释）：墨卡托对 worldSize 线性，
+        // 绘制时乘 2^(zoom-kRefZoom) 即得任意连续 zoom 的精确结果。zoom 变化不再重建，
+        // 因此缩放动画不会在跨整数层级时卡一下。
+        const double size = worldSize(kRefZoom);
+        built->paths.reserve(layer->features.size());
+        built->bounds.reserve(layer->features.size());
+        built->names.reserve(layer->features.size());
+
+        const bool isDistrict = layerName_ == QStringLiteral("district");
+
+        for (const VectorFeature& f : layer->features) {
+            // 视口外的要素不必建路径：全国范围下区县层几乎总是部分可见，
+            // 但世界层在 z>=8 时 95% 的要素都在屏外。
+            QPainterPath path;
+            bool any = false;
+            GeoBounds b;
+            bool first = true;
+
+            for (const GeoRing& ring : f.polygon) {
+                if (ring.size() < 3) continue;
+                path.moveTo(ring.front().second, ring.front().first);
+                for (std::size_t i = 1; i < ring.size(); ++i) {
+                    double lon = ring[i].second;
+                    double lat = ring[i].first;
+                    // GCJ-02 纠偏只在预投影时施加一次，绝不放进绘制循环。
+                    if (gcjShift_ && isDistrict) {
+                        const auto p = CoordinateTransform::wgs84ToGcj02(lat, lon);
+                        lat = p.first;
+                        lon = p.second;
+                    }
+                    path.lineTo(lon, lat);
+                }
+                any = true;
+
+                for (const auto& pt : ring) {
+                    if (first) {
+                        b.minLat = b.maxLat = pt.first;
+                        b.minLon = b.maxLon = pt.second;
+                        first = false;
+                    } else {
+                        b.minLat = std::min(b.minLat, pt.first);
+                        b.maxLat = std::max(b.maxLat, pt.first);
+                        b.minLon = std::min(b.minLon, pt.second);
+                        b.maxLon = std::max(b.maxLon, pt.second);
+                    }
+                }
             }
+            if (!any) continue;
+
+            // 经纬度 -> 参考层级世界像素（绘制时再统一乘 2^(zoom-kRefZoom)）。
+            QPainterPath projected;
+            projected.setFillRule(Qt::OddEvenFill);  // 洞靠 even-odd 自然镂空
+            projected.reserve(path.elementCount());
+            for (int i = 0; i < path.elementCount(); ++i) {
+                const auto& e = path.elementAt(i);
+                if (e.isMoveTo()) {
+                    const double lon = e.x;
+                    const double lat = qBound(-kLatLimit, e.y, kLatLimit);
+                    projected.moveTo((lon + 180.0) / 360.0 * size, projY(lat, size));
+                } else if (e.isLineTo()) {
+                    const double lon = e.x;
+                    const double lat = qBound(-kLatLimit, e.y, kLatLimit);
+                    projected.lineTo((lon + 180.0) / 360.0 * size, projY(lat, size));
+                }
+            }
+            built->paths.push_back(std::move(projected));
+            built->bounds.push_back(b);
+            built->names.push_back(f.name);
         }
-        paths_.push_back(std::move(projected));
-        bounds_.push_back(b);
-        names_.push_back(f.name);
+
+        geometryCache_ = built;
+        geometryCaches_.emplace(cacheKey, std::move(built));
     }
 }
 
@@ -242,7 +277,7 @@ void VectorMapItem::paint(QPainter* painter) {
         rebuildCache();
         cacheValid_ = false;   // 投影结构变了，离屏缓存作废
     }
-    if (paths_.empty()) return;
+    if (!geometryCache_ || geometryCache_->paths.empty()) return;
 
     const double refSize = worldSize(kRefZoom);
     const double scale = std::pow(2.0, zoom_ - kRefZoom);
@@ -361,8 +396,8 @@ void VectorMapItem::drawLayerContent(QPainter& painter, double vw, double vh) {
     painter.setBrush(fillColor_);
 
     const bool isDistrict = layerName_ == QStringLiteral("district");
-    for (std::size_t i = 0; i < paths_.size(); ++i) {
-        const GeoBounds& b = bounds_[i];
+    for (std::size_t i = 0; i < geometryCache_->paths.size(); ++i) {
+        const GeoBounds& b = geometryCache_->bounds[i];
         // 纬度裁剪与经度副本无关，先做一次。
         if (b.minLat > viewNorth || b.maxLat < viewSouth) continue;
 
@@ -372,7 +407,8 @@ void VectorMapItem::drawLayerContent(QPainter& painter, double vw, double vh) {
             // 区县层**平时完全透明**（对齐 kanameishi 的 eewBaseMapDefaultFill/Stroke，
             // 两者 alpha 均为 0）：只在有震度的区县才描边 + 填色。
             // 否则 1011 条描边会在地图上铺满网格，反而看不清底图。
-            const auto it = districtIntensity_.constFind(QString::fromStdString(names_[i]));
+            const auto it = districtIntensity_.constFind(
+                QString::fromStdString(geometryCache_->names[i]));
             if (it != districtIntensity_.constEnd()) {
                 const auto rgb = intensity_palette::intensityColor(it.value().toDouble());
                 // 填充用满不透明（kanameishi 的 classNameColors fillOpacity: 1），
@@ -405,12 +441,12 @@ void VectorMapItem::drawLayerContent(QPainter& painter, double vw, double vh) {
             if (fill.alpha() > 0) {
                 painter.setPen(Qt::NoPen);
                 painter.setBrush(fill);
-                painter.drawPath(paths_[i]);
+                painter.drawPath(geometryCache_->paths[i]);
             }
             if (wantsStroke) {
                 painter.setPen(pen);
                 painter.setBrush(Qt::NoBrush);
-                painter.drawPath(paths_[i]);
+                painter.drawPath(geometryCache_->paths[i]);
             }
             painter.restore();
         }

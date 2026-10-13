@@ -2,12 +2,14 @@
 
 #include <QColor>
 #include <QImage>
+#include <QMutex>
 #include <QtGlobal>
 #include <QPainterPath>
 #include <QQuickPaintedItem>
 #include <QVariantMap>
 #include <QtQml/qqmlregistration.h>
 #include <memory>
+#include <unordered_map>
 
 #include "core/vector_map_data.h"
 
@@ -110,6 +112,26 @@ private:
     /// 与坐标量级都适中：z 跨度 1..18 时最大放大 2^8，与逐层级投影的旧实现同量级。
     static constexpr int kRefZoom = 10;
 
+    struct GeometryCache {
+        std::vector<QPainterPath> paths;
+        std::vector<GeoBounds> bounds;
+        std::vector<std::string> names;
+    };
+
+    using GeometryCachePtr = std::shared_ptr<const GeometryCache>;
+
+    /// All map items in one MapView use the same immutable source data. Keeping this
+    /// process-local avoids parsing the 3.7 MiB .kvb once per visible layer.
+    static QMutex sharedDataMutex_;
+    static std::shared_ptr<VectorMapData> sharedData_;
+    static QString sharedDataPath_;
+    static bool sharedDataLoadAttempted_;
+
+    /// Projection depends only on layer + GCJ mode, not on paint style or camera.
+    /// Share it too so world/province/district items do not rebuild identical geometry.
+    static QMutex geometryCacheMutex_;
+    static std::unordered_map<std::string, GeometryCachePtr> geometryCaches_;
+
     QString layerName_;
     double centerLat_ = 35.0;
     double centerLon_ = 105.0;
@@ -123,17 +145,13 @@ private:
 
     bool ready_ = false;
     int featureCount_ = 0;
-    VectorMapData data_;
+    std::shared_ptr<VectorMapData> data_;
 
     /// 投影缓存。路径坐标为「参考层级 [kRefZoom] 下的世界像素」，绘制时整体缩放。
     bool pathsBuilt_ = false;
     bool cachedGcjShift_ = false;
     QString cachedLayer_;
-    std::vector<QPainterPath> paths_;
-    /// 与 paths_ 同序的经纬度包围盒，用于视口裁剪。
-    std::vector<GeoBounds> bounds_;
-    /// 与 paths_ 同序的要素名，用于区县烈度查表。
-    std::vector<std::string> names_;
+    GeometryCachePtr geometryCache_;
 
     /// 把「视口 + 四周 margin」渲成一张离屏位图。相机在 margin 范围内且缩放系数未明显
     /// 变化时，只对位图做仿射变换（平移 + 等比缩放），不再光栅化多边形 ——

@@ -12,22 +12,13 @@ const char* const kRoman[] = {
     "0", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII",
 };
 constexpr int kRomanCount = 13;
+constexpr double kWaveFadeStartRatio = 0.95;
 
 /// 中国大陆 CEA 烈度衰减关系（对齐参考实现 kanameishi 的 calcCeaCsis）。
 double ceaCsis(double magnitude, double distanceKm) {
     return 1.297 * magnitude - 4.368 * std::log10(distanceKm + 15.0) + 5.363;
 }
 
-/// 在 [minRadius, maxRadius] 上从 maxOpacity 过渡到 minOpacity（对齐 kanameishi 的 calcOpacity）。
-double rampedOpacity(double radius, double minRadius, double maxRadius, double minOpacity, double maxOpacity) {
-    if (maxRadius <= minRadius) return radius <= minRadius ? maxOpacity : minOpacity;
-    if (radius <= minRadius * 0.2 + maxRadius * 0.8) return maxOpacity;
-    if (radius >= maxRadius) return minOpacity;
-    const double k = 5.0 * (minOpacity - maxOpacity) / (maxRadius - minRadius);
-    const double b = (5.0 * maxOpacity * maxRadius - 4.0 * minOpacity * maxRadius - minOpacity * minRadius) /
-                     (maxRadius - minRadius);
-    return k * radius + b;
-}
 } // namespace
 
 double IntensityCalculator::rawCsis(double magnitude, double distanceKm, double depthKm) {
@@ -65,15 +56,19 @@ double IntensityCalculator::distanceForCsis(double magnitude, double depthKm, do
 }
 
 double IntensityCalculator::waveOpacity(double radiusKm, double fadeKm, double hardMaxKm) {
-    if (radiusKm <= 0.0 || fadeKm <= 0.0 || radiusKm >= hardMaxKm) return 0.0;
-    return radiusKm <= fadeKm ? rampedOpacity(radiusKm, 0.0, fadeKm, 0.25, 1.0)
-                              : rampedOpacity(radiusKm, fadeKm, hardMaxKm, 0.0, 0.25);
+    const double fadeEndKm = std::min(fadeKm, hardMaxKm);
+    if (radiusKm <= 0.0 || fadeEndKm <= 0.0 || radiusKm >= fadeEndKm) return 0.0;
+    const double fadeStartKm = fadeEndKm * kWaveFadeStartRatio;
+    if (radiusKm <= fadeStartKm) return 1.0;
+    return std::clamp((fadeEndKm - radiusKm) / (fadeEndKm - fadeStartKm), 0.0, 1.0);
 }
 
 double IntensityCalculator::waveFillOpacity(double radiusKm, double fadeKm) {
     // 与描边不同：填充只画在影响半径内（与 kanameishi 的 sWaveFill 一致），且由 0.25 递减到 0。
     if (radiusKm <= 0.0 || fadeKm <= 0.0 || radiusKm > fadeKm) return 0.0;
-    return rampedOpacity(radiusKm, 0.0, fadeKm, 0.0, 0.25);
+    const double fadeStartKm = fadeKm * kWaveFadeStartRatio;
+    if (radiusKm <= fadeStartKm) return 0.25;
+    return std::clamp(0.25 * (fadeKm - radiusKm) / (fadeKm - fadeStartKm), 0.0, 0.25);
 }
 
 int IntensityCalculator::displayLevel(double raw) {

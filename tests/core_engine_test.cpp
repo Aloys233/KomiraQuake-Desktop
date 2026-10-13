@@ -73,8 +73,12 @@ int main(int argc, char** argv) {
               IntensityCalculator::distanceForCsis(4.0, 10.0, 1.0),
           "fade radius grows with magnitude");
     check(near(IntensityCalculator::distanceForCsis(0.0, 10.0, 1.0), 0.0), "fade radius zero for M0");
-    check(near(IntensityCalculator::waveOpacity(400.0, 1000.0), 1.0), "wave opacity full inside 0.8fade");
-    check(near(IntensityCalculator::waveOpacity(1000.0, 1000.0), 0.25), "wave opacity 0.25 at fade");
+    check(near(IntensityCalculator::waveOpacity(950.0, 1000.0), 1.0),
+          "wave opacity stays full through first 95 percent");
+    check(IntensityCalculator::waveOpacity(990.0, 1000.0) > 0.0,
+          "wave opacity fades only in final 5 percent");
+    check(near(IntensityCalculator::waveOpacity(1000.0, 1000.0), 0.0),
+          "wave opacity ends at CSIS I");
     check(near(IntensityCalculator::waveOpacity(10000.0, 1000.0), 0.0), "wave opacity 0 at hard max");
     check(near(IntensityCalculator::waveOpacity(12000.0, 1000.0), 0.0), "wave opacity 0 beyond hard max");
     // S 波填充只在影响半径内可见，且由 0.25 递减到 0。

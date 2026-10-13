@@ -574,6 +574,42 @@ private slots:
         }
     }
 
+    /// 栅格瓦片预取必须有界：单层只预取一圈，跨层过渡最多保留当前层 + 一层底衬。
+    /// 这条护栏锁住的是 delegate 数量，而不是网络是否可用。
+    void rasterTilePrefetchStaysBounded() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("RasterTilePrefetchTest");
+
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("osm");
+        controller.settings()->setVectorOverlay(false);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(mapView);
+
+        QTRY_VERIFY_WITH_TIMEOUT(mapView->property("tileCount").toInt() > 0, 1000);
+        QCOMPARE(mapView->property("prefetchMargin").toInt(), 1);
+        QVERIFY2(mapView->property("tileCount").toInt() <= 80,
+                 "single raster layer should stay within one-prefetch-ring budget");
+
+        mapView->setProperty("zoom", 7.0);
+        QTest::qWait(100);
+        QVERIFY2(mapView->property("tileCount").toInt() <= 160,
+                 "zoom transition should retain at most two bounded tile layers");
+    }
+
     void districtShadingClearsOnCanceledReport() {
         QTemporaryDir isolated;
         QVERIFY(isolated.isValid());

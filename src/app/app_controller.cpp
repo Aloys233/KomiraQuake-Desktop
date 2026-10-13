@@ -201,8 +201,8 @@ AppController::AppController(QObject* parent, bool startServices)
     countdownTimer_.setInterval(1000);
     connect(&countdownTimer_, &QTimer::timeout, this, &AppController::onTick);
 
-    // 波前圆按 10 Hz 重算，只在焦点事件"还年轻"时跑（见 updateWaveTimer）。
-    waveTimer_.setInterval(100);
+    // 波前圆按显示帧率重算，只在焦点事件"还年轻"时跑（见 updateWaveTimer）。
+    waveTimer_.setInterval(16);
     connect(&waveTimer_, &QTimer::timeout, this, &AppController::updateWaveRadii);
 
     // 自动焦点跨过 10 分钟窗口时刷新一次 HUD 可见性（无需等下一次数据/告警）。

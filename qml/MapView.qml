@@ -103,8 +103,8 @@ Item {
         NumberAnimation { duration: root.followSmoothMs; easing.type: Easing.Linear }
     }
 
-    // 波前半径的显示值（km）。AppController 只按 10Hz 推送半径（见 updateWaveRadii），
-    // 波前圆直接绑定的话就是一圈一圈地跳；这里把半径本身插值到显示帧率。
+    // 波前半径的显示值（km）。AppController 按显示帧率推送半径（见 updateWaveRadii），
+    // 半径本身仍做 120ms 插值，掩盖走时表离散点。
     // 平滑半径（km）而非像素宽度：宽度还含 pxPerKmValue，镜头缩放期间它每帧都在变，
     // 平滑宽度会与 zoom 的 Behavior 叠加成两层滞后。
     // 波前结束（半径归 -1）时 Behavior 关闭，半径立即归零：此时圆已 visible:false，
@@ -201,17 +201,16 @@ Item {
         frameChina(false);
     }
     /// **显式**聚焦震中：工具条「跟随震中」按钮与「选中事件」都走这里。
-    /// 与自动跟随（frameEvent）不同，显式动作必须始终把镜头带过去 —— 否则波前一淡出
-    /// （faded 早退）按钮就只会点亮状态却不动镜头，看着就是「失效」。
+    /// 与自动跟随共用同一套可见波前半径，显式动作也能把镜头带到仍在淡出的波前。
     function focusEvent() {
-        frameEventImpl(undefined, true);
+        frameEventImpl(undefined);
     }
     /// 自动聚焦震中区域（不并入用户所在地）：半径跟随 P/S 波前，连续（无级）缩放。
     /// animate === false 用于波前逐帧重取景，避免与 420ms 补间互相追赶。
     function frameEvent(animate) {
-        frameEventImpl(animate, false);
+        frameEventImpl(animate);
     }
-    function frameEventImpl(animate, explicitFocus) {
+    function frameEventImpl(animate) {
         following = true;
         idleResetTimer.stop();
         if (!hasEvent || width <= 0 || height <= 0) return;
@@ -223,16 +222,8 @@ Item {
         const pKm = root.wavePKmShown;
         const sKm = root.waveSKmShown;
         const hasWaves = pKm > 0 || sKm > 0;
-        // 波前已大到看不见（opacity 降到 0.25，即超过 CSIS 可感半径）就冻住镜头，
-        // 不再继续缩小去装一个几乎透明的圈；等波前彻底消失再由 resetView 归位。
-        // C++ 侧已按 fadeKm 过滤并给出 pOpacity/sOpacity，这里直接用其等价判据。
-        // 注意：该冻结只针对**自动**跟随；显式聚焦（explicitFocus）不受它限制。
-        const faded = (app.waveRadii.pOpacity || 0) <= 0.25 || (app.waveRadii.sOpacity || 0) <= 0.25;
-        if (hasWaves && faded && !explicitFocus) return;
-        // 显式聚焦遇到已淡出的波前时，用一个可感范围半径（与无波前时同为 300 km），
-        // 免得为了一个几乎看不见的大圈把镜头一路拉到全国乃至半球。
-        const radiusKm = (hasWaves && faded) ? 300
-                                              : (hasWaves ? Math.max(100, pKm, sKm) : 300);
+        // CSIS I 是共同终点；描边只在终点前最后一点范围内淡出，相机跟随到同一边界。
+        const radiusKm = hasWaves ? Math.max(100, pKm, sKm) : 300;
         const r = radiusKm * 256 / (360 * 111.32 * Math.max(0.01, Math.cos(shiftedHypo.lat * Math.PI / 180)));
         const minX = x - r, maxX = x + r, minY = y - r, maxY = y + r;
         const left = Math.min(hudWidth + 24, width * 0.5);
@@ -249,17 +240,47 @@ Item {
 
     /// 波前（P/S）是否出现过。用于识别"波前消失"的瞬间并自动回到默认视野。
     property bool wavesShown: false
+    /// 波前/事件结束后保留当前镜头一段时间，避免刚结束就把用户视野拉走。
+    readonly property int eventEndResetMs: 2 * 60 * 1000
+    property string pendingEventEndId: ""
     /// 波前出现/结束：供主窗口收起 HUD 等使用。
     signal wavesStarted()
     signal wavesFinished()
 
-    // 波前约 10Hz 变化时无级跟随：duration 0 直接赋值，避免每 tick 重启 420ms 补间。
+    function eventIdentity() {
+        return root.event && root.event.id !== undefined ? String(root.event.id) : "";
+    }
+    function cancelEventEndReset() {
+        eventEndResetTimer.stop();
+        root.pendingEventEndId = "";
+    }
+
+    Timer {
+        id: eventEndResetTimer
+        interval: root.eventEndResetMs
+        repeat: false
+        onTriggered: {
+            const currentId = root.eventIdentity();
+            // 空事件表示原事件已从焦点中移除；同一 ID 则表示仍停留在已结束事件。
+            // 只有切换到了另一场事件才取消本次延迟回位。
+            if (root.pendingEventEndId !== "" && currentId !== "" &&
+                currentId !== root.pendingEventEndId) {
+                root.pendingEventEndId = "";
+                return;
+            }
+            root.pendingEventEndId = "";
+            root.resetView();
+        }
+    }
+
+    // 波前按显示帧率变化时无级跟随：duration 0 直接赋值，避免每 tick 重启 420ms 补间。
     // 初次聚焦的入场补间结束后（cameraMove 停止）才接管，避免打断入场动画。
     Connections {
         target: app
         function onWaveRadiiChanged() {
             const hasWaves = (app.waveRadii.pKm || 0) > 0 || (app.waveRadii.sKm || 0) > 0;
             if (hasWaves) {
+                root.cancelEventEndReset();
                 if (!root.wavesShown) {
                     root.wavesShown = true;
                     root.wavesStarted();
@@ -270,14 +291,15 @@ Item {
                 return;
             }
             // 波前全部消失（走完/淡出/事件结束）。仍聚焦（app.hasMapFocus）说明是自然结束而非
-            // 用户取消焦点：若之前在跟随震中，自动回到我的位置（无定位则全国概览），并收起 HUD。
-            // 用户手动操作过镜头（following=false）时不抢镜头。若有活动预警，继续保持在预警事件视野。
+            // 用户取消焦点：若之前在跟随震中，立即取消跟随，延迟 2 分钟回到默认镜头。
+            // 用户手动操作过镜头（following=false）时不抢镜头。
             if (!root.wavesShown) return;
             root.wavesShown = false;
             if (!app.hasMapFocus) return;
             if (root.following) {
-                if (root.warningActive && root.hasEvent) root.frameEvent(false);
-                else root.resetView();
+                root.pendingEventEndId = root.eventIdentity();
+                root.following = false;
+                eventEndResetTimer.restart();
             }
             root.wavesFinished();
         }
@@ -295,7 +317,16 @@ Item {
             else root.resetView();
         }
     }
-    function noteCameraInteraction() { idleResetTimer.restart(); }
+    function noteCameraInteraction() {
+        cancelEventEndReset();
+        idleResetTimer.restart();
+    }
+
+    onEventChanged: {
+        const currentId = root.eventIdentity();
+        if (eventEndResetTimer.running && currentId !== "" &&
+            currentId !== root.pendingEventEndId) root.cancelEventEndReset();
+    }
     /// 当前（或目标）整数缩放层级：相机动画进行中取动画目标，否则取当前值。
     /// 以目标为基准，快速连续滚动时每一格都实打实 ±1，不会被进行中的补间吞掉。
     readonly property int zoomLevel: cameraMove.running ? Math.round(camZoom.to) : Math.round(zoom)
@@ -351,8 +382,9 @@ Item {
     readonly property int tileZoom: Math.max(0, Math.min(18, Math.round(zoom)))
     readonly property real tileScale: Math.pow(2, zoom - tileZoom)
     readonly property real scaledTile: tileSize * tileScale
-    /// 视口外多取两圈，平移时新露出的瓦片已就绪，不会一格一格拼出来。
-    readonly property int prefetchMargin: 2
+    /// 视口外预取一圈，避免缩放/切层时同时创建过多 Image delegate。
+    /// 拖动跨过边界时只补一条边，旧层仍负责兜底。
+    readonly property int prefetchMargin: 1
     /// 瓦片就绪后淡入时长（ms）：掩盖跨层级切换时清晰度突变造成的顿挫。
     readonly property int tileFadeMs: 180
 
@@ -369,6 +401,10 @@ Item {
     property int underlayZ: -1
     /// 顶层瓦片状态表：key "tz:tx:ty" -> Image.status，用于判断新层是否已加载完成。
     property var tileStatus: ({})
+    /// 当前顶层尚未结算（Null/Loading）的瓦片数。状态变化增量维护，避免每张瓦片
+    /// Loading/Ready 都遍历整个 ListModel。
+    property int topLayerPendingTiles: 0
+    property int topLayerTileCount: 0
     /// 底衬兜底上限：顶层若始终未就绪（持续失败/超时），也不无限保留底衬。
     Timer {
         id: underlayMaxTimer
@@ -385,6 +421,8 @@ Item {
         // 旧顶层降级为底衬；更早的底衬在 syncTiles 里被丢弃，最多保留两层。
         root.underlayZ = root.tileModelZoom < 0 ? -1 : root.tileModelZoom;
         root.tileModelZoom = root.tileZoom;
+        root.topLayerPendingTiles = 0;
+        root.topLayerTileCount = 0;
         if (root.underlayZ >= 0) underlayMaxTimer.restart();
         Qt.callLater(syncTiles);
     }
@@ -408,33 +446,62 @@ Item {
         const u = root.underlayZ;
         if (u < 0) return;
         for (let i = tileModel.count - 1; i >= 0; --i) {
-            if (tileModel.get(i).tz === u) tileModel.remove(i);
+            if (tileModel.get(i).tz === u) removeTileAt(i);
         }
         root.underlayZ = -1;
     }
 
+    function tileStatusKey(tz, tx, ty) { return tz + ":" + tx + ":" + ty; }
+    function tileIsPending(status) {
+        return status === undefined || status === Image.Null || status === Image.Loading;
+    }
+
     function noteTileStatus(tz, tx, ty, status) {
-        tileStatus[tz + ":" + tx + ":" + ty] = status;
+        const key = tileStatusKey(tz, tx, ty);
+        const oldStatus = tileStatus[key];
+        tileStatus[key] = status;
+        if (tz === tileModelZoom && tileIsPending(oldStatus) !== tileIsPending(status)) {
+            root.topLayerPendingTiles += tileIsPending(status) ? 1 : -1;
+        }
         refreshTopLayerState();
     }
     function forgetTileStatus(tz, tx, ty) {
-        delete tileStatus[tz + ":" + tx + ":" + ty];
+        delete tileStatus[tileStatusKey(tz, tx, ty)];
+    }
+    function removeTileAt(index) {
+        const e = tileModel.get(index);
+        const key = tileStatusKey(e.tz, e.tx, e.ty);
+        if (e.tz === tileModelZoom) {
+            if (tileIsPending(tileStatus[key])) {
+                root.topLayerPendingTiles = Math.max(0, root.topLayerPendingTiles - 1);
+            }
+            root.topLayerTileCount = Math.max(0, root.topLayerTileCount - 1);
+        }
+        delete tileStatus[key];
+        tileModel.remove(index);
+    }
+
+    function recountTopLayerPending() {
+        let pending = 0;
+        let total = 0;
+        for (let i = 0; i < tileModel.count; ++i) {
+            const e = tileModel.get(i);
+            if (e.tz === tileModelZoom) {
+                total++;
+                if (tileIsPending(tileStatus[tileStatusKey(e.tz, e.tx, e.ty)])) {
+                    pending++;
+                }
+            }
+        }
+        root.topLayerPendingTiles = pending;
+        root.topLayerTileCount = total;
     }
     /// 顶层瓦片全部结算（Ready/Error，无 Loading/Null）才撤掉底衬，
     /// 避免冷瓦片（如 Petal 高层）加载慢时被固定计时器提前撤走而露白。
     /// 就绪后再等 tileFadeMs，让新层淡入完成，避免淡入期间露底。
     function refreshTopLayerState() {
         if (underlayZ < 0) return;
-        const z = tileModelZoom;
-        let total = 0, loading = 0;
-        for (let i = 0; i < tileModel.count; ++i) {
-            const e = tileModel.get(i);
-            if (e.tz !== z) continue;
-            total++;
-            const st = tileStatus[e.tz + ":" + e.tx + ":" + e.ty];
-            if (st === undefined || st === Image.Null || st === Image.Loading) loading++;
-        }
-        if (total > 0 && loading === 0) {
+        if (topLayerTileCount > 0 && topLayerPendingTiles === 0) {
             if (!underlayFadeTimer.running) underlayFadeTimer.start();
         } else {
             underlayFadeTimer.stop();
@@ -447,7 +514,7 @@ Item {
         // 纯矢量底图不加载栅格瓦片：直接清空并返回，避免为看不见的底图发请求。
         if (root.isVectorOnly()) {
             if (tileModel.count > 0) {
-                for (let i = tileModel.count - 1; i >= 0; --i) tileModel.remove(i);
+                for (let i = tileModel.count - 1; i >= 0; --i) removeTileAt(i);
                 retireUnderlay();
             }
             return;
@@ -465,11 +532,13 @@ Item {
         for (let i = tileModel.count - 1; i >= 0; --i) {
             const e = tileModel.get(i);
             if (e.tz === z) {
-                if (!keep[e.tz + ":" + e.tx + ":" + e.ty]) tileModel.remove(i);
+                if (!keep[e.tz + ":" + e.tx + ":" + e.ty]) removeTileAt(i);
             } else if (e.tz !== underlayZ) {
-                tileModel.remove(i);   // 只保留当前层与唯一底衬层
+                removeTileAt(i);   // 只保留当前层与唯一底衬层
             }
         }
+        // 处理回切到仍保留的底衬层，并把本次差集同步变成增量状态基线。
+        recountTopLayerPending();
         const have = ({});
         for (let i = 0; i < tileModel.count; ++i) {
             const e = tileModel.get(i);
@@ -478,6 +547,9 @@ Item {
         for (const key in keep) {
             if (have[key]) continue;
             const parts = key.split(":");
+            tileStatus[key] = Image.Null;
+            root.topLayerPendingTiles++;
+            root.topLayerTileCount++;
             tileModel.append({ tx: parseInt(parts[1]), ty: parseInt(parts[2]), tz: z });
         }
         refreshTopLayerState();
