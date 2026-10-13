@@ -1,11 +1,13 @@
 #pragma once
 
+#include <QFutureWatcher>
 #include <QHash>
 #include <QList>
 #include <QObject>
 #include <QPointF>
 #include <QStringList>
 #include <functional>
+#include <memory>
 #include <vector>
 #include "core/warning_session.h"
 #include <QTimer>
@@ -208,11 +210,17 @@ private:
     /// 焦点事件"还年轻"（发震时刻在窗口内）时跑 100ms 波前定时器，否则停。
     void updateWaveTimer();
     void updateWaveRadii();
-    /// 安排一次区县烈度重算：合并 100 ms 内的多次事件变更，只算最后一��。
+    /// 安排一次区县烈度重算：合并 80 ms 内的多次事件变更，只算最后一��。
     void scheduleDistrictRefresh();
-    /// 区县烈度重算本体（在 worker 线程跑；1011 个面约 3 ms，但仍不占 UI 线程）。
+    /// 在当前焦点事件下派发一次区县烈度重算。计算本体跑在 worker 线程；已有任务在跑时
+    /// 只记待办，等它结束后再按届时最新状态算一次，保证任一时刻只有一个任务读矢量数据。
     void recomputeDistrictIntensity();
-    /// 在给定事件参数下算出「区县名 -> CSIS 烈度」，纯函数，供 worker 线程调用。
+    /// worker 线程算完回到主线程应用结果；期间有新请求则按最新状态再算一次。
+    void onDistrictComputed();
+    /// 应用一次结果：与当前值相同则不重复发信号。
+    void applyDistrictIntensity(QVariantMap next);
+    /// 在给定事件参数下算出「区县名 -> CSIS 烈度」，纯函数、不触碰任何 QObject，
+    /// 故可安全地在 worker 线程调用（矢量数据以不可变快照传入）。
     static QVariantMap computeDistrictIntensity(const VectorMapData& data, double magnitude,
                                                 double depthKm, double lat, double lon);
     void refreshEventModel();
@@ -223,11 +231,15 @@ private:
     static QString identityOf(const EarthquakeEvent& event);
     /// 两条报次是否描述同一次地震（发震时刻接近且震中邻近）。
     static bool samePhysicalEvent(const EarthquakeEvent& a, const EarthquakeEvent& b);
+    /// 是否为触发本地烈度限制且有倒计时的受保护关键预警
+    bool isProtectedAlert(const EarthquakeEvent& e, long long clockNow) const;
+    bool isProtectedAlert(const EarthquakeEvent& e) const { return isProtectedAlert(e, nowMs()); }
 
     bool startServices_ = true;
     bool directoryRefreshEnabled_ = true;
     std::function<long long()> nowProvider_;
     long long nowMs() const;
+    QString assetRoot_;
     SettingsStore* settings_ = nullptr;
     LocationService* location_ = nullptr;
     HistoryStore* historyStore_ = nullptr;
@@ -271,11 +283,16 @@ private:
     QTimer waveTimer_;
     QTimer hudRefreshTimer_;
     QTimer directoryUiTimer_;
-    /// 区县烈度重算的合并定时器 + 最近一次计算结果。
+    /// 区县烈度重算：80 ms 合并定时器 + 后台任务 + 最近一次结果。
     QTimer districtTimer_;
+    QFutureWatcher<QVariantMap> districtWatcher_;
+    /// 后台任务是否在跑；在跑时新请求只置 pending，保证任一时刻只有一个任务读矢量数据。
+    bool districtRunning_ = false;
+    bool districtPending_ = false;
     QVariantMap districtIntensity_;
-    /// 区县矢量数据（首次需要着色时才加载 3.7 MiB）。
-    VectorMapData districtData_;
+    /// 区县矢量数据（首次需要着色时加载 3.7 MiB）。加载后不再变更，worker 线程按
+    /// shared_ptr 读取 —— 即便 AppController 先析构，任务也不会读到悬垂数据。
+    std::shared_ptr<const VectorMapData> districtData_;
     double wavePKm_ = -1.0;
     double waveSKm_ = -1.0;
     double wavePOpacity_ = 0.0;

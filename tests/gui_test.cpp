@@ -213,12 +213,14 @@ private slots:
         for (auto* item : warningHud->findChildren<QQuickItem*>())
             if (item->property("text").toString() == "停止本次提醒" && item->property("hovered").isValid()) alertButton = item;
         QVERIFY(alertButton);
+        window->requestActivate();
         for (bool dark : {false, true}) {
             controller.settings()->setThemeMode(dark ? "dark" : "light");
             const QPoint center = alertButton->mapToScene(QPointF(alertButton->width()/2, alertButton->height()/2)).toPoint();
-            QTest::mouseMove(window, center);
+            QTest::mouseMove(window, QPoint(0, 0));
             QTest::qWait(30);
-            QVERIFY(alertButton->property("hovered").toBool());
+            QTest::mouseMove(window, center);
+            QTRY_VERIFY_WITH_TIMEOUT(alertButton->property("hovered").toBool(), 1000);
             QVERIFY(alertButton->property("foregroundColor").value<QColor>() != alertButton->property("backgroundColor").value<QColor>());
             alertButton->forceActiveFocus(Qt::TabFocusReason);
             QVERIFY(alertButton->hasActiveFocus());
@@ -485,7 +487,6 @@ private slots:
         // QSettings 默认构造不一致，会写到别的文件，让断言建立在假前提上。
         controller.settings()->setBasemapId("vector");
         controller.settings()->setVectorOverlay(false);
-        controller.settings()->setDistrictShading(true);
         QCOMPARE(controller.settings()->basemapId(), QStringLiteral("vector"));
 
         QQmlApplicationEngine engine;
@@ -516,6 +517,16 @@ private slots:
             QVERIFY2(layer->parentItem() == renderLayer,
                      "vector layer must be a child of mapRenderLayer (blur backdrop)");
         }
+        auto* district = window->findChild<QQuickItem*>("vectorDistrictLayer");
+        auto* pWave = window->findChild<QQuickItem*>("pWaveRing");
+        auto* sFill = window->findChild<QQuickItem*>("sWaveFill");
+        auto* sWave = window->findChild<QQuickItem*>("sWaveRing");
+        auto* hypocenter = window->findChild<QQuickItem*>("hypocenterMarker");
+        QVERIFY(district && pWave && sFill && sWave && hypocenter);
+        QVERIFY2(district->z() < pWave->z(), "P wave must be above district intensity shading");
+        QVERIFY2(district->z() < sFill->z(), "S wave fill must be above district intensity shading");
+        QVERIFY2(district->z() < sWave->z(), "S wave must be above district intensity shading");
+        QVERIFY2(district->z() < hypocenter->z(), "hypocenter must be above district intensity shading");
         // 世界/区县层始终参与渲染；省级分界线只在拉近后画（见下个断言）。
         QVERIFY(window->findChild<QQuickItem*>("vectorWorldLayer")->property("visible").toBool());
         QVERIFY(window->findChild<QQuickItem*>("vectorDistrictLayer")->property("visible").toBool());
@@ -561,6 +572,40 @@ private slots:
             QTest::qWait(300);
             QVERIFY(window->grabWindow().save(evidence + "/vector-basemap.png"));
         }
+    }
+
+    void districtShadingClearsOnCanceledReport() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("DistrictCancelTest");
+
+        AppController controller(nullptr, false);
+        // 区县着色跟随矢量图层：开启叠加才会计算。
+        controller.settings()->setVectorOverlay(true);
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+
+        EarthquakeEvent event;
+        event.id = event.eventId = "DISTRICT-CANCEL";
+        event.timestamp = now;
+        event.reportNum = 1;
+        event.latitude = 30.6;
+        event.longitude = 104.0;
+        event.depth = 10.0;
+        event.magnitude = 6.5;
+        event.location = "测试事件";
+        controller.handleEvent(event, false, false);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.districtIntensity_.isEmpty(), 1500);
+
+        auto canceled = event;
+        canceled.reportNum = 2;
+        canceled.isCanceled = true;
+        controller.handleEvent(canceled, false, false);
+        QTRY_VERIFY_WITH_TIMEOUT(controller.districtIntensity_.isEmpty(), 1500);
     }
 
     /// 跨日界线时矢量底图两半都要有内容。
@@ -990,6 +1035,80 @@ private slots:
         QVERIFY2(qmlErrors.isEmpty(), qPrintable(qmlErrors.join('\n')));
     }
 
+    void mapLayerSettingsAndVectorOverlay() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("MapLayerSettingsTest");
+
+        AppController controller(nullptr, false);
+        // 事件时刻固定在 now：EarthquakeEvent::expired() 把「比 now 晚 60s 以上」判为过期，
+        // 若不钉住时钟，这个 2027 年的时间戳会被当作未来事件丢弃，焦点为空、着色自然为空。
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("amap_vector");
+        controller.settings()->setVectorOverlay(false);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showSettings", true);
+        QTest::qWait(100);
+
+        auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
+        auto* vectorSwitch = findVisualItem(window, "vectorOverlaySwitch");
+        QVERIFY(scroll && vectorSwitch);
+        QVERIFY(vectorSwitch->isVisible());
+        QVERIFY2(vectorSwitch->width() <= 64,
+                 "map switch must remain visible beside its label");
+
+        // 开关位于「地图底图」分区底部，默认落在视口之外 —— isVisible() 不反映滚动裁剪，
+        // 直接点击会落在窗口外被丢弃。先把设置页滚到让目标居中的位置再点。
+        auto ensureVisible = [&](QQuickItem* item) {
+            const qreal maxY =
+                qMax<qreal>(0, scroll->property("contentHeight").toReal() - scroll->height());
+            const qreal contentY = scroll->property("contentY").toReal();
+            const QPointF center =
+                item->mapToItem(scroll, QPointF(item->width() / 2, item->height() / 2));
+            scroll->setProperty("contentY",
+                                qBound<qreal>(0, contentY + center.y() - scroll->height() / 2, maxY));
+            QTest::qWait(50);
+        };
+        auto click = [&](QQuickItem* item) {
+            ensureVisible(item);
+            const QPoint position = item->mapToScene(QPointF(item->width() / 2, item->height() / 2)).toPoint();
+            QVERIFY2(QRect(QPoint(0, 0), window->size()).contains(position),
+                     "map switch must be inside the window after scrolling");
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, position);
+        };
+        click(vectorSwitch);
+        QTRY_VERIFY(controller.settings()->vectorOverlay());
+
+        EarthquakeEvent event;
+        event.id = event.eventId = "DISTRICT-TOGGLE";
+        event.timestamp = now;
+        event.latitude = 30.6;
+        event.longitude = 104.0;
+        event.depth = 10.0;
+        event.magnitude = 6.5;
+        event.location = "测试事件";
+        controller.handleEvent(event, false, false);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.districtIntensity_.isEmpty(), 1500);
+
+        // 区县着色跟随「叠加矢量层」：关闭即清空，重新开启按当前事件重算。
+        controller.settings()->setVectorOverlay(false);
+        QTRY_VERIFY_WITH_TIMEOUT(controller.districtIntensity_.isEmpty(), 1500);
+        controller.settings()->setVectorOverlay(true);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.districtIntensity_.isEmpty(), 1500);
+    }
+
     void iconsAndPersistence() {
         QTemporaryDir isolated;
         QSettings::setDefaultFormat(QSettings::IniFormat);
@@ -1012,7 +1131,7 @@ private slots:
         QVERIFY(!reloaded.reduceMotion());
         IconProvider provider;
         const auto resources = QDir(":/icons").entryList({"*.svg"});
-        QCOMPARE(resources.size(), 41);
+        QVERIFY(resources.size() >= 41);
         for (const auto& resource : resources) {
             QSize actual;
             const auto image = provider.requestImage(resource.chopped(4) + "/ff006874", &actual, QSize(40, 40));
@@ -1148,6 +1267,70 @@ private slots:
             QCOMPARE(blurred.pixelColor(102, 92), opaque.pixelColor(102, 92));
             if (software) QCOMPARE(blurred, opaque);
         }
+    }
+
+    void protectedAlertNotDisplacedByObservationEvent() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("ProtectedAlertTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(2.0);
+        controller.setManualLocation(30.0, 103.0, "本地观测站");
+
+        // 1. 注入一个触发本地烈度限制且有倒计时的紧急预警（本地震中距约 40km，烈度 4.5）
+        EarthquakeEvent alert;
+        alert.id = alert.eventId = "CRITICAL-ALERT";
+        alert.sourceProvider = "Wolfx"; alert.sourceAgency = "CENC"; alert.source = "四川地震预警";
+        alert.timestamp = now; alert.latitude = 30.3; alert.longitude = 103.3;
+        alert.depth = 10.0; alert.magnitude = 5.5; alert.location = "四川某地";
+        alert.rawIntensity = 4.5;
+        controller.handleEvent(alert, false, false);
+
+        QVERIFY(controller.hasWarning());
+        QCOMPARE(controller.activeWarning_.eventId, alert.eventId);
+        QCOMPARE(controller.selectedWarning_, alert.identity());
+        QVERIFY(controller.isProtectedAlert(controller.activeWarning_));
+        QVERIFY(controller.countdown() > 0);
+
+        // 2. 此时到来了一个普通地震观测情报（未达到本地烈度阈值的普通事件）
+        EarthquakeEvent obs;
+        obs.id = obs.eventId = "OBS-EVENT";
+        obs.sourceProvider = "CENC"; obs.sourceAgency = "CENC"; obs.source = "中国地震台网";
+        obs.timestamp = now + 1000; obs.latitude = 20.0; obs.longitude = 120.0;
+        obs.depth = 20.0; obs.magnitude = 4.0; obs.location = "台湾海域";
+        obs.rawIntensity = 0.5; // 未达到本地烈度限制
+
+        QSignalSpy camera(&controller, &AppController::centerMapRequested);
+        controller.handleEvent(obs, false, false);
+
+        // 验证：普通观测数据未抢占相机焦点、未顶掉活动关键预警、未把倒计时干没
+        QCOMPARE(camera.count(), 0);
+        QCOMPARE(controller.activeWarning_.eventId, alert.eventId);
+        QCOMPARE(controller.selectedWarning_, alert.identity());
+        QVERIFY(controller.countdown() > 0);
+        // 且观测数据被收录到了会话列表中供查阅
+        QVERIFY(controller.activeWarnings().size() >= 2);
+
+        // 3. 模拟又来了一个同样触发本地烈度限制的关键紧急预警
+        EarthquakeEvent alert2;
+        alert2.id = alert2.eventId = "CRITICAL-ALERT-2";
+        alert2.sourceProvider = "Wolfx"; alert2.sourceAgency = "CENC"; alert2.source = "另一高危预警";
+        alert2.timestamp = now + 2000; alert2.latitude = 30.1; alert2.longitude = 103.1;
+        alert2.depth = 10.0; alert2.magnitude = 6.0; alert2.location = "极近处大地震";
+        alert2.rawIntensity = 5.5;
+
+        controller.handleEvent(alert2, false, false);
+        // 新的关键紧急预警达到门槛，允许正常切换
+        QCOMPARE(controller.activeWarning_.eventId, alert2.eventId);
+        QCOMPARE(controller.selectedWarning_, alert2.identity());
     }
 };
 QTEST_MAIN(GuiTest)

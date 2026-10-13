@@ -103,28 +103,20 @@ Column {
                 onActivated: index => app.settings.basemapId = ids[index]
             }
             // 栅格底图上叠加矢量层：选纯矢量底图时本就画矢量，无需再叠一层。
+            // 区县烈度着色跟随本开关，不再单独设置。
             Row {
                 width: parent.width; spacing: 10; visible: app.settings.basemapId !== "vector"
                 Text {
                     width: parent.width - 52; color: root.theme.textPrimary; font.pixelSize: 14
-                    text: "叠加矢量层（省界 / 区县）"
+                    text: "叠加矢量层（省界 / 区县着色）"
                 }
                 GlassSwitch {
+                    objectName: "vectorOverlaySwitch"
+                    width: 44
+                    text: ""
                     theme: root.theme; checked: app.settings.vectorOverlay
                     Accessible.name: "叠加矢量层"
                     onToggled: app.settings.vectorOverlay = checked
-                }
-            }
-            Row {
-                width: parent.width; spacing: 10
-                Text {
-                    width: parent.width - 52; color: root.theme.textPrimary; font.pixelSize: 14
-                    text: "区县烈度着色"
-                }
-                GlassSwitch {
-                    theme: root.theme; checked: app.settings.districtShading
-                    Accessible.name: "区县烈度着色"
-                    onToggled: app.settings.districtShading = checked
                 }
             }
         }

@@ -21,9 +21,11 @@ ApplicationWindow {
     function sameEvent(a, b) { return !!a && !!b && a.id === b.id && a.sourceTag === b.sourceTag; }
     // HUD 默认隐藏：仅活动预警或用户点击选中的事件才显示（hudEvent 由控制器裁决）。
     readonly property var hudEvent: app.hudEvent
-    // 波前走完后收起左上角 HUD；新的波前或切换到其它事件时恢复。
+    // 本地达标倒计时的受保护预警正在活动中：绝不能被收起或遮挡
+    readonly property bool hasProtectedWarning: app.alertEligible && !!app.activeWarning && (app.countdown >= 0 || app.hasWarning)
+    // 波前走完后收起左上角 HUD；新的波前或切换到其它事件时恢复。但若有本地高危预警倒计时，不可收起。
     property string wavesDoneId: ""
-    readonly property bool hudSuppressed: !!hudEvent && hudEvent.id === wavesDoneId
+    readonly property bool hudSuppressed: !hasProtectedWarning && !!hudEvent && hudEvent.id === wavesDoneId
     // 地图标记仍画最近一次事件，但不作为默认取景中心；取景只跟随显式焦点。
     readonly property var mapEvent: app.mapEvent
     readonly property bool hudActive: sameEvent(hudEvent, app.activeWarning)
@@ -199,11 +201,12 @@ ApplicationWindow {
     // 桌面端不使用全屏预警：主 HUD 下方再放一张预警卡承载本地到时与操作。
     WarningHud {
         id: warningHud
-        anchors.left: hud.left
-        anchors.top: hud.bottom
-        anchors.topMargin: 8
-        width: hud.width
-        visible: !!app.activeWarning && hud.visible && app.alertEligible
+        anchors.left: hud.visible ? hud.left : parent.left
+        anchors.leftMargin: hud.visible ? 0 : 16
+        anchors.top: hud.visible ? hud.bottom : parent.top
+        anchors.topMargin: hud.visible ? 8 : 16
+        width: hud.visible ? hud.width : Math.min(352, (map ? map.width : window.width) - 88)
+        visible: !!app.activeWarning && app.alertEligible && (hud.visible || window.hasProtectedWarning)
         theme: appTheme
         backdropSource: map ? map.renderLayer : null
         event: app.activeWarning

@@ -268,11 +268,14 @@ Item {
             }
             // 波前全部消失（走完/淡出/事件结束）。仍聚焦（app.hasMapFocus）说明是自然结束而非
             // 用户取消焦点：若之前在跟随震中，自动回到我的位置（无定位则全国概览），并收起 HUD。
-            // 用户手动操作过镜头（following=false）时不抢镜头。
+            // 用户手动操作过镜头（following=false）时不抢镜头。若有活动预警，继续保持在预警事件视野。
             if (!root.wavesShown) return;
             root.wavesShown = false;
             if (!app.hasMapFocus) return;
-            if (root.following) root.resetView();
+            if (root.following) {
+                if (root.warningActive && root.hasEvent) root.frameEvent(false);
+                else root.resetView();
+            }
             root.wavesFinished();
         }
     }
@@ -668,7 +671,9 @@ Item {
     // 透明度按烈度影响半径渐隐（对齐 kanameishi），归零即隐藏。
     Rectangle {
         id: pWaveRing
+        objectName: "pWaveRing"
         readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.pKm : -1
+        z: 2
         visible: radiusKm > 0
         opacity: app.waveRadii.pOpacity === undefined ? 0 : app.waveRadii.pOpacity
         x: root.hypocenterX - width / 2
@@ -688,6 +693,7 @@ Item {
         objectName: "sWaveFill"
         readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.sKm : -1
         readonly property real fillOpacity: app.waveRadii.sFillOpacity === undefined ? 0 : app.waveRadii.sFillOpacity
+        z: 2
         visible: radiusKm > 0 && fillOpacity > 0
         opacity: fillOpacity
         x: root.hypocenterX - width / 2
@@ -720,7 +726,9 @@ Item {
 
     Rectangle {
         id: sWaveRing
+        objectName: "sWaveRing"
         readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.sKm : -1
+        z: 2
         visible: radiusKm > 0
         opacity: app.waveRadii.sOpacity === undefined ? 0 : app.waveRadii.sOpacity
         x: root.hypocenterX - width / 2
@@ -736,6 +744,8 @@ Item {
     // 震中 X 十字。参考 kanameishi eqlistCross.svg：10px 米黄描边打底 + 6px 红描边。
     Canvas {
         id: hypocenter
+        objectName: "hypocenterMarker"
+        z: 3
         visible: root.hasEvent
         x: root.hypocenterX - width / 2
         y: root.hypocenterY - height / 2
@@ -762,6 +772,7 @@ Item {
 
     // 用户位置（带纠偏）
     Item {
+        z: 3
         visible: root.hasUser
         x: root.screenX(root.shiftedUser.lon) - 19
         y: root.screenY(root.shiftedUser.lat) - 19

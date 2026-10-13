@@ -12,10 +12,8 @@ class SettingsStore : public QObject {
     Q_PROPERTY(QString basemapId READ basemapId WRITE setBasemapId NOTIFY changed)
     Q_PROPERTY(QString customBasemapUrl READ customBasemapUrl WRITE setCustomBasemapUrl NOTIFY changed)
     Q_PROPERTY(int customBasemapDatum READ customBasemapDatum WRITE setCustomBasemapDatum NOTIFY changed)
-    /// 在栅格底图之上叠加矢量层（省界 / 区县着色）。
+    /// 在栅格底图之上叠加矢量层（省界 / 区县）；开启时预警按区县烈度着色。
     Q_PROPERTY(bool vectorOverlay READ vectorOverlay WRITE setVectorOverlay NOTIFY changed)
-    /// 区县 EEW 烈度着色。
-    Q_PROPERTY(bool districtShading READ districtShading WRITE setDistrictShading NOTIFY changed)
     Q_PROPERTY(int intensityStandard READ intensityStandard WRITE setIntensityStandard NOTIFY changed)
     Q_PROPERTY(double localIntensityFilter READ localIntensityFilter WRITE setLocalIntensityFilter NOTIFY changed)
     Q_PROPERTY(bool enableWarnings READ enableWarnings WRITE setEnableWarnings NOTIFY changed)
@@ -52,7 +50,7 @@ class SettingsStore : public QObject {
 public:
     explicit SettingsStore(QObject* parent = nullptr);
 
-    QString basemapId() const { return s_.value("basemapId", "amap_vector").toString(); }
+    QString basemapId() const { return s_.value("basemapId", "petal").toString(); }
     void setBasemapId(const QString& v) { set("basemapId", v); }
 
     QString customBasemapUrl() const { return s_.value("customBasemapUrl", "").toString(); }
@@ -64,10 +62,6 @@ public:
     /// 在栅格底图之上叠加矢量层（省界 / 区县着色）。默认关闭：叠加是 opt-in。
     bool vectorOverlay() const { return s_.value("vectorOverlay", false).toBool(); }
     void setVectorOverlay(bool v) { set("vectorOverlay", v); }
-
-    /// 区县 EEW 烈度着色（矢量底图 / 叠加模式下按烈度给 1011 个区县面填色）。
-    bool districtShading() const { return s_.value("districtShading", true).toBool(); }
-    void setDistrictShading(bool v) { set("districtShading", v); }
 
     int intensityStandard() const { return s_.value("intensityStandard", 0).toInt(); } // 0 csis, 1 jma
     void setIntensityStandard(int v) { set("intensityStandard", v); }

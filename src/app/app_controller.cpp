@@ -11,6 +11,7 @@
 #include <QStringList>
 #include <QStyleHints>
 #include <QTimeZone>
+#include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
 
@@ -133,13 +134,16 @@ QString directoryTag(ConnectionStatus s) {
 
 AppController::AppController(QObject* parent, bool startServices)
     : QObject(parent), startServices_(startServices) {
-    QString assetRoot = QCoreApplication::applicationDirPath() + "/assets";
-    if (!QFileInfo::exists(assetRoot + "/travel_times.json"))
-        assetRoot = QDir(QCoreApplication::applicationDirPath()).absoluteFilePath("../share/komiraquake/assets");
+    assetRoot_ = QCoreApplication::applicationDirPath() + "/assets";
+    if (!QFileInfo::exists(assetRoot_ + "/travel_times.json")
+        || !QFileInfo::exists(assetRoot_ + "/map_bounds.kvb")) {
+        assetRoot_ = QDir(QCoreApplication::applicationDirPath())
+                         .absoluteFilePath("../share/komiraquake/assets");
+    }
 
-    TravelTimeService::instance().loadFromFile(assetRoot + "/travel_times.json");
-    CityCoordTable::instance().loadFromFile(assetRoot + "/china_cities.json");
-    qInfo() << "[app] asset root:" << assetRoot
+    TravelTimeService::instance().loadFromFile(assetRoot_ + "/travel_times.json");
+    CityCoordTable::instance().loadFromFile(assetRoot_ + "/china_cities.json");
+    qInfo() << "[app] asset root:" << assetRoot_
             << "| travel times:" << (TravelTimeService::instance().isLoaded() ? "loaded" : "MISSING")
             << "| city coords:" << (CityCoordTable::instance().isLoaded() ? "loaded" : "MISSING");
 
@@ -156,6 +160,9 @@ AppController::AppController(QObject* parent, bool startServices)
             darkMode_ = resolveDarkMode();
             emit darkModeChanged();
         }
+        // 区县着色也由 SettingsStore::changed 驱动，确保关闭时清空旧结果、
+        // 开启时按当前地图事件立即重算。
+        scheduleDistrictRefresh();
     });
     if (QGuiApplication::styleHints()) {
         connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this](Qt::ColorScheme) {
@@ -168,7 +175,7 @@ AppController::AppController(QObject* parent, bool startServices)
     }
     location_ = new LocationService(this);
     sound_ = new AlertSoundService(this);
-    sound_->setAssetRoot(assetRoot);
+    sound_->setAssetRoot(assetRoot_);
     announcer_ = new AlertAnnouncer(settings_, sound_, this);
 
     // 数据源注册表：Wolfx / Pancakes / Jian / Whews … 平级、互为备份。新增源在此登记一行即可，
@@ -208,9 +215,11 @@ AppController::AppController(QObject* parent, bool startServices)
         emit hudEventChanged();
     });
 
-    // 区县烈度着色：单次定时器合并连发事件，只算最后一次。
+    // 区县烈度着色：单次定时器合并连发事件，只算最后一次；计算本体派给 worker 线程。
     districtTimer_.setSingleShot(true);
     connect(&districtTimer_, &QTimer::timeout, this, &AppController::recomputeDistrictIntensity);
+    connect(&districtWatcher_, &QFutureWatcher<QVariantMap>::finished, this,
+            &AppController::onDistrictComputed);
 }
 
 long long AppController::nowMs() const {
@@ -572,17 +581,37 @@ void AppController::toggleMapFocus(const QString& id) {
         setMapFocus(active->second.event, true);
         return;
     }
+    for (const auto& [key, state] : sessions_.active) {
+        if (QString::fromStdString(state.event.id) == id) {
+            if (selectedWarning_ != key) announcer_->stopOutput();
+            selectedWarning_ = key;
+            syncWarning();
+            setMapFocus(state.event, true);
+            return;
+        }
+    }
     if (isMapFocused(id)) {
         // 再次点击同一事件：取消焦点并收起 HUD（活动预警仍会保持显示）。
         clearMapFocus();
         return;
     }
-    if (hasActiveWarning_ && QString::fromStdString(activeWarning_.identity()) == id) {
+    if (hasActiveWarning_ && (QString::fromStdString(activeWarning_.identity()) == id ||
+                             QString::fromStdString(activeWarning_.id) == id)) {
         setMapFocus(activeWarning_, true);
         return;
     }
     for (const EarthquakeEvent& event : history_) {
-        if (QString::fromStdString(event.identity()) == id) {
+        if (QString::fromStdString(event.identity()) == id || QString::fromStdString(event.id) == id) {
+            // 如果该历史条目正是当前正在活跃的预警（同一物理地震），优先切换到活跃预警会话
+            for (const auto& [key, state] : sessions_.active) {
+                if (samePhysicalEvent(state.event, event)) {
+                    if (selectedWarning_ != key) announcer_->stopOutput();
+                    selectedWarning_ = key;
+                    syncWarning();
+                    setMapFocus(state.event, true);
+                    return;
+                }
+            }
             setMapFocus(event, true);
             return;
         }
@@ -645,19 +674,62 @@ QVariantMap AppController::computeDistrictIntensity(const VectorMapData& data, d
 }
 
 void AppController::recomputeDistrictIntensity() {
-    const EarthquakeEvent* event = displayedEvent();
-    QVariantMap next;
-    if (event && settings_->districtShading() && event->magnitude > 0.0) {
-        if (!districtData_.loaded()) {
-            districtData_.loadFromFile((QCoreApplication::applicationDirPath() +
-                                       QStringLiteral("/assets/map_bounds.kvb"))
-                                          .toStdString());
-        }
-        if (districtData_.loaded()) {
-            next = computeDistrictIntensity(districtData_, event->magnitude, event->depth,
-                                            event->latitude, event->longitude);
-        }
+    // 已有一次计算在跑：只记待办，等它结束后再按届时最新状态算一次。这样任一时刻只有
+    // 一个任务读矢量数据，连发事件也不会把任务堆积进线程池。
+    if (districtRunning_) {
+        districtPending_ = true;
+        return;
     }
+
+    const EarthquakeEvent* event = displayedEvent();
+    // 区县着色跟随矢量图层：纯矢量底图本就画矢量，栅格底图需开启「叠加矢量层」。
+    // 与 QML 的 vectorActive（MapView.qml）同口径。
+    const bool vectorActive =
+        settings_->vectorOverlay() || settings_->basemapId() == QLatin1String("vector");
+    // 取消/终态事件仍可能暂时留在 mapFocus_ 中，用于完成地图与 HUD 的收尾通知；
+    // 但它们不再代表有效影响范围，不能把已经清掉的区县颜色重新算回来。
+    const bool usable = event && !event->isCanceled && !sessions_.finished(event->identity()) &&
+                        vectorActive && event->magnitude > 0.0;
+    if (!usable) {
+        applyDistrictIntensity({});
+        return;
+    }
+
+    // 矢量数据只在首次着色时加载一次（3.7 MiB）；此后作为不可变快照交给 worker 读取。
+    if (!districtData_) {
+        auto data = std::make_shared<VectorMapData>();
+        if (data->loadFromFile((assetRoot_ + QStringLiteral("/map_bounds.kvb")).toStdString()))
+            districtData_ = std::move(data);
+    }
+    if (!districtData_) {
+        applyDistrictIntensity({});
+        return;
+    }
+
+    // 参数在主线程快照后按值捕获：worker 只持有不可变数据与纯值，不触碰任何 QObject。
+    const std::shared_ptr<const VectorMapData> snapshot = districtData_;
+    const double magnitude = event->magnitude;
+    const double depthKm = event->depth;
+    const double lat = event->latitude;
+    const double lon = event->longitude;
+    districtRunning_ = true;
+    districtWatcher_.setFuture(QtConcurrent::run([snapshot, magnitude, depthKm, lat, lon] {
+        return computeDistrictIntensity(*snapshot, magnitude, depthKm, lat, lon);
+    }));
+}
+
+void AppController::onDistrictComputed() {
+    // 时效性由「同一时刻只有一个任务在跑」保证：期间到来的新请求只置 pending，
+    // 故这里拿到的结果必是最近一次派发的，不会用旧结果覆盖新状态。
+    districtRunning_ = false;
+    applyDistrictIntensity(districtWatcher_.result());
+    if (districtPending_) {
+        districtPending_ = false;
+        recomputeDistrictIntensity();
+    }
+}
+
+void AppController::applyDistrictIntensity(QVariantMap next) {
     if (next == districtIntensity_) return;
     districtIntensity_ = std::move(next);
     emit districtIntensityChanged();
@@ -884,11 +956,26 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         return;
     }
     const bool added = change == WarningSession::Change::Added;
+    const long long now = nowMs();
+    const bool eventIsProtected = isProtectedAlert(event, now);
+
+    bool currentIsProtected = false;
+    auto curIt = sessions_.active.find(selectedWarning_);
+    if (curIt != sessions_.active.end()) {
+        currentIsProtected = isProtectedAlert(curIt->second.event, now);
+    }
+
     if (added) {
-        announcer_->stopOutput();
-        selectedWarning_ = event.identity();
-        sessions_.active.at(selectedWarning_).hidden = replay;
-        setMapFocus(event, false);
+        // 若当前正处于触发本地烈度限制且有倒计时的关键预警保护中，而新事件未达本地预警门槛（普通观测数据/情报/远震）：
+        // 允许新数据存入会话供观测切换，但绝不掐断当前警报声音、不抢走当前预警的主焦点和倒计时，避免遮挡。
+        if (currentIsProtected && !eventIsProtected) {
+            sessions_.active.at(event.identity()).hidden = replay;
+        } else {
+            announcer_->stopOutput();
+            selectedWarning_ = event.identity();
+            sessions_.active.at(selectedWarning_).hidden = replay;
+            setMapFocus(event, false);
+        }
     } else if (hasMapFocus_ && mapFocus_.identity() == event.identity()) {
         mapFocus_ = event;
         updateWaveTimer();
@@ -913,8 +1000,27 @@ void AppController::upsertHistory(const EarthquakeEvent& event) {
     history_.push_back(event);
 }
 
+bool AppController::isProtectedAlert(const EarthquakeEvent& e, long long clockNow) const {
+    return !e.isCanceled && announcer_ && announcer_->eligible(e) && e.remainingSeconds(clockNow) >= 0;
+}
+
 void AppController::syncWarning() {
+    const long long now = nowMs();
     auto selected = sessions_.active.find(selectedWarning_);
+    const bool currentIsProtected = (selected != sessions_.active.end() && isProtectedAlert(selected->second.event, now));
+
+    // 优选保障：如果有满足「触发本地烈度限制且有倒计时」的关键预警，
+    // 绝不能让非关键事件（如远方观测事件）作为 activeWarning 占据主焦点。
+    if (!currentIsProtected) {
+        for (auto it = sessions_.active.begin(); it != sessions_.active.end(); ++it) {
+            if (isProtectedAlert(it->second.event, now)) {
+                selected = it;
+                selectedWarning_ = it->first;
+                break;
+            }
+        }
+    }
+
     if (selected == sessions_.active.end() && !sessions_.active.empty()) {
         selected = sessions_.active.begin();
         selectedWarning_ = selected->first;
@@ -926,7 +1032,7 @@ void AppController::syncWarning() {
         activeWarning_ = selected->second.event;
         // 未达提醒门槛（总开关 / 本地烈度过滤）时不给倒计时，避免被过滤掉的事件仍显示预警卡。
         const bool eligible = announcer_->eligible(activeWarning_);
-        countdown_ = eligible ? activeWarning_.remainingSeconds(nowMs()) : -1;
+        countdown_ = eligible ? activeWarning_.remainingSeconds(now) : -1;
         overlayVisible_ = !selected->second.hidden && eligible;
         countdownTimer_.start();
     } else {
