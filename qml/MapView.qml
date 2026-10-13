@@ -124,7 +124,10 @@ Item {
         NumberAnimation { duration: root.followSmoothMs; easing.type: Easing.Linear }
     }
 
-    function clampZoom(z) { return Math.max(1, Math.min(18, z)); }
+    /// 视口把世界完整铺满所需的最小缩放。低于它世界（纵向不环绕）会在容器里露出一条背景带
+    /// ——看起来就是「缩成了长方形」。与 Android 的 `minZoomForViewport` 同式。
+    readonly property real minZoom: Math.max(1, Math.log2(Math.max(width, height) / tileSize))
+    function clampZoom(z) { return Math.max(minZoom, Math.min(18, z)); }
 
     /// 平滑移动镜头；duration 为 0 或开启"减少动态效果"时立即生效。
     /// 经度按最短路径插值，避免跨 ±180° 时绕行一整圈。
@@ -181,7 +184,7 @@ Item {
         const right = 76, top = hudHeight, bottom = bottomBadgeHeight;
         const availableW = Math.max(80, width - left - right);
         const availableH = Math.max(80, height - top - bottom);
-        const z = Math.max(1, Math.min(12, Math.floor(Math.log2(Math.min(availableW / (x1 - x0), availableH / (y1 - y0))))));
+        const z = Math.max(minZoom, Math.min(12, Math.floor(Math.log2(Math.min(availableW / (x1 - x0), availableH / (y1 - y0))))));
         const scale = Math.pow(2, z);
         const lat = unprojLat((y0 + y1) / 2 - (top - bottom) / (2 * scale), 0);
         const lon = unprojLon((x0 + x1) / 2 - (left - right) / (2 * scale), 0);
@@ -331,6 +334,8 @@ Item {
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
         else if (!hasFocus && !hasUser && !userMovedCamera) Qt.callLater(() => frameChina(false));
     }
+    // 窗口尺寸变化后最小缩放随之变化：当前缩放若已低于新下界就抬上来，避免露出背景带。
+    onMinZoomChanged: if (root.zoom < root.minZoom) moveCamera(root.centerLat, root.centerLon, root.minZoom, 0)
     onGcjDatumChanged: {
         if (previousGcjDatum === gcjDatum) return;
         const pt = gcjDatum ? app.wgs84ToGcj02(centerLat, centerLon)
@@ -831,10 +836,15 @@ Item {
             lastY = mouse.y;
             const z = root.tileZoom;
             const s = root.tileScale;
+            const worldPx = root.worldSize(z) * s;   // == tileSize * 2^zoom 的连续世界像素尺寸
             const nx = root.projX(root.centerLon, z) * s - dx;
             const ny = root.projY(root.centerLat, z) * s - dy;
             root.centerLon = root.wrapLon(root.unprojLon(nx / s, z));
-            root.centerLat = root.clampLat(root.unprojLat(ny / s, z));
+            // 纵向不环绕：中心限制在"视口不出世界"的范围内，缩到最小也不会拖出背景带。
+            const halfFrac = (root.height / 2) / worldPx;
+            const nyFrac = (ny / s) / root.worldSize(z);
+            const clampedNy = halfFrac < 0.5 ? Math.min(1 - halfFrac, Math.max(halfFrac, nyFrac)) : 0.5;
+            root.centerLat = root.clampLat(root.unprojLat(clampedNy * root.worldSize(z), z));
         }
         onClicked: (mouse) => {
             // 如果移动距离极小判定为点击选点
