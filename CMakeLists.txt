@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(KomiraQuake VERSION 1.2.0 LANGUAGES CXX)
+project(KomiraQuake VERSION 1.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -70,8 +70,12 @@ target_include_directories(komiraquake PRIVATE src)
 # （无路径），故 src/map 必须也在头文件搜索路径中，否则注册代码找不到类型。
 target_include_directories(komiraquake PRIVATE src/map)
 
-# 供 C++ 与 QML 展示的版本号，唯一来源是 project() 的 VERSION。
-target_compile_definitions(komiraquake PRIVATE KOMIRA_VERSION="${PROJECT_VERSION}")
+# 供 C++ 与 QML 展示的版本号；正式构建由 CI 通过 KOMIRA_BUILD_VERSION 对齐 release tag。
+set(KOMIRA_VERSION_VALUE "${PROJECT_VERSION}")
+if(DEFINED KOMIRA_BUILD_VERSION AND NOT KOMIRA_BUILD_VERSION STREQUAL "")
+    set(KOMIRA_VERSION_VALUE "${KOMIRA_BUILD_VERSION}")
+endif()
+target_compile_definitions(komiraquake PRIVATE KOMIRA_VERSION="${KOMIRA_VERSION_VALUE}")
 
 target_link_libraries(komiraquake PRIVATE
     Qt6::Core

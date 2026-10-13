@@ -54,12 +54,28 @@ jobs:
       - name: Configure
         run: |
           cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DKOMIRA_BUILD_VERSION="${{ needs.version.outputs.version }}" \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DBUILD_TESTING=OFF
 
       - name: Build
         run: cmake --build build
+
+      - name: Upload Linux native debug information to Sentry
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: "4511504349396992"
+          SENTRY_PROJECT: "4512246266789888"
+        run: |
+          if [ -z "${SENTRY_AUTH_TOKEN:-}" ]; then
+            echo "SENTRY_AUTH_TOKEN 未配置，跳过 Linux debug information 上传"
+            exit 0
+          fi
+          npx --yes @sentry/cli@latest upload-dif \
+            --org "$SENTRY_ORG" \
+            --project "$SENTRY_PROJECT" \
+            build/komiraquake
 
       - name: Stage install tree (AppDir)
         run: DESTDIR="$PWD/AppDir" cmake --install build
@@ -155,13 +171,35 @@ jobs:
       - name: Configure
         run: >
           cmake -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DKOMIRA_BUILD_VERSION="${{ needs.version.outputs.version }}"
           -DBUILD_TESTING=OFF
           -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
           -DCPACK_PACKAGE_VERSION="${{ needs.version.outputs.version }}"
 
       - name: Build
         run: cmake --build build
+
+      - name: Upload Windows native debug information to Sentry
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: "4511504349396992"
+          SENTRY_PROJECT: "4512246266789888"
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SENTRY_AUTH_TOKEN)) {
+            Write-Host "SENTRY_AUTH_TOKEN 未配置，跳过 Windows debug information 上传"
+            exit 0
+          }
+          $debugFiles = @(Get-ChildItem -Path build -Recurse -File |
+            Where-Object { $_.Extension -in @('.pdb', '.exe') })
+          if ($debugFiles.Count -eq 0) {
+            throw "未找到 Windows ELF/PDB debug information 文件"
+          }
+          npx --yes @sentry/cli@latest upload-dif `
+            --org $env:SENTRY_ORG `
+            --project $env:SENTRY_PROJECT `
+            build
 
       - name: Build installer
         working-directory: build
