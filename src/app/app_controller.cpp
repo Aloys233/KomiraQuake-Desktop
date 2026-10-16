@@ -14,6 +14,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
+#include <cmath>
 
 #include "core/coordinate_transform.h"
 #include "core/intensity_calculator.h"
@@ -31,9 +32,15 @@
 #include "source/eew_parser.h"
 #include "source/earthquake_source.h"
 #include "source/jian_source.h"
+#include "source/kmoni_station_protocol.h"
+#include "source/kmoni_station_source.h"
+#include "source/pancakes_seis_protocol.h"
+#include "source/pancakes_seis_source.h"
 #include "source/pancakes_source.h"
 #include "source/simulated_source.h"
 #include "source/whews_source.h"
+#include "source/wolfx_seis_protocol.h"
+#include "source/wolfx_seis_source.h"
 #include "source/wolfx_source.h"
 #include "store/history_store.h"
 #include "theme/seismic_colors.h"
@@ -130,6 +137,32 @@ QString directoryTag(ConnectionStatus s) {
     return QStringLiteral("CRITICAL");
 }
 
+/// CSIS 测站缺测哨兵：烈度域为整数 0–12，`< 0` 表示无观测。
+constexpr double kMissingCsis = -1.0;
+
+/// 中国地震烈度卡片数值文本：仪器烈度四舍五入取整（0–12）。
+QString csisText(double raw) {
+    return QString::number(static_cast<int>(std::lround(std::max(0.0, raw))));
+}
+
+/// 一张测站源卡片的载荷。`standard` 决定语义与色阶：JMA 用計測震度（缺测 `raw <= -3`），
+/// CSIS 用中国地震烈度（缺测 `raw < 0`）；两者缺测均显示 `--`。
+QVariantMap stationCard(const QString& id, const QString& name, bool hasData, double raw,
+                        IntensityStandard standard, int stationCount, const QString& frameTime) {
+    const bool csis = standard == IntensityStandard::Csis;
+    QVariantMap m;
+    m["id"] = id;
+    m["name"] = name;
+    m["standard"] = csis ? QStringLiteral("csis") : QStringLiteral("jma");
+    m["caption"] = csis ? QStringLiteral("当前最大烈度") : QStringLiteral("当前最大震度");
+    m["hasData"] = hasData;
+    m["raw"] = raw;
+    m["text"] = hasData ? (csis ? csisText(raw) : jmaShindoText(raw)) : QStringLiteral("--");
+    m["stationCount"] = stationCount;
+    m["frameTime"] = frameTime;
+    return m;
+}
+
 } // namespace
 
 AppController::AppController(QObject* parent, bool startServices)
@@ -185,6 +218,12 @@ AppController::AppController(QObject* parent, bool startServices)
     simulated_ = new SimulatedSource(this);
     sources_ << new WolfxSource(this) << new PancakesSource(this) << jian_ << whews_
              << simulated_;
+    // NIED Kmoni 测站显示源：独立于事件源注册表（不产事件、不参与预警/去重/历史）。
+    stationSource_ = new KmoniStationSource(this);
+    // PancakesSeis 测站显示源：同上，独立于事件源注册表。
+    seisSource_ = new PancakesSeisSource(this);
+    // Wolfx SeisJS 测站显示源：同上。
+    wolfxSeisSource_ = new WolfxSeisSource(this);
     clock_ = new NtpClock(this);
     autoStart_ = new AutoStartService(this);
     updater_ = new UpdateService(this);
@@ -200,6 +239,13 @@ AppController::AppController(QObject* parent, bool startServices)
 
     countdownTimer_.setInterval(1000);
     connect(&countdownTimer_, &QTimer::timeout, this, &AppController::onTick);
+
+    // 三路测站源都可能按站推送；UI 不需要按网络帧频率重建整张测站表。
+    stationIntensityRefreshTimer_.setSingleShot(true);
+    stationIntensityRefreshTimer_.setInterval(100);
+    connect(&stationIntensityRefreshTimer_, &QTimer::timeout, this, [this]() {
+        emit stationIntensityChanged();
+    });
 
     // 波前圆按显示帧率重算，只在焦点事件"还年轻"时跑（见 updateWaveTimer）。
     waveTimer_.setInterval(16);
@@ -220,6 +266,10 @@ AppController::AppController(QObject* parent, bool startServices)
     connect(&districtTimer_, &QTimer::timeout, this, &AppController::recomputeDistrictIntensity);
     connect(&districtWatcher_, &QFutureWatcher<QVariantMap>::finished, this,
             &AppController::onDistrictComputed);
+}
+
+void AppController::scheduleStationIntensityRefresh() {
+    if (!stationIntensityRefreshTimer_.isActive()) stationIntensityRefreshTimer_.start();
 }
 
 long long AppController::nowMs() const {
@@ -318,6 +368,24 @@ void AppController::wire() {
             source->start();
     }
     if (startServices_) {
+        // NIED 测站显示源：随应用启停（不参与 EEW 源门控）。台站表/震度两帧都转发给 QML。
+        connect(stationSource_, &KmoniStationSource::stationsChanged, this,
+                [this]() { scheduleStationIntensityRefresh(); });
+        connect(stationSource_, &KmoniStationSource::intensityChanged, this,
+                [this]() { scheduleStationIntensityRefresh(); });
+        stationSource_->start();
+        // PancakesSeis 测站显示源：同上，与 Kmoni 共用地图测站图层。
+        connect(seisSource_, &PancakesSeisSource::stationsChanged, this,
+                [this]() { scheduleStationIntensityRefresh(); });
+        connect(seisSource_, &PancakesSeisSource::dataChanged, this,
+                [this]() { scheduleStationIntensityRefresh(); });
+        seisSource_->start();
+        // Wolfx SeisJS 测站显示源：同上，共用地图测站图层。
+        connect(wolfxSeisSource_, &WolfxSeisSource::stationsChanged, this,
+                [this]() { scheduleStationIntensityRefresh(); });
+        connect(wolfxSeisSource_, &WolfxSeisSource::dataChanged, this,
+                [this]() { scheduleStationIntensityRefresh(); });
+        wolfxSeisSource_->start();
         clock_->setCustomServer(settings_->customNtpServer());
         clock_->setEnabled(settings_->enableNtpSync());
         clock_->start();
@@ -566,6 +634,85 @@ QVariantMap AppController::waveRadii() const {
     m["sOpacity"] = waveSOpacity_;
     m["sFillOpacity"] = waveSFillOpacity_;
     return m;
+}
+
+QVariantList AppController::stationIntensity() const {
+    QVariantList list;
+    // NIED Kmoni：raw 为 JMA 計測震度（缺测哨兵 -3）；`src` 供 QML 按源选色阶。
+    if (stationSource_ && stationSource_->hasData()) {
+        const auto& stations = stationSource_->stations();
+        const auto& intensity = stationSource_->intensity();
+        list.reserve(stations.size());
+        for (int i = 0; i < stations.size(); ++i) {
+            QVariantMap m;
+            m["src"] = QStringLiteral("kmoni");
+            m["lat"] = stations[i].latitude;
+            m["lon"] = stations[i].longitude;
+            m["raw"] = i < intensity.size() ? intensity[i] : KmoniStationProtocol::kMissing;
+            list.push_back(m);
+        }
+    }
+    // PancakesSeis：PGA（Gal）折算为中国地震烈度（CSIS）；缺测哨兵 -1。
+    if (seisSource_ && seisSource_->hasData()) {
+        const auto& stations = seisSource_->stations();
+        const auto& pga = seisSource_->pga();
+        for (int i = 0; i < stations.size(); ++i) {
+            QVariantMap m;
+            m["src"] = QStringLiteral("pancakes_seis");
+            m["lat"] = stations[i].latitude;
+            m["lon"] = stations[i].longitude;
+            const double value = i < pga.size() ? pga[i] : PancakesSeisProtocol::kMissingPga;
+            m["raw"] = value > 0.0 ? IntensityCalculator::csisFromPga(value) : kMissingCsis;
+            list.push_back(m);
+        }
+    }
+    // Wolfx SeisJS：报文自带中国地震烈度 `Intensity`，直接进入 CSIS 域。
+    if (wolfxSeisSource_ && wolfxSeisSource_->hasData()) {
+        for (const auto& station : wolfxSeisSource_->stations()) {
+            QVariantMap m;
+            m["src"] = QStringLiteral("wolfx_seis");
+            m["lat"] = station.latitude;
+            m["lon"] = station.longitude;
+            m["raw"] = station.csis >= 0 ? static_cast<double>(station.csis) : kMissingCsis;
+            list.push_back(m);
+        }
+    }
+    return list;
+}
+
+QVariantList AppController::stationSources() const {
+    // 每个测站源一张卡片：NIED 沿用 JMA 計測震度，Pancakes / Wolfx 用中国地震烈度（CSIS）。
+    QVariantList list;
+    if (stationSource_) {
+        const double raw = stationSource_->hasData() ? stationSource_->maxIntensity()
+                                                      : KmoniStationProtocol::kMissing;
+        list.push_back(stationCard(QStringLiteral("kmoni"), QStringLiteral("NIED"),
+                                   raw > KmoniStationProtocol::kMissing, raw, IntensityStandard::Jma,
+                                   stationSource_->stations().size(), stationSource_->frameTime()));
+    }
+    if (seisSource_) {
+        const double pga = seisSource_->maxPga();
+        const bool hasData = seisSource_->hasData() && pga > PancakesSeisProtocol::kMissingPga;
+        const double raw = hasData ? IntensityCalculator::csisFromPga(pga) : kMissingCsis;
+        const QString frameTime = seisSource_->lastTimestamp() > 0
+            ? QDateTime::fromMSecsSinceEpoch(seisSource_->lastTimestamp(),
+                                             QTimeZone(kClockUtc8OffsetSeconds))
+                  .toString(QStringLiteral("yyyyMMddHHmmss"))
+            : QString();
+        list.push_back(stationCard(QStringLiteral("pancakes_seis"), QStringLiteral("PancakesSeis"),
+                                   hasData, raw, IntensityStandard::Csis,
+                                   seisSource_->stations().size(), frameTime));
+    }
+    if (wolfxSeisSource_) {
+        const int maxCsis = wolfxSeisSource_->hasData() ? wolfxSeisSource_->maxCsis()
+                                                        : WolfxSeisProtocol::kMissingIntensity;
+        const bool hasData = maxCsis >= 0;
+        list.push_back(stationCard(QStringLiteral("wolfx_seis"), QStringLiteral("WolfxSeisJS"),
+                                   hasData, hasData ? static_cast<double>(maxCsis) : kMissingCsis,
+                                   IntensityStandard::Csis, wolfxSeisSource_->stations().size(),
+                                   wolfxSeisSource_->frameTime()));
+    }
+    return list;
 }
 
 bool AppController::isMapFocused(const QString& id) const {

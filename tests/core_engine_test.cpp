@@ -64,6 +64,10 @@ int main(int argc, char** argv) {
     check(near(IntensityCalculator::rawCsis(7.0, 0.0, 10.0), 9.3048, 1e-3), "CSIS M7 at epicenter");
     check(IntensityCalculator::formatCsis(4.2) == "IV", "CSIS roman IV");
     check(IntensityCalculator::formatCsis(20.0) == "XII", "CSIS roman clamp XII");
+    // 仪器烈度：由 PGA（Gal）折算，单参数振幅式；100 Gal ≈ 6.6 度，缺测（<=0）为 0。
+    check(near(IntensityCalculator::csisFromPga(100.0), 6.59, 1e-9), "csis VI at 100 Gal");
+    check(near(IntensityCalculator::csisFromPga(400.0), 8.50, 1e-2), "csis grows with PGA");
+    check(near(IntensityCalculator::csisFromPga(0.0), 0.0), "csis zero when no PGA");
     check(IntensityCalculator::formatJma(9.0, 1.0, 1.0) == "7", "JMA band 7");
     // 波前影响半径（CSIS 可感下限 I）与分段渐隐。
     const double r6 = IntensityCalculator::distanceForCsis(6.0, 10.0, 1.0);

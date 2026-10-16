@@ -44,6 +44,7 @@ ApplicationWindow {
             hasUser: app.hasLocation
             userLat: app.userLatitude; userLon: app.userLongitude
             event: window.mapEvent
+            stations: app.stationIntensity
             hasFocus: app.hasMapFocus
             warningActive: !!app.activeWarning
             hudWidth: hud.visible ? hud.width : 0
@@ -124,32 +125,42 @@ ApplicationWindow {
         readonly property var activeSources: app.sources.filter(function (s) {
             return s.enabled && s.configured
         })
+        // 把「源名」展开成「分隔点 + 源名」的扁平项列表：分隔点作为独立布局项，
+        // RowLayout 的 spacing 会均匀落在它两侧，因此正好居中（内联进文本里就会偏）。
+        readonly property var sourceTokens: {
+            const out = [];
+            const srcs = activeSources;
+            for (let i = 0; i < srcs.length; ++i) {
+                if (i > 0) out.push({ sep: true });
+                out.push({ sep: false, name: srcs[i].name, tag: srcs[i].statusTag });
+            }
+            return out;
+        }
         RowLayout {
             id: sourceRow
-            anchors.centerIn: parent; spacing: 7
-            Text { Layout.alignment: Qt.AlignVCenter; text: "数据源"; color: appTheme.outline; font.pixelSize: 11 }
+            anchors.centerIn: parent; spacing: 8
+            // 中英混排：按基线对齐（AlignVCenter 会让拉丁字母与中文不在一条线上，
+            // 因为两者的 ascent/descent 不同、居中后视觉基线错位）。
             Text {
-                Layout.alignment: Qt.AlignVCenter
+                Layout.alignment: Qt.AlignBaseline
+                text: "数据源"; color: appTheme.outline; font.pixelSize: 11
+            }
+            Text {
+                Layout.alignment: Qt.AlignBaseline
                 visible: sourceBadge.activeSources.length === 0
                 text: "无启用数据源"; color: appTheme.outline; font.pixelSize: 11
             }
             Repeater {
-                model: sourceBadge.activeSources
-                delegate: RowLayout {
+                model: sourceBadge.sourceTokens
+                delegate: Text {
                     required property var modelData
-                    required property int index
-                    spacing: 7
-                    Text {
-                        Layout.alignment: Qt.AlignVCenter
-                        visible: index > 0
-                        text: "·"; color: appTheme.outline; font.pixelSize: 11
-                    }
-                    Text {
-                        Layout.alignment: Qt.AlignVCenter
-                        text: modelData.name
-                        color: appTheme.connectionColor(modelData.statusTag)
-                        font.pixelSize: 11; font.weight: Font.Medium
-                    }
+                    Layout.alignment: Qt.AlignBaseline
+                    // 分隔点用实心圆点 •（比 · 粗），独立成项。
+                    text: modelData.sep ? "•" : modelData.name
+                    color: modelData.sep ? appTheme.outline : appTheme.connectionColor(modelData.tag)
+                    font.pixelSize: 11
+                    font.weight: modelData.sep ? Font.Normal : Font.Medium
+                    font.letterSpacing: modelData.sep ? 0 : 0.3
                 }
             }
         }

@@ -30,6 +30,51 @@ Item {
     property real userLat: 0.0
     property real userLon: 0.0
     property bool hasUser: false
+    /// NIED Kmoni 测站震度：逐站 `{ lat, lon, raw }`（raw 为连续震度，缺测 -3）。
+    /// 由 AppController.stationIntensity 注入；仅用于地图显示。
+    property var stations: []
+    /// 预纠偏后的测站坐标（GCJ-02）。测站震度是高频变化数据，但坐标通常不变；
+    /// 坐标缓存避免每个数据帧都对上千站跨 JS/C++ 调用一次 `shiftCoord`。
+    property var shiftedStations: []
+    property var stationCoordinateCache: ({})
+
+    function rebuildShiftedStations() {
+        const list = root.stations;
+        if (!list || list.length === 0) {
+            root.shiftedStations = [];
+            root.stationCoordinateCache = ({});
+            return;
+        }
+
+        const cache = root.stationCoordinateCache;
+        const out = root.shiftedStations && root.shiftedStations.length === list.length
+            ? root.shiftedStations : new Array(list.length);
+        for (let i = 0; i < list.length; ++i) {
+            const s = list[i];
+            const lat = Number(s.lat);
+            const lon = Number(s.lon);
+            const key = lat + ":" + lon;
+            let point = cache[key];
+            if (!point) {
+                const shifted = root.shiftCoord(lat, lon);
+                point = { lat: shifted.lat, lon: shifted.lon };
+                cache[key] = point;
+            }
+            // 复用输出对象；只有 raw/src 随实时帧更新。
+            const item = out[i] || {};
+            item.lat = point.lat;
+            item.lon = point.lon;
+            item.raw = s.raw;
+            item.src = s.src;
+            out[i] = item;
+        }
+        root.shiftedStations = out;
+    }
+
+    onStationsChanged: {
+        root.rebuildShiftedStations();
+        stationLayer.requestPaint();
+    }
     /// 镜头是否锁定在焦点事件上（工具条的"跟随震中"按下态）。默认不跟随：无定位时地图是全国概览。
     property bool following: false
     /// 用户是否手动控制过镜头（拖动/缩放/回到我的位置/复位）。用于避免定位到达时抢镜头。
@@ -368,13 +413,20 @@ Item {
     // 窗口尺寸变化后最小缩放随之变化：当前缩放若已低于新下界就抬上来，避免露出背景带。
     onMinZoomChanged: if (root.zoom < root.minZoom) moveCamera(root.centerLat, root.centerLon, root.minZoom, 0)
     onGcjDatumChanged: {
-        if (previousGcjDatum === gcjDatum) return;
+        if (previousGcjDatum === gcjDatum) {
+            root.stationCoordinateCache = ({});
+            root.rebuildShiftedStations();
+            return;
+        }
         const pt = gcjDatum ? app.wgs84ToGcj02(centerLat, centerLon)
                             : app.gcj02ToWgs84(centerLat, centerLon);
         cameraMove.stop();
         centerLat = clampLat(pt.y);
         centerLon = wrapLon(pt.x);
         previousGcjDatum = gcjDatum;
+        root.stationCoordinateCache = ({});
+        root.rebuildShiftedStations();
+        stationLayer.requestPaint();
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
     }
 
@@ -435,6 +487,7 @@ Item {
     onLastTileYChanged: Qt.callLater(syncTiles)
     // 切到/切出纯矢量底图时要立即重算瓦片集合（要么清空，要么按当前相机重建）。
     Component.onCompleted: {
+        root.rebuildShiftedStations();
         if (root.tileModelZoom < 0) root.tileModelZoom = root.tileZoom;
         Qt.callLater(syncTiles);
         Qt.callLater(applyDefaultOverview);
@@ -556,7 +609,13 @@ Item {
     }
 
     function shiftCoord(lat, lon) {
-        if (!gcjDatum || !app || typeof app.wgs84ToGcj02 !== "function") return { lat: lat, lon: lon };
+        // 日本及其它境外测站本来就不应做 GCJ-02 纠偏。提前在 QML 侧筛掉，
+        // 既保持坐标不变，也避免为每个境外站点跨 C++ 调用一次。
+        if (!gcjDatum || lat < 0.8293 || lat > 55.8271
+                || lon < 72.004 || lon > 137.8347
+                || !app || typeof app.wgs84ToGcj02 !== "function") {
+            return { lat: lat, lon: lon };
+        }
         const pt = app.wgs84ToGcj02(lat, lon);
         return { lat: pt.y, lon: pt.x };
     }
@@ -868,6 +927,142 @@ Item {
     }
 
     } // mapRenderLayer
+
+    // ---- 测站强度层 ------------------------------------------------------
+    // 用单个 Canvas 批量绘制测站（上千个点，逐 Item 会拖垮场景图）。
+    // NIED（JMA 計測震度）沿用 kanameishi：常态圆点，颜色随连续震度色阶。
+    // Pancakes / Wolfx（中国地震烈度 CSIS）对齐 flutterRhythmQuake：活跃测站画带烈度数字的
+    // 圆角方标（高烈度白实边），缺测画蓝点。
+    Canvas {
+        id: stationLayer
+        objectName: "stationIntensityLayer"
+        anchors.fill: parent
+        z: 2
+        visible: root.stations.length > 0
+
+        function hexToRgba(hex, a) {
+            const r = parseInt(hex.substr(1, 2), 16);
+            const g = parseInt(hex.substr(3, 2), 16);
+            const b = parseInt(hex.substr(5, 2), 16);
+            return "rgba(" + r + "," + g + "," + b + "," + a + ")";
+        }
+        function luminance(hex) {
+            const r = parseInt(hex.substr(1, 2), 16) / 255;
+            const g = parseInt(hex.substr(3, 2), 16) / 255;
+            const b = parseInt(hex.substr(5, 2), 16) / 255;
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        }
+        function roundRect(ctx, x, y, w, h, r) {
+            ctx.beginPath();
+            ctx.moveTo(x + r, y);
+            ctx.arcTo(x + w, y, x + w, y + h, r);
+            ctx.arcTo(x + w, y + h, x, y + h, r);
+            ctx.arcTo(x, y + h, x, y, r);
+            ctx.arcTo(x, y, x + w, y, r);
+            ctx.closePath();
+        }
+
+        onPaint: {
+            const ctx = getContext("2d");
+            ctx.reset();
+            const list = root.shiftedStations;   // 已纠偏，直接投影即可
+            if (!list || list.length === 0) return;
+            const w = stationLayer.width;
+            const h = stationLayer.height;
+            const zoom = root.zoom;
+            // NIED 圆点：所有测站同一尺寸，仅随缩放整体变化（对齐 kanameishi）。
+            const dotRadius = Math.max(1.6, Math.min(4.5, 1.2 + (zoom - 4) * 0.45));
+            // CSIS 方标尺寸（对齐 flutterRhythmQuake：社区测站给可读下限，放大时略增）。
+            const markerSize = Math.max(16, Math.min(24, 16 + (zoom - 4) * 1.4));
+            const idleRadius = Math.max(5, Math.min(9, 5 + (zoom - 3) * 0.8));
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            for (let i = 0; i < list.length; ++i) {
+                const s = list[i];
+                const x = root.screenX(s.lon);
+                const y = root.screenY(s.lat);
+                if (s.src === "pancakes_seis" || s.src === "wolfx_seis") {
+                    const raw = (s.raw === undefined) ? -1 : s.raw;
+                    if (raw >= 0) {
+                        // 活跃测站：带烈度数字的圆角方标。
+                        const level = Math.max(0, Math.min(12, Math.round(raw)));
+                        const color = root.theme.intensityColor(level);
+                        const half = markerSize / 2;
+                        if (x < -half || y < -half || x > w + half || y > h + half) continue;
+                        stationLayer.roundRect(ctx, x - half, y - half, markerSize, markerSize,
+                                               markerSize * 0.22);
+                        ctx.fillStyle = stationLayer.hexToRgba(color, 0.75);
+                        ctx.fill();
+                        // 高烈度用白实边强调；低烈度浅白边。
+                        ctx.lineWidth = level >= 5 ? 1.6 : 0.9;
+                        ctx.strokeStyle = level >= 5 ? "rgba(255,255,255,0.95)"
+                                                     : "rgba(255,255,255,0.45)";
+                        ctx.stroke();
+                        ctx.fillStyle = stationLayer.luminance(color) > 0.42 ? "#000000" : "#FFFFFF";
+                        ctx.font = "bold " + Math.round(markerSize * (level >= 5 ? 0.58 : 0.48))
+                            + "px sans-serif";
+                        ctx.fillText(String(level), x, y);
+                    } else if (x >= -idleRadius && y >= -idleRadius
+                               && x <= w + idleRadius && y <= h + idleRadius) {
+                        // 缺测测站：蓝点。
+                        ctx.beginPath();
+                        ctx.arc(x, y, idleRadius, 0, Math.PI * 2);
+                        ctx.fillStyle = "rgba(68,102,170,0.5)";
+                        ctx.fill();
+                        ctx.lineWidth = 1.2;
+                        ctx.strokeStyle = "rgba(68,102,170,0.7)";
+                        ctx.stroke();
+                    }
+                    continue;
+                }
+                // NIED：常态圆点（静稳=深蓝，活跃=按色阶）。
+                if (x < -dotRadius || y < -dotRadius || x > w + dotRadius || y > h + dotRadius) {
+                    continue;
+                }
+                const jma = (s.raw === undefined || s.raw <= -3) ? -3 : s.raw;
+                ctx.beginPath();
+                ctx.arc(x, y, dotRadius, 0, Math.PI * 2);
+                ctx.fillStyle = root.theme.niedStationColor(jma);
+                ctx.fill();
+            }
+        }
+        Connections {
+            target: app
+            function onStationIntensityChanged() { stationLayer.requestPaint(); }
+        }
+        Connections {
+            target: root
+            function onCenterLatChanged() { stationLayer.requestPaint(); }
+            function onCenterLonChanged() { stationLayer.requestPaint(); }
+            function onZoomChanged() { stationLayer.requestPaint(); }
+            function onWidthChanged() { stationLayer.requestPaint(); }
+            function onHeightChanged() { stationLayer.requestPaint(); }
+        }
+    }
+
+    // 右上角：各测站源的实时最大值（仅显示，不参与预警）；每个源一张小卡，横向排列。
+    RowLayout {
+        anchors.right: parent.right
+        anchors.rightMargin: 16
+        anchors.top: parent.top
+        anchors.topMargin: 16
+        spacing: 8
+        z: 10
+        visible: !root.pickingLocation
+        Repeater {
+            model: app.stationSources
+            delegate: StationIntensityCard {
+                required property var modelData
+                Layout.alignment: Qt.AlignTop
+                theme: root.theme
+                backdropSource: mapRenderLayer
+                sourceName: modelData.name
+                caption: modelData.caption
+                standard: modelData.standard
+                maxInfo: modelData
+            }
+        }
+    }
 
     MouseArea {
         anchors.fill: parent

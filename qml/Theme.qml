@@ -81,6 +81,32 @@ QtObject {
         default: return level >= 10 ? "#7F007F" : "#9F9F9F";
         }
     }
+    /// NIED 测站色阶（对齐 kanameishi `colorBand.nied`）：连续震度 → 深蓝→青→绿→黄→橙→红。
+    /// 低值/缺测（<= -3，Jian 用 -3 表示"无观测/低于基线"）都落在最低的深蓝，形成常态蓝色测站网。
+    readonly property var niedColorBand: [
+        "#0003cf",
+        "#0014da", "#0037f0", "#006cdc", "#00b3a2", "#12dc72",
+        "#31f049", "#64fb2a", "#9dfe17", "#ccff09", "#ebff03",
+        "#fff500", "#ffe500", "#ffca00", "#ffa600", "#ff7e00",
+        "#ff5900", "#fd3500", "#f81100", "#e50000", "#bd0000"
+    ]
+    /// 连续震度 → 测站颜色。缺测（`raw <= -3`）取最低档深蓝（默认观感即"蓝点"）。
+    function niedStationColor(raw) {
+        const idx = Math.max(0, Math.min(20, Math.round((raw + 3) * 2)));
+        return niedColorBand[idx];
+    }
+    /// 卡片大号数字用的颜色：色阶原色在浅色卡上偏亮、深色卡上偏暗，
+    /// 这里按主题做对比度校正（浅色卡压暗、深色卡提亮），保证数字可读。
+    function stationTextColor(raw) {
+        const base = niedStationColor(raw);
+        return dark ? Qt.lighter(base, 1.45) : Qt.darker(base, 1.5);
+    }
+    /// 卡片大号数字用色（按数据源制式）：`csis` 用中国烈度色阶，其余用 NIED 连续色阶；
+    /// 同样按主题做对比度校正，保证数字可读。
+    function stationTextColorFor(raw, standard) {
+        const base = standard === "csis" ? intensityColor(raw) : niedStationColor(raw);
+        return dark ? Qt.lighter(base, 1.45) : Qt.darker(base, 1.5);
+    }
     function magnitudeColor(m) {
         if (m < 3.0) return "#00796B";
         if (m < 4.5) return "#F57F17";

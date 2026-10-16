@@ -38,8 +38,13 @@ double IntensityCalculator::rawCsis(double magnitude, double distanceKm, double 
     return std::max(0.0, (ceaCsis(magnitude, distanceKm) + ceaCsis(magnitude, hypoDistance)) / 2.0);
 }
 
-double IntensityCalculator::distanceForCsis(double magnitude, double depthKm, double level) {
-    if (magnitude <= 0.0) return 0.0;
+double IntensityCalculator::csisFromPga(double pgaGal) {
+    if (pgaGal <= 0.0) return 0.0;
+    // GB/T 17742 仪器烈度单参数振幅式，PGA 取 Gal（cm/s²）：100 Gal ≈ VI 度。
+    return std::max(0.0, 3.17 * std::log10(pgaGal / 100.0) + 6.59);
+}
+
+double IntensityCalculator::distanceForCsis(double magnitude, double depthKm, double level) {    if (magnitude <= 0.0) return 0.0;
     if (rawCsis(magnitude, 0.0, depthKm) < level) return 0.0;
     // rawCsis 关于距离单调不增，二分求交；量程上限对齐走时表 10000 km。
     double lo = 0.0;

@@ -29,6 +29,9 @@ class EarthquakeSource;
 class JianSource;
 class WhewsSource;
 class SimulatedSource;
+class KmoniStationSource;
+class PancakesSeisSource;
+class WolfxSeisSource;
 class HistoryStore;
 class AlertSoundService;
 class AlertAnnouncer;
@@ -83,6 +86,11 @@ class AppController : public QObject {
     Q_PROPERTY(QVariantMap waveRadii READ waveRadii NOTIFY waveRadiiChanged)
     /// 区县名 -> CSIS 烈度原始值，供矢量地图按烈度给区县面填色。
     Q_PROPERTY(QVariantMap districtIntensity READ districtIntensity NOTIFY districtIntensityChanged)
+    /// 实时测站震度（**仅显示，不参与预警**）：合并各测站源，逐站 `{ lat, lon, raw }`，
+    /// `raw` 为连续震度（缺测 -3；PancakesSeis 的 PGA 已折算为計測震度）。供地图测站图层绘制。
+    Q_PROPERTY(QVariantList stationIntensity READ stationIntensity NOTIFY stationIntensityChanged)
+    /// 逐测站源的实时最大值卡片数据：`[{ id, name, caption, hasData, raw, text, stationCount, frameTime }]`。
+    Q_PROPERTY(QVariantList stationSources READ stationSources NOTIFY stationIntensityChanged)
 
 public:
     explicit AppController(QObject* parent = nullptr, bool startServices = true);
@@ -129,6 +137,8 @@ public:
     int hudCount() const;
     QVariantMap waveRadii() const;
     QVariantMap districtIntensity() const { return districtIntensity_; }
+    QVariantList stationIntensity() const;
+    QVariantList stationSources() const;
 
     /// HUD 左右切换：在全部活动事件间循环（按发震时刻倒序，0 为最新）。
     Q_INVOKABLE void hudPrev();
@@ -175,6 +185,7 @@ signals:
     void hudEventChanged();
     void waveRadiiChanged();
     void districtIntensityChanged();
+    void stationIntensityChanged();
     /// 实时 EEW 到达：请求把地图移到该震中。
     void centerMapRequested(double latitude, double longitude);
     /// 取消焦点（再次点击同一事件）：请求把镜头还原到默认视野。
@@ -203,6 +214,8 @@ private:
     bool hudWindowOpen(const EarthquakeEvent& event, long long now) const;
     /// 安排一次 HUD 可见性重算（跨过 10 分钟窗口时隐藏自动焦点的 HUD）。
     void scheduleHudRefresh();
+    /// 将高频测站帧合并为固定频率的 QML 快照刷新，避免每条站点帧都重建大列表。
+    void scheduleStationIntensityRefresh();
     /// 全部活动事件按发震时刻倒序（最新在前）的 identity 列表。
     std::vector<std::string> orderedActiveKeys() const;
     /// HUD 左右切换的公共实现：delta 为 ±1 时循环切换所选预警。
@@ -253,6 +266,12 @@ private:
     WhewsSource* whews_ = nullptr;
     /// 模拟源（仅开发自测）需注入开发者模式开关与地址，保留具体类型访问注入入口。
     SimulatedSource* simulated_ = nullptr;
+    /// NIED Kmoni 实时测站显示源（非 EEW，不入 sources_ 事件注册表）。
+    KmoniStationSource* stationSource_ = nullptr;
+    /// PancakesSeis 实时测站显示源（非 EEW，不入 sources_ 事件注册表）。
+    PancakesSeisSource* seisSource_ = nullptr;
+    /// Wolfx SeisJS 实时测站显示源（非 EEW，不入 sources_ 事件注册表）。
+    WolfxSeisSource* wolfxSeisSource_ = nullptr;
     AlertSoundService* sound_ = nullptr;
     AlertAnnouncer* announcer_ = nullptr;
     /// 网络授时：所有地震时间语义的唯一时间基准。《NATIVE_PORT_SPEC》 §13。
@@ -274,6 +293,7 @@ private:
     /// 系统配色方案是否为深色（themeMode == "system" 时的判定依据）。
     bool systemDark_ = false;
     QTimer countdownTimer_;
+    QTimer stationIntensityRefreshTimer_;
 
     /// 地图焦点：用户从列表选中，或被实时 EEW 自动接管。
     EarthquakeEvent mapFocus_;

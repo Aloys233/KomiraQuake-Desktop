@@ -59,9 +59,15 @@ qt_add_executable(komiraquake WIN32
     src/source/jian_protocol.cpp
     src/source/jian_parser.cpp
     src/source/jian_source.cpp
+    src/source/kmoni_station_parser.cpp
+    src/source/kmoni_station_source.cpp
+    src/source/pancakes_seis_parser.cpp
+    src/source/pancakes_seis_source.cpp
     src/source/whews_protocol.cpp
     src/source/whews_parser.cpp
     src/source/whews_source.cpp
+    src/source/wolfx_seis_parser.cpp
+    src/source/wolfx_seis_source.cpp
     src/source/simulated_protocol.cpp
     src/source/simulated_parser.cpp
     src/source/simulated_source.cpp
@@ -123,6 +129,7 @@ set(KOMIRA_QML_FILES
     qml/EventTile.qml
     qml/EventListSidebar.qml
     qml/MapView.qml
+    qml/StationIntensityCard.qml
     qml/SettingsPage.qml
     qml/settings/AppearanceSection.qml
     qml/settings/LocationSection.qml
@@ -242,7 +249,10 @@ if(BUILD_TESTING)
         src/source/earthquake_source.h
         src/source/pancakes_parser.cpp src/source/pancakes_source.cpp
         src/source/jian_protocol.cpp src/source/jian_parser.cpp src/source/jian_source.cpp
+        src/source/kmoni_station_parser.cpp src/source/kmoni_station_source.cpp
+        src/source/pancakes_seis_parser.cpp src/source/pancakes_seis_source.cpp
         src/source/whews_protocol.cpp src/source/whews_parser.cpp src/source/whews_source.cpp
+        src/source/wolfx_seis_parser.cpp src/source/wolfx_seis_source.cpp
         src/source/simulated_protocol.cpp src/source/simulated_parser.cpp
         src/source/simulated_source.cpp
         src/service/sentry_service.cpp

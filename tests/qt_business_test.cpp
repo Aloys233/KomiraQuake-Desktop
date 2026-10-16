@@ -29,12 +29,15 @@
 #include "service/sentry_service.h"
 #include "source/eew_parser.h"
 #include "source/jian_parser.h"
+#include "source/kmoni_station_parser.h"
 #include "source/pancakes_parser.h"
 #include "source/pancakes_protocol.h"
+#include "source/pancakes_seis_parser.h"
 #include "source/simulated_parser.h"
 #include "source/simulated_protocol.h"
 #include "source/whews_parser.h"
 #include "source/whews_protocol.h"
+#include "source/wolfx_seis_parser.h"
 #include "store/history_store.h"
 
 // No production clock/network seam exists for message injection. Restrict access
@@ -95,6 +98,118 @@ private slots:
         QVERIFY2(!asset.isEmpty(), "The real travel asset must be available; do not silently use fallback speeds");
         QVERIFY(TravelTimeService::instance().loadFromFile(asset));
         QVERIFY(TravelTimeService::instance().isLoaded());
+    }
+
+    // NIED Kmoni 测站通道：首包台站表 + 增量震度数组解析，及连续震度->JMA 震度阶文本。
+    void kmoniStationParsesStationsAndIntensity() {
+        const QJsonObject stationsFrame = QJsonDocument::fromJson(R"({
+            "type":"kmoni","timestamp":1791893684277,
+            "stations":[
+                {"code":"ABSH01","lat":44.5276,"lon":142.8444,"name":"雄武","region":"北海道","station_type":"KiK-net"},
+                {"code":"ABSH02","lat":44.4234,"lon":143.0264,"name":"興部西","region":"北海道","station_type":"KiK-net"}
+            ]})").object();
+        const auto stations = KmoniStationParser::parseStations(stationsFrame);
+        QVERIFY(stations.has_value());
+        QCOMPARE(stations->size(), 2);
+        QCOMPARE(stations->at(0).code, QStringLiteral("ABSH01"));
+        QCOMPARE(stations->at(0).latitude, 44.5276);
+        QCOMPARE(stations->at(0).stationType, QStringLiteral("KiK-net"));
+        // 首包不含 int[]；增量帧不含 stations。
+        QVERIFY(!KmoniStationParser::parseIntensity(stationsFrame).has_value());
+
+        const QJsonObject frame = QJsonDocument::fromJson(R"({
+            "type":"kmoni","time":"20261013234717","timestamp":1791902839000,
+            "int":[-3, 0.5, 2.4, -3]})").object();
+        const auto intensity = KmoniStationParser::parseIntensity(frame);
+        QVERIFY(intensity.has_value());
+        QCOMPARE(intensity->size(), 4);
+        QCOMPARE(intensity->at(1), 0.5);
+        QVERIFY(!KmoniStationParser::parseStations(frame).has_value());
+
+        QCOMPARE(jmaShindoText(-3.0), QStringLiteral("?"));
+        QCOMPARE(jmaShindoText(0.4), QStringLiteral("0"));
+        QCOMPARE(jmaShindoText(2.4), QStringLiteral("2"));
+        QCOMPARE(jmaShindoText(4.6), QStringLiteral("5弱"));
+        QCOMPARE(jmaShindoText(5.2), QStringLiteral("5強"));
+        QCOMPARE(jmaShindoText(6.7), QStringLiteral("7"));
+    }
+
+    // PancakesSeis 测站通道：首包台站表 + 逐站三轴加速度帧解析，及 PGA->計測震度折算。
+    void pancakesSeisParsesStationsAndSamples() {
+        const QJsonObject stationsFrame = QJsonDocument::fromJson(R"({
+            "type":"stations","timestamp":1792147945777,"total":1,
+            "data":[
+                {"sid":0,"name":"四川省成都市郫都区",
+                 "location":{"lat":30.797,"lon":103.9078,"region":"四川省成都市郫都区"}}
+            ]})").object();
+        const auto stations = PancakesSeisParser::parseStations(stationsFrame);
+        QVERIFY(stations.has_value());
+        QCOMPARE(stations->size(), 1);
+        QCOMPARE(stations->at(0).sid, 0);
+        QCOMPARE(stations->at(0).latitude, 30.797);
+        QCOMPARE(stations->at(0).longitude, 103.9078);
+        QCOMPARE(stations->at(0).region, QStringLiteral("四川省成都市郫都区"));
+        // 台站表不含加速度字段；数据帧不含 type/data。
+        QVERIFY(!PancakesSeisParser::parseSample(stationsFrame).has_value());
+
+        const QJsonObject frame = QJsonDocument::fromJson(
+            R"({"s":0,"p":44.26,"x":27.019,"y":40.107,"z":9.378,"e":38.1,"t":1792147951411})")
+            .object();
+        const auto sample = PancakesSeisParser::parseSample(frame);
+        QVERIFY(sample.has_value());
+        QCOMPARE(sample->sid, 0);
+        QCOMPARE(sample->pga, 44.26);
+        QCOMPARE(sample->x, 27.019);
+        QCOMPARE(sample->timestamp, 1792147951411LL);
+        // `e`（芯片温度）不参与解析，缺 `type` 的帧不会被当成台站表。
+        QVERIFY(!PancakesSeisParser::parseStations(frame).has_value());
+
+        // PGA（Gal）-> JMA 計測震度近似：100 Gal ≈ 4.94；缺测（<=0）取 -3。
+        QVERIFY(std::abs(shindoFromPga(100.0) - 4.94) < 1e-9);
+        QCOMPARE(shindoFromPga(0.0), -3.0);
+    }
+
+    // Wolfx SeisJS 测站通道：自描述单站帧（自带坐标 + 計測震度）解析，及心跳/pong 判别。
+    void wolfxSeisParsesStationFrames() {
+        const QJsonObject heartbeat = QJsonDocument::fromJson(
+            R"({"type":"heartbeat","ver":11,"id":"82034e2d4b9ff89e","timestamp":"1792149278960"})")
+            .object();
+        QVERIFY(WolfxSeisParser::isHeartbeat(heartbeat));
+        QVERIFY(!WolfxSeisParser::isPong(heartbeat));
+        QVERIFY(!WolfxSeisParser::parseStation(heartbeat).has_value());
+
+        const QJsonObject pong = QJsonDocument::fromJson(
+            R"({"type":"pong","timestamp":"1792149279108"})").object();
+        QVERIFY(WolfxSeisParser::isPong(pong));
+        QVERIFY(!WolfxSeisParser::parseStation(pong).has_value());
+
+        const QJsonObject frame = QJsonDocument::fromJson(R"({
+            "type":"cfbb5286-e6ce-41a4-89e1-3938cb5e30ee","region":"四川省成都市",
+            "latitude":30.6,"longitude":104.1,"PGA":0.123,
+            "Shindo":"0","CalcShindo":-3.5,"Max_CalcShindo":-2.7,
+            "Intensity":1,"update_at":"2026-10-16 19:15:12"})").object();
+        QVERIFY(!WolfxSeisParser::isHeartbeat(frame));
+        const auto station = WolfxSeisParser::parseStation(frame);
+        QVERIFY(station.has_value());
+        QCOMPARE(station->id, QStringLiteral("cfbb5286-e6ce-41a4-89e1-3938cb5e30ee"));
+        QCOMPARE(station->region, QStringLiteral("四川省成都市"));
+        QCOMPARE(station->latitude, 30.6);
+        QCOMPARE(station->longitude, 104.1);
+        QCOMPARE(station->calcShindo, -3.5);
+        QCOMPARE(station->csis, 1);
+        QCOMPARE(station->updatedAt, QStringLiteral("2026-10-16 19:15:12"));
+
+        // 缺 `Intensity` 的帧不伪造烈度，置缺测哨兵 -1。
+        const QJsonObject noIntensity = QJsonDocument::fromJson(R"({
+            "type":"cfbb5286-e6ce-41a4-89e1-3938cb5e30ee","region":"四川省成都市",
+            "latitude":30.6,"longitude":104.1,"CalcShindo":-2.0,
+            "update_at":"2026-10-16 19:15:12"})").object();
+        const auto withoutIntensity = WolfxSeisParser::parseStation(noIntensity);
+        QVERIFY(withoutIntensity.has_value());
+        QCOMPARE(withoutIntensity->csis, -1);
+
+        // 缺坐标的帧不可展示。
+        QVERIFY(!WolfxSeisParser::parseStation({{"type", "abc"}}).has_value());
     }
 
     void linuxAutostartMigratesStorePath() {
