@@ -54,4 +54,12 @@ inline const QString kWhews = QStringLiteral("whews");
 inline const QString kSimulated = QStringLiteral("simulated");
 }
 
+/// 测站显示源唯一标识（仅桌面端）。这些源不产事件、不参与预警/去重/历史，
+/// 因此与事件源分开管理启停。
+namespace StationSourceIds {
+inline const QString kKmoni = QStringLiteral("kmoni");
+inline const QString kPancakesSeis = QStringLiteral("pancakes_seis");
+inline const QString kWolfxSeis = QStringLiteral("wolfx_seis");
+}
+
 } // namespace komira

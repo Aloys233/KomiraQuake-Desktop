@@ -11,7 +11,11 @@ ApplicationWindow {
     title: "KomiraQuake - 地震预警"
     Theme { id: appTheme }
     color: appTheme.surface
-    onClosing: function(close) { close.accepted = false; window.hide(); }
+    // 关闭到托盘（默认）：只隐藏窗口；关闭该设置后按系统惯例直接退出。
+    onClosing: function(close) {
+        if (app.settings.closeToTray) { close.accepted = false; window.hide(); }
+        else { close.accepted = true; Qt.quit(); }
+    }
     onVisibleChanged: app.setWindowVisible(visible)
     readonly property bool desktop: width >= 1024
     onDesktopChanged: if (!desktop) showList = false

@@ -50,6 +50,7 @@ TrayController::TrayController(AppController* app, QObject* parent)
     });
 
     connect(app_, &AppController::warningChanged, this, &TrayController::refresh);
+    connect(app_, &AppController::notifiableEvent, this, &TrayController::announceTier);
     refresh();
 }
 
@@ -68,30 +69,61 @@ QIcon TrayController::makeIcon(const QColor& color) {
     return QIcon(pixmap);
 }
 
-void TrayController::announceAlert(const QVariantMap& warning) {
-    // 门槛与音效 / HUD 一致：只有通过烈度过滤的预警级事件才提醒。
-    if (!app_->alertEligible()) return;
+void TrayController::announceTier(const QVariantMap& event, const QString& tier) {
     // toMap 的 id 已是 identity()，可直接作为去重键。
-    const QString identity = warning.value("id").toString();
-    if (identity.isEmpty() || identity == announced_) return;
-    announced_ = identity;
+    const QString identity = event.value("id").toString();
+    if (identity.isEmpty()) return;
+    const QString key = tier + QLatin1Char('|') + identity;
+    if (announced_.contains(key)) return;
+    announced_.insert(key);
+    if (announced_.size() > 512) announced_.clear();
 
     SettingsStore* settings = app_->settings();
-    const QString location = warning.value("location").toString();
-    if (settings && settings->enableDesktopNotification() && QSystemTrayIcon::supportsMessages()) {
+    if (!settings) return;
+
+    bool notify = false;
+    bool raise = false;
+    QString title;
+    QString body;
+    QSystemTrayIcon::MessageIcon icon = QSystemTrayIcon::Information;
+    const QString location = event.value("location").toString();
+    if (tier == QLatin1String("alert")) {
+        notify = settings->notifyAlert();
+        raise = settings->raiseAlert();
+        title = QStringLiteral("地震预警");
+        body = location.isEmpty() ? QStringLiteral("检测到地震，请注意避险。")
+                                  : QStringLiteral("%1，请注意避险。").arg(location);
+        icon = QSystemTrayIcon::Critical;
+    } else if (tier == QLatin1String("eew")) {
+        notify = settings->notifyEew();
+        raise = settings->raiseEew();
+        title = QStringLiteral("地震预警更新");
+        body = QStringLiteral("%1 · M %2")
+                   .arg(location.isEmpty() ? QStringLiteral("未知地点") : location)
+                   .arg(event.value("magnitude").toDouble(), 0, 'f', 1);
+        icon = QSystemTrayIcon::Warning;
+    } else if (tier == QLatin1String("info")) {
+        notify = settings->notifyInfo();
+        raise = settings->raiseInfo();
+        title = QStringLiteral("地震信息");
+        body = QStringLiteral("%1 · M %2")
+                   .arg(location.isEmpty() ? QStringLiteral("未知地点") : location)
+                   .arg(event.value("magnitude").toDouble(), 0, 'f', 1);
+        icon = QSystemTrayIcon::Information;
+    } else {
+        return;
+    }
+
+    if (notify && QSystemTrayIcon::supportsMessages()) {
         // 注意重载选择：QSystemTrayIcon 有两个 showMessage 重载 ——
         //   (title, msg, const QIcon&, int msecs) 与
         //   (title, msg, MessageIcon, int msecs)
-        // 直接传Critical 会被解析成第一个（QIcon 版），枚举值 2 被当成
-        // msecs，通知只显示 2 毫秒 —— 表现为「一闪而过」。显式转型锁定正确重载。
-        tray_.showMessage(
-            QStringLiteral("地震预警"),
-            location.isEmpty() ? QStringLiteral("检测到地震，请注意避险。")
-                               : QStringLiteral("%1，请注意避险。").arg(location),
-            QSystemTrayIcon::MessageIcon(QSystemTrayIcon::Critical), int{kNotifyTimeoutMs});
+        // 直接传枚举会被解析成第一个（QIcon 版），枚举值被当成 msecs，
+        // 通知只显示几毫秒 —— 表现为「一闪而过」。显式转型锁定正确重载。
+        tray_.showMessage(title, body, QSystemTrayIcon::MessageIcon(icon), int{kNotifyTimeoutMs});
     }
     // 抢焦点是打扰性最强的手段，默认关闭，由用户在设置里显式开启。
-    if (settings && settings->enableWindowRaise()) emit alertWindowRaiseRequested();
+    if (raise) emit alertWindowRaiseRequested();
 }
 
 void TrayController::refresh() {
@@ -103,7 +135,6 @@ void TrayController::refresh() {
         && (tag == QLatin1String("WARNING") || tag == QLatin1String("CRITICAL"));
 
     if (alert) {
-        announceAlert(warning);
         if (!blinkTimer_.isActive()) blinkTimer_.start();
         const QColor base = tag == QLatin1String("CRITICAL") ? QColor(0xBA, 0x1A, 0x1A)
                                                              : QColor(0xBC, 0x28, 0x00);
@@ -112,8 +143,13 @@ void TrayController::refresh() {
     } else {
         blinkTimer_.stop();
         blinkOn_ = false;
-        // 预警结束后允许下一个事件重新提醒。
-        announced_.clear();
+        // 预警结束后允许同一 identity 重新提醒；目录信息的去重键保留更久。
+        for (auto it = announced_.begin(); it != announced_.end();) {
+            if (it->startsWith(QLatin1String("alert|")) || it->startsWith(QLatin1String("eew|")))
+                it = announced_.erase(it);
+            else
+                ++it;
+        }
         tray_.setIcon(makeIcon(QColor(0x00, 0x68, 0x74)));
         tray_.setToolTip(QStringLiteral("KomiraQuake 地震预警 · 正常守候中"));
     }

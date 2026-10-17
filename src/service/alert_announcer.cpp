@@ -56,16 +56,23 @@ void AlertAnnouncer::onWarning(const EarthquakeEvent& event) {
     if (settings_->isMuted() || !eligible(event)) return;
     EventState& state = stateFor(event);
     const bool first = !state.issued;
-    if (first) sound_->play(QStringLiteral("issue"));
-    else if (event.isFinal) sound_->play(QStringLiteral("final"));
-    else sound_->play(QStringLiteral("update"), 3000);
+    // 播报内容分轨：事件语句与更新报文各自可关，状态推进不受影响。
+    if (first) {
+        if (settings_->announceEvent()) sound_->play(QStringLiteral("issue"));
+    } else if (event.isFinal) {
+        if (settings_->announceEvent()) sound_->play(QStringLiteral("final"));
+    } else if (settings_->announceUpdate()) {
+        sound_->play(QStringLiteral("update"), 3000);
+    }
 
-    if (event.warningLevel == WarningLevel::Critical && !state.warned) {
-        state.warned = state.cautioned = true;
-        sound_->play(QStringLiteral("warn"));
-    } else if (event.warningLevel == WarningLevel::Warning && !state.cautioned) {
-        state.cautioned = true;
-        sound_->play(QStringLiteral("caution"));
+    if (settings_->enableAlarmTone()) {
+        if (event.warningLevel == WarningLevel::Critical && !state.warned) {
+            state.warned = state.cautioned = true;
+            sound_->play(QStringLiteral("warn"));
+        } else if (event.warningLevel == WarningLevel::Warning && !state.cautioned) {
+            state.cautioned = true;
+            sound_->play(QStringLiteral("caution"));
+        }
     }
     state.issued = true;
 }
@@ -78,9 +85,9 @@ void AlertAnnouncer::onCountdown(const EarthquakeEvent& event, long long nowMs) 
     EventState& current = stateFor(event);
     if (current.countdownSeconds.contains(seconds)) return;
     current.countdownSeconds.insert(seconds);
-    sound_->playCountdownClip(seconds);
+    if (settings_->announceCountdown()) sound_->playCountdownClip(seconds);
 
-    if (seconds <= 10) {
+    if (seconds <= 10 && settings_->enableAlarmTone()) {
         EventState& state = stateFor(event);
         if (!state.intense) {
             state.intense = true;
@@ -97,6 +104,8 @@ void AlertAnnouncer::onArrived(const EarthquakeEvent& event) {
     // 与 Android 同规则：只有确实播过倒计时的事件才播抵达，避免从未提醒过的事件
     // 在倒计时缺席的情况下凭空播报抵达。
     if (state.countdownSeconds.isEmpty()) return;
+    // 抵达提示属于倒计时轨道：关闭倒计时时一并安静。
+    if (!settings_->announceCountdown()) return;
     // 抵达提示：`0s` + 两下计时音走提示通道连播，与 hypocenter 并发。
     sound_->playArrivalCues();
     sound_->play(QStringLiteral("hypocenter"), 10000);

@@ -748,7 +748,8 @@ Item {
     /// 省级分界线（province 层）只在 z >= 5 时画：全国概览（z4~5 以下）时 35 条省界
     /// 会糊成一团噪声，看不清底图。与 Android 的 PROVINCE_BORDER_MIN_ZOOM 对齐。
     readonly property real provinceBorderMinZoom: 5
-    readonly property bool showProvinceBorders: root.vectorActive && root.zoom >= root.provinceBorderMinZoom
+    readonly property bool showProvinceBorders: root.vectorActive && app.settings.showProvinceBorders
+        && root.zoom >= root.provinceBorderMinZoom
     /// 底图是否为纯矢量（供 syncTiles / tileUrl 早退）。显式函数而非 bool 属性，
     /// 避免属性在 Component.onCompleted 之前尚未求值时得到 undefined。
     function isVectorOnly() { return basemap === "vector"; }
@@ -899,7 +900,7 @@ Item {
         objectName: "pWaveRing"
         readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.pKm : -1
         z: 2
-        visible: radiusKm > 0
+        visible: radiusKm > 0 && app.settings.showWavefront
         opacity: app.waveRadii.pOpacity === undefined ? 0 : app.waveRadii.pOpacity
         x: root.hypocenterX - width / 2
         y: root.hypocenterY - height / 2
@@ -919,7 +920,7 @@ Item {
         readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.sKm : -1
         readonly property real fillOpacity: app.waveRadii.sFillOpacity === undefined ? 0 : app.waveRadii.sFillOpacity
         z: 2
-        visible: radiusKm > 0 && fillOpacity > 0
+        visible: radiusKm > 0 && fillOpacity > 0 && app.settings.showWavefront
         opacity: fillOpacity
         x: root.hypocenterX - width / 2
         y: root.hypocenterY - height / 2
@@ -954,7 +955,7 @@ Item {
         objectName: "sWaveRing"
         readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.sKm : -1
         z: 2
-        visible: radiusKm > 0
+        visible: radiusKm > 0 && app.settings.showWavefront
         opacity: app.waveRadii.sOpacity === undefined ? 0 : app.waveRadii.sOpacity
         x: root.hypocenterX - width / 2
         y: root.hypocenterY - height / 2
@@ -1031,6 +1032,7 @@ Item {
         centerLon: root.centerLon
         zoom: root.zoom
         snapshot: app.stationSnapshot
+        visible: app.settings.showStationLayer
         gcjShift: root.gcjDatum
         niedColors: root.theme.niedColorBand
         csisColors: root.theme.csisColorBand
@@ -1044,7 +1046,7 @@ Item {
         anchors.topMargin: 16
         spacing: 8
         z: 10
-        visible: !root.pickingLocation
+        visible: !root.pickingLocation && app.settings.showStationLayer
         // model 用**长度**而不是数组本身：stationSources 每 100 ms 全量重建，
         // 若直接当 model，Repeater 会把三张玻璃卡（含模糊层）反复销毁重建。
         Repeater {

@@ -14,6 +14,13 @@ Column {
     width: parent.width
     spacing: 12
 
+    /// 把持久化的震级阈值映射回下拉选项下标；非标准值取最近档。
+    function infoFilterIndex(value) {
+        if (value < 0) return 1;
+        if (value <= 0) return 0;
+        return Math.max(2, Math.min(10, Math.round((value - 1.0) / 0.5) + 2));
+    }
+
     Text {
         width: parent.width
         text: "各数据源平级、互为备份；关闭某个源后应用会改用其余源。"
@@ -196,6 +203,76 @@ Column {
                         text: "令牌保存后本机直连，不经第三方。单令牌最多 20 条并发连接，本应用只用 1 条聚合连接。"
                         color: root.theme.outline; font.pixelSize: 11; wrapMode: Text.Wrap; lineHeight: 1.4
                     }
+                }
+            }
+        }
+    }
+
+    // 测站显示源：只画地图、不产事件，故与上面的事件源分开管理。
+    SettingsSection {
+        width: parent.width; theme: root.theme; title: "测站显示源"; iconName: "activity"
+        Text {
+            width: parent.width
+            text: "仅用于地图测站强度与右上角卡片，不参与预警、去重或历史记录。关闭后立即断开该源。"
+            wrapMode: Text.Wrap; lineHeight: 1.4
+            color: root.theme.outline; font.pixelSize: 12
+        }
+        GlassSwitch {
+            objectName: "kmoniStationSwitch"
+            width: parent.width; theme: root.theme
+            text: "NIED 强震监测"
+            description: "經 Jian 转发的 Kmoni 实时测站震度（JMA 計測震度）。"
+            checked: app.settings.isStationSourceEnabled("kmoni")
+            onToggled: app.settings.setStationSourceEnabled("kmoni", checked)
+        }
+        GlassSwitch {
+            objectName: "pancakesSeisSwitch"
+            width: parent.width; theme: root.theme
+            text: "PancakesSeis 加速度台站"
+            description: "PGA 折算为中国地震烈度（CSIS）。"
+            checked: app.settings.isStationSourceEnabled("pancakes_seis")
+            onToggled: app.settings.setStationSourceEnabled("pancakes_seis", checked)
+        }
+        GlassSwitch {
+            objectName: "wolfxSeisSwitch"
+            width: parent.width; theme: root.theme
+            text: "Wolfx SeisJS 台站"
+            description: "报文自带中国地震烈度（CSIS）。"
+            checked: app.settings.isStationSourceEnabled("wolfx_seis")
+            onToggled: app.settings.setStationSourceEnabled("wolfx_seis", checked)
+        }
+    }
+
+    // 逐源信息事件震级过滤：只过滤目录情报，不影响实时预警。
+    SettingsSection {
+        width: parent.width; theme: root.theme; title: "信息事件震级过滤"; iconName: "sliders-horizontal"
+        Text {
+            width: parent.width
+            text: "低于所选震级的目录情报不会显示、也不会入库。实时预警不受此过滤影响。"
+            wrapMode: Text.Wrap; lineHeight: 1.4
+            color: root.theme.outline; font.pixelSize: 12
+        }
+        Repeater {
+            model: app.sources
+            delegate: RowLayout {
+                required property var modelData
+                width: parent.width; spacing: 12
+                visible: modelData.id !== "simulated" || app.settings.developerMode
+                Text {
+                    Layout.fillWidth: true
+                    text: modelData.name
+                    color: root.theme.textPrimary; font.pixelSize: 14
+                    elide: Text.ElideRight
+                }
+                GlassComboBox {
+                    objectName: "infoFilter-" + modelData.id
+                    Layout.preferredWidth: 132
+                    theme: root.theme
+                    Accessible.name: "信息事件震级过滤 · " + modelData.name
+                    model: ["不过滤", "不接收", "M 1.0", "M 1.5", "M 2.0", "M 2.5", "M 3.0", "M 3.5", "M 4.0", "M 4.5", "M 5.0"]
+                    currentIndex: root.infoFilterIndex(app.settings.infoMagnitudeFilter(modelData.id))
+                    onActivated: index => app.settings.setInfoMagnitudeFilter(
+                        modelData.id, [0, -1, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0][index])
                 }
             }
         }

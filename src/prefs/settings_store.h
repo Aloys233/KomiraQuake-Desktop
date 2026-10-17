@@ -14,18 +14,36 @@ class SettingsStore : public QObject {
     Q_PROPERTY(int customBasemapDatum READ customBasemapDatum WRITE setCustomBasemapDatum NOTIFY changed)
     /// 在栅格底图之上叠加矢量层（省界 / 区县）；开启时预警按区县烈度着色。
     Q_PROPERTY(bool vectorOverlay READ vectorOverlay WRITE setVectorOverlay NOTIFY changed)
+    /// 矢量层中的省界描边；关闭后只保留区县填色。
+    Q_PROPERTY(bool showProvinceBorders READ showProvinceBorders WRITE setShowProvinceBorders NOTIFY changed)
+    /// 地图叠加层：测站强度点与右上角测站卡片、P/S 波前圆。
+    Q_PROPERTY(bool showStationLayer READ showStationLayer WRITE setShowStationLayer NOTIFY changed)
+    Q_PROPERTY(bool showWavefront READ showWavefront WRITE setShowWavefront NOTIFY changed)
     Q_PROPERTY(int intensityStandard READ intensityStandard WRITE setIntensityStandard NOTIFY changed)
     Q_PROPERTY(double localIntensityFilter READ localIntensityFilter WRITE setLocalIntensityFilter NOTIFY changed)
     Q_PROPERTY(bool enableWarnings READ enableWarnings WRITE setEnableWarnings NOTIFY changed)
     Q_PROPERTY(bool enableSoundAlert READ enableSoundAlert WRITE setEnableSoundAlert NOTIFY changed)
-    Q_PROPERTY(bool enableDesktopNotification READ enableDesktopNotification WRITE setEnableDesktopNotification NOTIFY changed)
-    Q_PROPERTY(bool enableWindowRaise READ enableWindowRaise WRITE setEnableWindowRaise NOTIFY changed)
+    /// 提醒矩阵（视觉）：分级事件各自决定是否弹系统通知 / 置顶主窗口。
+    /// alert = 通过本地烈度过滤的预警；eew = 其余实时预警；info = 目录地震信息。
+    Q_PROPERTY(bool notifyAlert READ notifyAlert WRITE setNotifyAlert NOTIFY changed)
+    Q_PROPERTY(bool raiseAlert READ raiseAlert WRITE setRaiseAlert NOTIFY changed)
+    Q_PROPERTY(bool notifyEew READ notifyEew WRITE setNotifyEew NOTIFY changed)
+    Q_PROPERTY(bool raiseEew READ raiseEew WRITE setRaiseEew NOTIFY changed)
+    Q_PROPERTY(bool notifyInfo READ notifyInfo WRITE setNotifyInfo NOTIFY changed)
+    Q_PROPERTY(bool raiseInfo READ raiseInfo WRITE setRaiseInfo NOTIFY changed)
+    /// 播报内容分轨：首发/终报、更新报、倒计时与抵达、警报音可分别关闭。
+    Q_PROPERTY(bool announceEvent READ announceEvent WRITE setAnnounceEvent NOTIFY changed)
+    Q_PROPERTY(bool announceUpdate READ announceUpdate WRITE setAnnounceUpdate NOTIFY changed)
+    Q_PROPERTY(bool announceCountdown READ announceCountdown WRITE setAnnounceCountdown NOTIFY changed)
+    Q_PROPERTY(bool enableAlarmTone READ enableAlarmTone WRITE setEnableAlarmTone NOTIFY changed)
     Q_PROPERTY(bool reduceMotion READ reduceMotion WRITE setReduceMotion NOTIFY changed)
     Q_PROPERTY(bool backgroundBlur READ backgroundBlur WRITE setBackgroundBlur NOTIFY changed)
     Q_PROPERTY(bool isMuted READ isMuted WRITE setIsMuted NOTIFY changed)
     /// 已禁用的数据源 id 列表。采用「禁用集合」而非「启用集合」：未列出的源默认启用，
     /// 新增数据源无需迁移即默认开启（两端一致）。
     Q_PROPERTY(QStringList disabledSources READ disabledSources WRITE setDisabledSources NOTIFY changed)
+    /// 已禁用的测站显示源 id 列表（仅桌面端）。空的禁用集合 = 三路测站都开启。
+    Q_PROPERTY(QStringList disabledStationSources READ disabledStationSources WRITE setDisabledStationSources NOTIFY changed)
     /// Jian 数据源的刷新令牌（rt_…，登录后由应用写入并持久化；不向 UI 回显明文）。
     Q_PROPERTY(QString jianRefreshToken READ jianRefreshToken WRITE setJianRefreshToken NOTIFY changed)
     /// 是否已完成 Jian 登录（有刷新令牌）。未登录时设置页显示登录框，且该源不会被启动。
@@ -45,6 +63,8 @@ class SettingsStore : public QObject {
     /// 主题模式：`system` / `light` / `dark`。替代旧版布尔 darkMode（迁移见 themeMode()）。
     Q_PROPERTY(QString themeMode READ themeMode WRITE setThemeMode NOTIFY changed)
     Q_PROPERTY(bool silentStart READ silentStart WRITE setSilentStart NOTIFY changed)
+    /// 关闭主窗口时收进托盘（默认）；关闭时直接退出应用。
+    Q_PROPERTY(bool closeToTray READ closeToTray WRITE setCloseToTray NOTIFY changed)
     Q_PROPERTY(bool autoCheckUpdates READ autoCheckUpdates WRITE setAutoCheckUpdates NOTIFY changed)
 
 public:
@@ -63,6 +83,13 @@ public:
     bool vectorOverlay() const { return s_.value("vectorOverlay", false).toBool(); }
     void setVectorOverlay(bool v) { set("vectorOverlay", v); }
 
+    bool showProvinceBorders() const { return s_.value("showProvinceBorders", true).toBool(); }
+    void setShowProvinceBorders(bool v) { set("showProvinceBorders", v); }
+    bool showStationLayer() const { return s_.value("showStationLayer", true).toBool(); }
+    void setShowStationLayer(bool v) { set("showStationLayer", v); }
+    bool showWavefront() const { return s_.value("showWavefront", true).toBool(); }
+    void setShowWavefront(bool v) { set("showWavefront", v); }
+
     int intensityStandard() const { return s_.value("intensityStandard", 0).toInt(); } // 0 csis, 1 jma
     void setIntensityStandard(int v) { set("intensityStandard", v); }
 
@@ -76,13 +103,36 @@ public:
     bool enableSoundAlert() const { return s_.value("enableSoundAlert", true).toBool(); }
     void setEnableSoundAlert(bool v) { set("enableSoundAlert", v); }
 
-    /// 桌面端预警时弹出系统托盘通知气泡。点击通知或托盘图标打开主窗口。
-    bool enableDesktopNotification() const { return s_.value("enableDesktopNotification", true).toBool(); }
-    void setEnableDesktopNotification(bool v) { set("enableDesktopNotification", v); }
+    /// 提醒矩阵（视觉）。旧键 enableDesktopNotification / enableWindowRaise 只在
+    /// 新键缺失时作为 alert 分级的迁移来源，之后一律以新键为准。
+    bool notifyAlert() const {
+        if (s_.contains("notifyAlert")) return s_.value("notifyAlert").toBool();
+        return s_.value("enableDesktopNotification", true).toBool();
+    }
+    void setNotifyAlert(bool v) { set("notifyAlert", v); }
+    bool raiseAlert() const {
+        if (s_.contains("raiseAlert")) return s_.value("raiseAlert").toBool();
+        return s_.value("enableWindowRaise", false).toBool();
+    }
+    void setRaiseAlert(bool v) { set("raiseAlert", v); }
+    bool notifyEew() const { return s_.value("notifyEew", false).toBool(); }
+    void setNotifyEew(bool v) { set("notifyEew", v); }
+    bool raiseEew() const { return s_.value("raiseEew", false).toBool(); }
+    void setRaiseEew(bool v) { set("raiseEew", v); }
+    bool notifyInfo() const { return s_.value("notifyInfo", false).toBool(); }
+    void setNotifyInfo(bool v) { set("notifyInfo", v); }
+    bool raiseInfo() const { return s_.value("raiseInfo", false).toBool(); }
+    void setRaiseInfo(bool v) { set("raiseInfo", v); }
 
-    /// 桌面端预警时把主窗口拉到前台。会抢焦点，默认关闭。
-    bool enableWindowRaise() const { return s_.value("enableWindowRaise", false).toBool(); }
-    void setEnableWindowRaise(bool v) { set("enableWindowRaise", v); }
+    /// 播报内容分轨：默认全开；关闭只影响对应片段，不影响其余。
+    bool announceEvent() const { return s_.value("announceEvent", true).toBool(); }
+    void setAnnounceEvent(bool v) { set("announceEvent", v); }
+    bool announceUpdate() const { return s_.value("announceUpdate", true).toBool(); }
+    void setAnnounceUpdate(bool v) { set("announceUpdate", v); }
+    bool announceCountdown() const { return s_.value("announceCountdown", true).toBool(); }
+    void setAnnounceCountdown(bool v) { set("announceCountdown", v); }
+    bool enableAlarmTone() const { return s_.value("enableAlarmTone", true).toBool(); }
+    void setEnableAlarmTone(bool v) { set("enableAlarmTone", v); }
 
     bool backgroundBlur() const { return s_.value("backgroundBlur", true).toBool(); }
     void setBackgroundBlur(bool v) { set("backgroundBlur", v); }
@@ -113,6 +163,38 @@ public:
         if ((!disabled.contains(id)) == enabled) return;
         if (enabled) disabled.removeAll(id); else disabled << id;
         set("disabledSources", disabled);
+    }
+
+    /// 测站显示源（仅桌面端）：与事件源分开管理，默认全开。
+    QStringList disabledStationSources() const {
+        return s_.value("disabledStationSources").toStringList();
+    }
+    void setDisabledStationSources(const QStringList& v) { set("disabledStationSources", v); }
+    Q_INVOKABLE bool isStationSourceEnabled(const QString& id) const {
+        return !disabledStationSources().contains(id);
+    }
+    Q_INVOKABLE void setStationSourceEnabled(const QString& id, bool enabled) {
+        QStringList disabled = disabledStationSources();
+        if ((!disabled.contains(id)) == enabled) return;
+        if (enabled) disabled.removeAll(id); else disabled << id;
+        set("disabledStationSources", disabled);
+    }
+
+    /// 逐源「信息事件震级过滤」：仅作用于目录事件，不影响实时预警链路。
+    /// -1 = 不接收；0 = 不过滤；>0 = 低于该震级的信息事件不显示。
+    Q_INVOKABLE double infoMagnitudeFilter(const QString& sourceId) const {
+        return s_.value(QStringLiteral("minMagnitude.") + sourceId, 0.0).toDouble();
+    }
+    Q_INVOKABLE void setInfoMagnitudeFilter(const QString& sourceId, double value) {
+        set(QStringLiteral("minMagnitude.") + sourceId, value);
+    }
+    /// 目录事件是否通过逐源震级过滤。未知震级（<= 0）不因阈值被丢弃。
+    bool passesInfoMagnitudeFilter(const QString& sourceId, double magnitude) const {
+        const double filter = infoMagnitudeFilter(sourceId);
+        if (filter < 0.0) return false;
+        if (filter <= 0.0) return true;
+        if (magnitude <= 0.0) return true;
+        return magnitude + 1e-9 >= filter;
     }
 
     QString jianRefreshToken() const { return s_.value("jianRefreshToken", "").toString(); }
@@ -161,6 +243,10 @@ public:
     /// 静默启动：启动时不显示主窗口，仅保留托盘（等同「关闭窗口」）。
     bool silentStart() const { return s_.value("silentStart", false).toBool(); }
     void setSilentStart(bool v) { set("silentStart", v); }
+
+    /// 关闭主窗口时收进托盘（默认）；关闭时直接退出应用。
+    bool closeToTray() const { return s_.value("closeToTray", true).toBool(); }
+    void setCloseToTray(bool v) { set("closeToTray", v); }
 
     /// 启动时后台自动检查一次新版本。
     bool autoCheckUpdates() const { return s_.value("autoCheckUpdates", true).toBool(); }

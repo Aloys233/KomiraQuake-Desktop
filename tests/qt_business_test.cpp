@@ -543,6 +543,57 @@ private slots:
         QCOMPARE(settings.intensityStandard(), 0);
     }
 
+    // 新增的提醒矩阵 / 声音分轨 / 图层 / 逐源过滤默认值，以及旧通知键的迁移。
+    void granularSettingsDefaultsAndMigration() {
+        QSettings().clear();
+        {
+            SettingsStore settings;
+            QVERIFY(settings.notifyAlert());
+            QVERIFY(!settings.raiseAlert());
+            QVERIFY(!settings.notifyEew());
+            QVERIFY(!settings.raiseEew());
+            QVERIFY(!settings.notifyInfo());
+            QVERIFY(!settings.raiseInfo());
+            QVERIFY(settings.announceEvent());
+            QVERIFY(settings.announceUpdate());
+            QVERIFY(settings.announceCountdown());
+            QVERIFY(settings.enableAlarmTone());
+            QVERIFY(settings.showStationLayer());
+            QVERIFY(settings.showWavefront());
+            QVERIFY(settings.showProvinceBorders());
+            QVERIFY(settings.closeToTray());
+            QVERIFY(settings.isStationSourceEnabled(QStringLiteral("kmoni")));
+            QCOMPARE(settings.infoMagnitudeFilter(QStringLiteral("wolfx")), 0.0);
+            QVERIFY(settings.passesInfoMagnitudeFilter(QStringLiteral("wolfx"), 3.0));
+
+            // 逐源过滤：不接收 / 低于阈值 / 未知震级。
+            settings.setInfoMagnitudeFilter(QStringLiteral("wolfx"), -1.0);
+            QVERIFY(!settings.passesInfoMagnitudeFilter(QStringLiteral("wolfx"), 6.0));
+            settings.setInfoMagnitudeFilter(QStringLiteral("wolfx"), 4.0);
+            QVERIFY(!settings.passesInfoMagnitudeFilter(QStringLiteral("wolfx"), 3.9));
+            QVERIFY(settings.passesInfoMagnitudeFilter(QStringLiteral("wolfx"), 4.0));
+            QVERIFY(settings.passesInfoMagnitudeFilter(QStringLiteral("wolfx"), 0.0));
+
+            settings.setStationSourceEnabled(QStringLiteral("kmoni"), false);
+            QVERIFY(!settings.isStationSourceEnabled(QStringLiteral("kmoni")));
+            settings.setNotifyEew(true);
+            settings.setAnnounceCountdown(false);
+        }
+        SettingsStore reloaded;
+        QVERIFY(reloaded.notifyEew());
+        QVERIFY(!reloaded.announceCountdown());
+        QVERIFY(!reloaded.isStationSourceEnabled(QStringLiteral("kmoni")));
+        QCOMPARE(reloaded.infoMagnitudeFilter(QStringLiteral("wolfx")), 4.0);
+
+        // 旧键迁移：新键缺失时沿用旧通知/置顶设置。
+        QSettings().clear();
+        QSettings().setValue("enableDesktopNotification", false);
+        QSettings().setValue("enableWindowRaise", true);
+        SettingsStore migrated;
+        QVERIFY(!migrated.notifyAlert());
+        QVERIFY(migrated.raiseAlert());
+    }
+
     // 需要鉴权的源默认关闭，且未填凭据前不建立连接。
     void credentialSourcesAreOffByDefault() {
         QSettings().clear();

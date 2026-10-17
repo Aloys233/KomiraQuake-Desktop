@@ -275,6 +275,7 @@ void SimulatedSource::onAdmission(const EarthquakeEvent& event, AdmissionStatus 
     case AdmissionStatus::Applied: label = QStringLiteral("applied"); break;
     case AdmissionStatus::Tombstoned: label = QStringLiteral("tombstoned"); break;
     case AdmissionStatus::Duplicate: label = QStringLiteral("duplicate"); break;
+    case AdmissionStatus::Filtered: label = QStringLiteral("filtered"); break;
     case AdmissionStatus::Ended: label = lastEmitted_.isCanceled ? QStringLiteral("canceled")
                                                                 : QStringLiteral("ended"); break;
     }

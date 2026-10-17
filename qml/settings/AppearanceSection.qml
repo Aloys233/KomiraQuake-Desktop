@@ -2,8 +2,8 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 
-// 「界面与地图」分区：外观（主题 / 背景模糊 / 减少动效）与地图底图。
-// 由 SettingsPage 实例化并按 currentSection 切换 visible。
+// 「外观」分区：主题与渲染效果。地图底图/图层已独立到「地图与图层」，避免
+// 一个分区同时承担两件互不相关的事。
 Column {
     id: root
     objectName: "settingsPanel-appearance"
@@ -12,7 +12,7 @@ Column {
     spacing: 20
 
     SettingsSection {
-        width: parent.width; theme: root.theme; title: "外观"; iconName: "sun"
+        width: parent.width; theme: root.theme; title: "主题"; iconName: "sun"
         Flow {
             width: parent.width; spacing: 10
             Repeater {
@@ -68,6 +68,10 @@ Column {
             wrapMode: Text.Wrap; lineHeight: 1.4
             color: root.theme.outline; font.pixelSize: 12
         }
+    }
+
+    SettingsSection {
+        width: parent.width; theme: root.theme; title: "显示效果"; iconName: "eye"
         GlassSwitch {
             objectName: "backgroundBlurSwitch"
             width: parent.width; theme: root.theme; text: "背景模糊"
@@ -85,57 +89,6 @@ Column {
             description: "停用装饰过渡。真实波前、预计倒计时和数据更新不受影响。"
             checked: app.settings.reduceMotion
             onToggled: app.settings.reduceMotion = checked
-        }
-    }
-
-    SettingsSection {
-        width: parent.width; theme: root.theme; title: "地图底图"; iconName: "map"
-        Column {
-            width: parent.width; spacing: 10
-            Text { text: "底图"; color: root.theme.textPrimary; font.pixelSize: 14 }
-            GlassComboBox {
-                objectName: "basemapCombo"
-                width: parent.width; theme: root.theme; Accessible.name: "底图"
-                model: ["高德标准 · GCJ-02", "Petal · GCJ-02", "OpenStreetMap · WGS-84", "矢量 · WGS-84", "自定义底图"]
-                readonly property var ids: ["amap_vector", "petal", "osm", "vector", "custom"]
-                // 未知 id（旧版残留，如已下线的卫星图）回落到第一项而不是空白。
-                currentIndex: Math.max(0, ids.indexOf(app.settings.basemapId))
-                onActivated: index => app.settings.basemapId = ids[index]
-            }
-            // 栅格底图上叠加矢量层：选纯矢量底图时本就画矢量，无需再叠一层。
-            // 区县烈度着色跟随本开关，不再单独设置。
-            Row {
-                width: parent.width; spacing: 10; visible: app.settings.basemapId !== "vector"
-                Text {
-                    width: parent.width - 52; color: root.theme.textPrimary; font.pixelSize: 14
-                    text: "叠加矢量层（省界 / 区县着色）"
-                }
-                GlassSwitch {
-                    objectName: "vectorOverlaySwitch"
-                    width: 44
-                    text: ""
-                    theme: root.theme; checked: app.settings.vectorOverlay
-                    Accessible.name: "叠加矢量层"
-                    onToggled: app.settings.vectorOverlay = checked
-                }
-            }
-        }
-        Column {
-            width: parent.width; spacing: 10
-            visible: app.settings.basemapId === "custom"
-            GlassTextField {
-                width: parent.width; theme: root.theme
-                placeholderText: "瓦片 URL 模板：{z}/{x}/{y}"
-                Accessible.name: "自定义瓦片 URL"
-                text: app.settings.customBasemapUrl
-                onEditingFinished: app.settings.customBasemapUrl = text
-            }
-            GlassComboBox {
-                width: parent.width; theme: root.theme; Accessible.name: "自定义底图坐标系"
-                model: ["WGS-84", "GCJ-02"]
-                currentIndex: app.settings.customBasemapDatum
-                onActivated: index => app.settings.customBasemapDatum = index
-            }
         }
     }
 }

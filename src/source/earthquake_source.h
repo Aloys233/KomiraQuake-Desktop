@@ -18,6 +18,7 @@ enum class AdmissionStatus {
     Applied,      ///< 已进入（或更新）活动事件
     Tombstoned,   ///< 被终态墓碑压制：同一 eventId 此前已结束，旧报不得重开提醒
     Duplicate,    ///< 与已收报文重复（EventGate 判定）
+    Filtered,     ///< 被逐源「信息事件震级过滤」丢弃（仅目录事件）
     Ended,        ///< 取消报或已过期，活动事件随即结束
 };
 

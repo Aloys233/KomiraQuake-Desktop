@@ -173,6 +173,9 @@ public:
     Q_INVOKABLE QString severityColor(const QString& levelTag) const;
 
 signals:
+    /// 分级提醒：tier ∈ {alert, eew, info}。alert = 通过本地烈度过滤的预警，
+    /// eew = 其余实时预警，info = 新入库的目录地震信息。托盘按设置决定通知/置顶。
+    void notifiableEvent(const QVariantMap& event, const QString& tier);
     void statusChanged();
     void clockChanged();
     void locationChanged();

@@ -21,6 +21,7 @@
 #include "map/vector_map_item.h"
 #include "map/station_map_item.h"
 #include "model/station_snapshot.h"
+#include "source/wolfx_source.h"
 #include "store/history_store.h"
 #define private public
 #include "app/app_controller.h"
@@ -386,9 +387,9 @@ private slots:
             QVERIFY(screenshot(dark ? "07-map-dark-blur-on" : "07-map-light-blur-on"));
             QVERIFY(clickText("设置"));
             QVERIFY(screenshot(dark ? "08-settings-dark" : "08-settings-light"));
-            QVERIFY(clickText("定位与基准地"));
+            QVERIFY(clickText("定位"));
             QVERIFY(screenshot(dark ? "08-location-dark" : "08-location-light"));
-            QVERIFY(clickText("界面与地图"));
+            QVERIFY(clickText("外观"));
             QVERIFY(screenshot(dark ? "09-appearance-dark" : "09-appearance-light"));
             QVERIFY(clickText("返回地图"));
         }
@@ -410,7 +411,7 @@ private slots:
         QVERIFY(screenshot("10-settings-narrow"));
         auto* settingsPage = window->findChild<QQuickItem*>("settingsPage");
         QVERIFY(settingsPage);
-        for (int section = 0; section < 6; ++section) {
+        for (int section = 0; section < 8; ++section) {
             settingsPage->setProperty("currentSection", section);
             QTest::qWait(30);
             for (auto* item : visualItems(settingsPage)) {
@@ -1158,6 +1159,7 @@ private slots:
             QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, position);
             return true;
         };
+        QVERIFY(click("settingsNav-appearance"));
         QVERIFY(capture("settings-default-light"));
         // Click the real QML controls: calling the C++ setter here would miss the original bug.
         QVERIFY(click("darkThemeButton"));
@@ -1188,7 +1190,7 @@ private slots:
         QCOMPARE(background->property("color").value<QColor>(), lightBackground);
         QVERIFY(capture("settings-selected-light"));
 
-        const QStringList categories = {"appearance", "location", "warning", "audio", "source", "clock", "about"};
+        const QStringList categories = {"warning", "audio", "map", "appearance", "location", "source", "clock", "about"};
         for (int index = 0; index < categories.size(); ++index) {
             QVERIFY(click("settingsNav-" + categories[index]));
             QTRY_COMPARE(page->property("currentSection").toInt(), index);
@@ -1236,13 +1238,15 @@ private slots:
 
         window->resize(360, 520);
         QTRY_VERIFY(!sidebar->isVisible());
+        // 当前停在「外观」；窄屏下拉从当前项开始上下移动。
+        page->setProperty("currentSection", 3);
         auto* combo = window->findChild<QQuickItem*>("settingsCategoryCombo");
         QVERIFY(combo && combo->isVisible());
         combo->forceActiveFocus(Qt::TabFocusReason);
         QTest::keyClick(window, Qt::Key_Down);
-        QTRY_COMPARE(page->property("currentSection").toInt(), 1);
+        QTRY_COMPARE(page->property("currentSection").toInt(), 4);
         QTest::keyClick(window, Qt::Key_Up);
-        QTRY_COMPARE(page->property("currentSection").toInt(), 0);
+        QTRY_COMPARE(page->property("currentSection").toInt(), 3);
         QTest::qWait(50);
         QVERIFY(click("darkThemeButton"));
         QTRY_VERIFY(controller.darkMode());
@@ -1261,6 +1265,147 @@ private slots:
         QTest::keyClick(window, Qt::Key_Escape);
         QTRY_VERIFY(!window->property("showSettings").toBool());
         QVERIFY2(qmlErrors.isEmpty(), qPrintable(qmlErrors.join('\n')));
+    }
+
+    // 分级提醒信号：同一帧实时事件按是否达到本地门槛归入 alert / eew；目录事件归 info。
+    void notificationTiersEmitPerEventKind() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("NotificationTierTest");
+        AppController controller(nullptr, false);
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        QSignalSpy tiers(&controller, &AppController::notifiableEvent);
+
+        auto makeEvent = [&](const QString& id, double magnitude) {
+            EarthquakeEvent e;
+            e.id = e.eventId = id.toStdString();
+            e.timestamp = now;
+            e.reportTime = now;
+            e.latitude = 30.0;
+            e.longitude = 104.0;
+            e.depth = 10.0;
+            e.magnitude = magnitude;
+            e.location = "测试事件";
+            e.sourceAgency = "TEST";
+            e.warningLevel = WarningLevel::Warning;
+            return e;
+        };
+
+        // 总开关关闭：未通过本地过滤 → eew 级，而不是静默丢弃。
+        controller.handleEvent(makeEvent("EEW-1", 5.0), false, false);
+        QCOMPARE(tiers.count(), 1);
+        QCOMPARE(tiers.at(0).at(1).toString(), QStringLiteral("eew"));
+
+        // 打开总开关且过滤为 0：同一路径应升级为 alert 级。
+        controller.settings()->setEnableWarnings(true);
+        controller.handleEvent(makeEvent("ALERT-1", 6.0), false, false);
+        QCOMPARE(tiers.count(), 2);
+        QCOMPARE(tiers.at(1).at(1).toString(), QStringLiteral("alert"));
+
+        // 目录事件：新入库且时间新鲜 → info 级。
+        EarthquakeEvent info = makeEvent("INFO-1", 4.2);
+        info.latitude = 31.5;
+        info.longitude = 105.5;
+        info.timestamp = now + 1000;
+        info.reportTime = now;
+        controller.handleEvent(info, false, true);
+        QCOMPARE(tiers.count(), 3);
+        QCOMPARE(tiers.at(2).at(1).toString(), QStringLiteral("info"));
+
+        // 同一物理地震的后续目录更新不再重复发 info。
+        controller.handleEvent(info, false, true);
+        QCOMPARE(tiers.count(), 3);
+
+        // 逐源震级过滤：Wolfx 设为「不接收」后，它的目录事件不入库、不通知。
+        WolfxSource probe;
+        controller.settings()->setInfoMagnitudeFilter(QStringLiteral("wolfx"), -1.0);
+        EarthquakeEvent filtered = makeEvent("FILTERED-1", 3.0);
+        filtered.latitude = 33.0;
+        filtered.longitude = 110.0;
+        filtered.timestamp = now + 2000;
+        filtered.reportTime = now;
+        const int before = controller.eventList().size();
+        controller.handleEvent(filtered, false, true, &probe);
+        QCOMPARE(controller.eventList().size(), before);
+        QCOMPARE(tiers.count(), 3);
+
+        // 回到不过滤后同一条事件重新入库并通知一次。
+        controller.settings()->setInfoMagnitudeFilter(QStringLiteral("wolfx"), 0.0);
+        controller.handleEvent(filtered, false, true, &probe);
+        QCOMPARE(tiers.count(), 4);
+        QCOMPARE(tiers.at(3).at(1).toString(), QStringLiteral("info"));
+    }
+
+    // 新增控件必须真的写回设置：提醒矩阵、播报分轨、关闭到托盘各点一次。
+    void granularSettingsRoundTripThroughUi() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("GranularSettingsTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setEnableWarnings(true);
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showSettings", true);
+        auto* page = window->findChild<QQuickItem*>("settingsPage");
+        auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
+        QVERIFY(page && scroll);
+        QTest::qWait(80);
+        // 分区内的控件常落在视口之外：先把目标滚到中间再点，否则点击会被窗口丢弃。
+        auto click = [&](const QString& name) {
+            auto* item = findVisualItem(window, name);
+            if (!item || !item->isVisible() || !item->isEnabled()) return false;
+            const qreal maxY =
+                qMax<qreal>(0, scroll->property("contentHeight").toReal() - scroll->height());
+            const qreal contentY = scroll->property("contentY").toReal();
+            const QPointF center =
+                item->mapToItem(scroll, QPointF(item->width() / 2, item->height() / 2));
+            scroll->setProperty("contentY",
+                                qBound<qreal>(0, contentY + center.y() - scroll->height() / 2, maxY));
+            QTest::qWait(60);
+            const QPoint position = item->mapToScene(QPointF(item->width() / 2, item->height() / 2)).toPoint();
+            if (!QRect(QPoint(0, 0), window->size()).contains(position)) return false;
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, position);
+            return true;
+        };
+
+        // 提醒矩阵（默认分区）
+        QVERIFY(click("notifyAlertSwitch"));
+        QTRY_VERIFY(!controller.settings()->notifyAlert());
+        QVERIFY(click("raiseAlertSwitch"));
+        QTRY_VERIFY(controller.settings()->raiseAlert());
+
+        // 播报分轨
+        page->setProperty("currentSection", 1);
+        QTest::qWait(60);
+        QVERIFY(click("announceCountdownSwitch"));
+        QTRY_VERIFY(!controller.settings()->announceCountdown());
+
+        // 关闭到托盘
+        page->setProperty("currentSection", 7);
+        QTest::qWait(60);
+        QVERIFY(click("closeToTraySwitch"));
+        QTRY_VERIFY(!controller.settings()->closeToTray());
+
+        // 恢复默认后全部回到初始值。
+        controller.settings()->resetToDefaults();
+        QVERIFY(controller.settings()->notifyAlert());
+        QVERIFY(!controller.settings()->raiseAlert());
+        QVERIFY(controller.settings()->announceCountdown());
+        QVERIFY(controller.settings()->closeToTray());
     }
 
     void mapLayerSettingsAndVectorOverlay() {
@@ -1290,12 +1435,15 @@ private slots:
         window->setProperty("showSettings", true);
         QTest::qWait(100);
 
+        auto* page = window->findChild<QQuickItem*>("settingsPage");
         auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
         auto* vectorSwitch = findVisualItem(window, "vectorOverlaySwitch");
-        QVERIFY(scroll && vectorSwitch);
+        QVERIFY(page && scroll && vectorSwitch);
+        page->setProperty("currentSection", 2);   // 「地图与图层」
+        QTest::qWait(60);
         QVERIFY(vectorSwitch->isVisible());
-        QVERIFY2(vectorSwitch->width() <= 64,
-                 "map switch must remain visible beside its label");
+        QVERIFY2(vectorSwitch->width() > 0 && vectorSwitch->width() <= scroll->width(),
+                 "map switch must remain inside the settings column");
 
         // 开关位于「地图底图」分区底部，默认落在视口之外 —— isVisible() 不反映滚动裁剪，
         // 直接点击会落在窗口外被丢弃。先把设置页滚到让目标居中的位置再点。

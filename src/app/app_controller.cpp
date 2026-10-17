@@ -359,6 +359,14 @@ void AppController::wire() {
                 source->start();
             else source->stop();
         }
+        // 测站显示源独立于事件源门控：关闭后立即断开连接并清空图层数据。
+        const auto syncStation = [this](bool enabled, auto* source) {
+            if (startServices_ && enabled) source->start(); else source->stop();
+        };
+        syncStation(settings_->isStationSourceEnabled(StationSourceIds::kKmoni), stationSource_);
+        syncStation(settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis), seisSource_);
+        syncStation(settings_->isStationSourceEnabled(StationSourceIds::kWolfxSeis), wolfxSeisSource_);
+        scheduleStationIntensityRefresh();
         sound_->setEnabled(settings_->enableSoundAlert());
         sound_->setVolume(settings_->alertVolume());
         clock_->setCustomServer(settings_->customNtpServer());
@@ -399,19 +407,22 @@ void AppController::wire() {
                 [this]() { scheduleStationIntensityRefresh(); });
         connect(stationSource_, &KmoniStationSource::intensityChanged, this,
                 [this]() { scheduleStationIntensityRefresh(); });
-        stationSource_->start();
+        if (settings_->isStationSourceEnabled(StationSourceIds::kKmoni))
+            stationSource_->start();
         // PancakesSeis 测站显示源：同上，与 Kmoni 共用地图测站图层。
         connect(seisSource_, &PancakesSeisSource::stationsChanged, this,
                 [this]() { scheduleStationIntensityRefresh(); });
         connect(seisSource_, &PancakesSeisSource::dataChanged, this,
                 [this]() { scheduleStationIntensityRefresh(); });
-        seisSource_->start();
+        if (settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis))
+            seisSource_->start();
         // Wolfx SeisJS 测站显示源：同上，共用地图测站图层。
         connect(wolfxSeisSource_, &WolfxSeisSource::stationsChanged, this,
                 [this]() { scheduleStationIntensityRefresh(); });
         connect(wolfxSeisSource_, &WolfxSeisSource::dataChanged, this,
                 [this]() { scheduleStationIntensityRefresh(); });
-        wolfxSeisSource_->start();
+        if (settings_->isStationSourceEnabled(StationSourceIds::kWolfxSeis))
+            wolfxSeisSource_->start();
         clock_->setCustomServer(settings_->customNtpServer());
         clock_->setEnabled(settings_->enableNtpSync());
         clock_->start();
@@ -667,7 +678,8 @@ void AppController::refreshStationSnapshot() {
     std::vector<StationSnapshot::Entry> entries;
 
     // NIED Kmoni：raw 为 JMA 計測震度（缺测哨兵 -3）。
-    if (stationSource_ && stationSource_->hasData()) {
+    if (stationSource_ && stationSource_->hasData()
+        && settings_->isStationSourceEnabled(StationSourceIds::kKmoni)) {
         const auto& stations = stationSource_->stations();
         const auto& intensity = stationSource_->intensity();
         entries.reserve(entries.size() + stations.size());
@@ -681,7 +693,8 @@ void AppController::refreshStationSnapshot() {
         }
     }
     // PancakesSeis：PGA（Gal）折算为中国地震烈度（CSIS）；缺测哨兵 -1。
-    if (seisSource_ && seisSource_->hasData()) {
+    if (seisSource_ && seisSource_->hasData()
+        && settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis)) {
         const auto& stations = seisSource_->stations();
         const auto& pga = seisSource_->pga();
         entries.reserve(entries.size() + stations.size());
@@ -696,7 +709,8 @@ void AppController::refreshStationSnapshot() {
         }
     }
     // Wolfx SeisJS：报文自带中国地震烈度 `Intensity`，直接进入 CSIS 域。
-    if (wolfxSeisSource_ && wolfxSeisSource_->hasData()) {
+    if (wolfxSeisSource_ && wolfxSeisSource_->hasData()
+        && settings_->isStationSourceEnabled(StationSourceIds::kWolfxSeis)) {
         const auto& stations = wolfxSeisSource_->stations();
         entries.reserve(entries.size() + stations.size());
         for (const auto& station : stations) {
@@ -715,14 +729,14 @@ void AppController::refreshStationSnapshot() {
 QVariantList AppController::stationSources() const {
     // 每个测站源一张卡片：NIED 沿用 JMA 計測震度，Pancakes / Wolfx 用中国地震烈度（CSIS）。
     QVariantList list;
-    if (stationSource_) {
+    if (stationSource_ && settings_->isStationSourceEnabled(StationSourceIds::kKmoni)) {
         const double raw = stationSource_->hasData() ? stationSource_->maxIntensity()
                                                       : KmoniStationProtocol::kMissing;
         list.push_back(stationCard(QStringLiteral("kmoni"), QStringLiteral("NIED"),
                                    raw > KmoniStationProtocol::kMissing, raw, IntensityStandard::Jma,
                                    stationSource_->stations().size(), stationSource_->frameTime()));
     }
-    if (seisSource_) {
+    if (seisSource_ && settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis)) {
         const double pga = seisSource_->maxPga();
         const bool hasData = seisSource_->hasData() && pga > PancakesSeisProtocol::kMissingPga;
         const double raw = hasData ? IntensityCalculator::csisFromPga(pga) : kMissingCsis;
@@ -735,7 +749,7 @@ QVariantList AppController::stationSources() const {
                                    hasData, raw, IntensityStandard::Csis,
                                    seisSource_->stations().size(), frameTime));
     }
-    if (wolfxSeisSource_) {
+    if (wolfxSeisSource_ && settings_->isStationSourceEnabled(StationSourceIds::kWolfxSeis)) {
         const int maxCsis = wolfxSeisSource_->hasData() ? wolfxSeisSource_->maxCsis()
                                                         : WolfxSeisProtocol::kMissingIntensity;
         const bool hasData = maxCsis >= 0;
@@ -1089,13 +1103,40 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         QStringLiteral("info"));
     // Directory and warning gates are deliberately independent.
     if (inDirectory) {
+        // 逐源信息事件震级过滤：只影响目录展示，不拦截实时预警链路。
+        if (source && !settings_->passesInfoMagnitudeFilter(source->id(), event.magnitude)) {
+            admit(event, AdmissionStatus::Filtered);
+            return;
+        }
         const auto decision = gate_.admit(event, nowMs());
         if (decision == EventGateDecision::Duplicate || decision == EventGateDecision::Stale) {
             admit(event, AdmissionStatus::Duplicate);
             return;
         }
+        // 同一物理地震可能已由实时预警或别的源先入库：新事件只通知一次。
+        bool alreadyKnown = false;
+        for (const auto& h : history_) {
+            if (samePhysicalEvent(h, event)) { alreadyKnown = true; break; }
+        }
+        if (!alreadyKnown) {
+            for (const auto& entry : sessions_.active) {
+                if (samePhysicalEvent(entry.second.event, event)) { alreadyKnown = true; break; }
+            }
+        }
         if (isAlertLevel(event.warningLevel)) event.warningLevel = WarningLevel::Watch;
-        if (upsertHistory(event)) queueHistoryWrite(event);
+        const bool changed = upsertHistory(event);
+        if (changed) {
+            queueHistoryWrite(event);
+            // 仅对「刚发生」的新信息提醒；启动时回填几百条历史不应刷屏。
+            const long long stamp = event.reportTime > 0 ? event.reportTime : event.timestamp;
+            const long long now = nowMs();
+            const bool recent = stamp > 0 && stamp <= now + 60'000 && now - stamp <= 30 * 60'000;
+            if (!alreadyKnown && recent) {
+                const IntensityStandard standard = settings_->intensityStandard() == 1
+                    ? IntensityStandard::Jma : IntensityStandard::Csis;
+                emit notifiableEvent(toMap(event, standard), QStringLiteral("info"));
+            }
+        }
         if (hasMapFocus_ && mapFocus_.identity() == event.identity() &&
             !sessions_.active.count(event.identity())) {
             // 目录事件没有推送时间；保留实时链路已知的最后一报推送时间，
@@ -1131,6 +1172,14 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         return;
     }
     const bool added = change == WarningSession::Change::Added;
+    if (added && !replay && !event.isCanceled) {
+        const IntensityStandard standard = settings_->intensityStandard() == 1
+            ? IntensityStandard::Jma : IntensityStandard::Csis;
+        // 只有「达成本地门槛 + 预警级」才算 alert；其余实时事件归 eew（默认不打扰）。
+        const bool alertTier = announcer_->eligible(event) && isAlertLevel(event.warningLevel);
+        emit notifiableEvent(toMap(event, standard),
+                             alertTier ? QStringLiteral("alert") : QStringLiteral("eew"));
+    }
     const long long now = nowMs();
     const bool eventIsProtected = isProtectedAlert(event, now);
 

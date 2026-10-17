@@ -134,6 +134,7 @@ set(KOMIRA_QML_FILES
     qml/StationIntensityCard.qml
     qml/SettingsPage.qml
     qml/settings/AppearanceSection.qml
+    qml/settings/MapSection.qml
     qml/settings/LocationSection.qml
     qml/settings/WarningSection.qml
     qml/settings/AudioSection.qml

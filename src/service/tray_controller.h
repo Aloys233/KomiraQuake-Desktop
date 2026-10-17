@@ -3,6 +3,7 @@
 #include <QColor>
 #include <QIcon>
 #include <QObject>
+#include <QSet>
 #include <QString>
 #include <QSystemTrayIcon>
 #include <QTimer>
@@ -28,8 +29,8 @@ signals:
 
 private:
     void refresh();
-    /// 预警首次成为活动事件时弹一次通知，并按设置请求把主窗口拉到前台。
-    void announceAlert(const QVariantMap& warning);
+    /// 分级提醒：按 tier 读取对应的「通知 / 置顶」设置，同一事件只提醒一次。
+    void announceTier(const QVariantMap& event, const QString& tier);
     static QIcon makeIcon(const QColor& color);
 
     AppController* app_ = nullptr;
@@ -37,10 +38,10 @@ private:
     QMenu* menu_ = nullptr;
     QTimer blinkTimer_;
     bool blinkOn_ = false;
-    /// 已弹过通知的事件 identity：同一事件只提醒一次，修正报不重复打扰。
-    QString announced_;
+    /// 已提醒过的 `tier|identity`：同一事件只提醒一次，修正报不重复打扰。
+    QSet<QString> announced_;
     /// 通知气泡驻留时长。与 Qt 默认一致，但显式传入以免被枚举隐式转换覆盖
-    /// （见 announceAlert 注释：Critical 的值 2 会被当成 msecs）。
+    /// （见 announceTier 注释：MessageIcon 的值会被当成 msecs）。
     static constexpr int kNotifyTimeoutMs = 10'000;
 };
 

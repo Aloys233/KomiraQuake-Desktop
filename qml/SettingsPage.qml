@@ -10,14 +10,16 @@ Item {
     property Theme theme: Theme {}
     property int currentSection: 0
     readonly property bool compact: width < 760
+    // 任务式分区：先决定「什么值得提醒」，再拆声音、地图、外观、定位、数据源与系统行为。
     readonly property var sections: [
-        { key: "appearance", title: "界面与地图", icon: "layers", description: "选择舒适的外观，调整地图的显示方式。" },
-        { key: "location", title: "定位与基准地", icon: "map-pin", description: "设置用于估算本地烈度、距离与预计到时的位置。" },
-        { key: "warning", title: "预警策略", icon: "shield", description: "决定何时提醒，不再展开的选项会置灰显示。" },
-        { key: "audio", title: "警报提醒", icon: "volume-2", description: "管理警报声音、系统通知与窗口弹窗。" },
-        { key: "source", title: "数据源", icon: "radio", description: "查看各数据源的连接与目录刷新状态。" },
+        { key: "warning", title: "预警提醒", icon: "bell", description: "提醒条件与分级提醒方式。" },
+        { key: "audio", title: "声音", icon: "volume-2", description: "警报音量与播报内容分轨。" },
+        { key: "map", title: "地图与图层", icon: "map", description: "底图，以及地图上的矢量、测站与波前叠加层。" },
+        { key: "appearance", title: "外观", icon: "sun", description: "主题、背景模糊与动态效果。" },
+        { key: "location", title: "定位", icon: "map-pin", description: "设置用于估算本地烈度、距离与预计到时的位置。" },
+        { key: "source", title: "数据源", icon: "radio", description: "逐源启停、测站显示与信息事件震级过滤。" },
         { key: "clock", title: "时间校准", icon: "clock", description: "网络授时：开关、自定义 NTP 服务器与校准状态。" },
-        { key: "about", title: "自启与更新", icon: "refresh-cw", description: "管理开机自启与静默启动，检查新版本。" }
+        { key: "about", title: "启动与更新", icon: "refresh-cw", description: "开机自启、静默启动、关闭行为与版本更新。" }
     ]
     signal back()
     signal pickLocationRequested()
@@ -131,35 +133,39 @@ Item {
                     }
 
                     // 全部分区都实例化，仅按 currentSection 切换 visible。
-                    AppearanceSection {
+                    WarningSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 0; height: visible ? implicitHeight : 0
                     }
-                    LocationSection {
+                    AudioSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 1; height: visible ? implicitHeight : 0
-                        onPickLocationRequested: root.pickLocationRequested()
-                        onNotify: (message, success) => toast.show(message, success)
                     }
-                    WarningSection {
+                    MapSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 2; height: visible ? implicitHeight : 0
                     }
-                    AudioSection {
+                    AppearanceSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 3; height: visible ? implicitHeight : 0
                     }
-                    SourceSection {
+                    LocationSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 4; height: visible ? implicitHeight : 0
+                        onPickLocationRequested: root.pickLocationRequested()
+                        onNotify: (message, success) => toast.show(message, success)
                     }
-                    ClockSection {
+                    SourceSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 5; height: visible ? implicitHeight : 0
                     }
-                    AboutSection {
+                    ClockSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 6; height: visible ? implicitHeight : 0
+                    }
+                    AboutSection {
+                        width: parent.width; theme: root.theme
+                        visible: root.currentSection === 7; height: visible ? implicitHeight : 0
                     }
                 }
             }

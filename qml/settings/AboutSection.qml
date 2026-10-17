@@ -21,9 +21,16 @@ Column {
         GlassSwitch {
             objectName: "silentStartSwitch"
             width: parent.width; theme: root.theme; text: "静默启动"
-            description: "启动时不显示主窗口，只保留托盘图标；可从托盘菜单随时打开（等同于关闭窗口）。"
+            description: "启动时不显示主窗口，只保留托盘图标；可从托盘菜单随时打开。"
             checked: app.settings.silentStart
             onToggled: app.settings.silentStart = checked
+        }
+        GlassSwitch {
+            objectName: "closeToTraySwitch"
+            width: parent.width; theme: root.theme; text: "关闭窗口时收进托盘"
+            description: "关闭主窗口后继续在后台保持连接；从托盘菜单可重新打开或退出。关闭本项后，关闭窗口即退出应用。"
+            checked: app.settings.closeToTray
+            onToggled: app.settings.closeToTray = checked
         }
     }
 
