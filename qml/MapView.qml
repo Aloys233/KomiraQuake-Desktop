@@ -537,8 +537,6 @@ Item {
     /// 视口外预取一圈，避免缩放/切层时同时创建过多 Image delegate。
     /// 拖动跨过边界时只补一条边，旧层仍负责兜底。
     readonly property int prefetchMargin: 1
-    /// 瓦片就绪后淡入时长（ms）：掩盖跨层级切换时清晰度突变造成的顿挫。
-    readonly property int tileFadeMs: 180
 
     /// 当前应绘制的瓦片集合，存**绝对瓦片坐标 + 层级 tz**。用 ListModel + 增量增删：
     /// 平移跨过瓦片边界时只增删边缘一圈，已有瓦片的 delegate 不重建、source 不变，不会整屏闪黑重载。
@@ -553,6 +551,9 @@ Item {
     property int underlayZ: -1
     /// 顶层瓦片状态表：key "tz:tx:ty" -> Image.status，用于判断新层是否已加载完成。
     property var tileStatus: ({})
+    /// tileStatus 是普通 JS 对象，原地改字段不会触发绑定；每次变更递增此值，
+    /// 让依赖 tileStatus 的绑定（父层兜底可见性）重新求值。
+    property int tileStatusRevision: 0
     /// 当前顶层尚未结算（Null/Loading）的瓦片数。状态变化增量维护，避免每张瓦片
     /// Loading/Ready 都遍历整个 ListModel。
     property int topLayerPendingTiles: 0
@@ -563,10 +564,13 @@ Item {
         interval: 8000
         onTriggered: root.retireUnderlay()
     }
-    /// 顶层全部就绪后，等新层淡入（见 delegate 的 opacity）完成再撤底衬，避免淡入期间露底。
+    /// 顶层全部就绪后撤掉底衬。不再额外等待淡入：新层是直接整层接管的，
+    /// 没有「淡入期间露底」的窗口；旧层多留一帧都只会盖住新图。
+    /// 用 0ms Timer 而不是直接调用：就绪通知可能发生在 syncTiles 的增删循环里，
+    /// 此时立刻删底衬会改动正在遍历的 ListModel。
     Timer {
-        id: underlayFadeTimer
-        interval: root.tileFadeMs
+        id: underlayRetireTimer
+        interval: 0
         onTriggered: root.retireUnderlay()
     }
     onTileZoomChanged: {
@@ -594,7 +598,7 @@ Item {
 
     function retireUnderlay() {
         underlayMaxTimer.stop();
-        underlayFadeTimer.stop();
+        underlayRetireTimer.stop();
         const u = root.underlayZ;
         if (u < 0) return;
         for (let i = tileModel.count - 1; i >= 0; --i) {
@@ -607,11 +611,18 @@ Item {
     function tileIsPending(status) {
         return status === undefined || status === Image.Null || status === Image.Loading;
     }
+    /// 本格瓦片是否已经有像素。父层兜底只在这之前显示；Ready 后立即让位。
+    function tileReady(tz, tx, ty) {
+        // 依赖 tileStatusRevision：tileStatus 是原地改写的 JS 对象，本身不发通知。
+        root.tileStatusRevision;
+        return tileStatus[tileStatusKey(tz, tx, ty)] === Image.Ready;
+    }
 
     function noteTileStatus(tz, tx, ty, status) {
         const key = tileStatusKey(tz, tx, ty);
         const oldStatus = tileStatus[key];
         tileStatus[key] = status;
+        if ((status === Image.Ready) !== (oldStatus === Image.Ready)) ++root.tileStatusRevision;
         if (tz === tileModelZoom && tileIsPending(oldStatus) !== tileIsPending(status)) {
             root.topLayerPendingTiles += tileIsPending(status) ? 1 : -1;
         }
@@ -650,19 +661,18 @@ Item {
     }
     /// 顶层瓦片全部结算（Ready/Error，无 Loading/Null）才撤掉底衬，
     /// 避免冷瓦片（如 Petal 高层）加载慢时被固定计时器提前撤走而露白。
-    /// 就绪后再等 tileFadeMs，让新层淡入完成，避免淡入期间露底。
     function refreshTopLayerState() {
         if (underlayZ < 0) return;
         // 镜头补间期间不撤底衬：新视口边缘的瓦片是移动途中才加入集合的，
         // 提前撤掉旧层会让后半程露白。补间结束（onStopped）后再结算。
         if (cameraMove.running) {
-            underlayFadeTimer.stop();
+            underlayRetireTimer.stop();
             return;
         }
         if (topLayerTileCount > 0 && topLayerPendingTiles === 0) {
-            if (!underlayFadeTimer.running) underlayFadeTimer.start();
+            if (!underlayRetireTimer.running) underlayRetireTimer.start();
         } else {
-            underlayFadeTimer.stop();
+            underlayRetireTimer.stop();
         }
     }
 
@@ -901,9 +911,17 @@ Item {
                 clip: true
                 /// 父层级别；低于图源下界（Petal 无 z0）时为 -1，直接不兜底。
                 readonly property int parentLevel: tileCell.tz - 2 >= root.tileMinZoom ? tileCell.tz - 2 : -1
-                // 只给当前层兜底：底衬层自身已就绪，再加载父层纯属浪费。
-                readonly property bool active: parentLevel >= 0 && tileCell.tz === root.tileModelZoom
+                /// 只在「本格瓦片还没就绪」时显示父层，且**有底衬时不显示**：
+                /// 跨层过渡期旧层（tz±1）已经整屏垫在最下面，父层（tz-2）更粗，
+                /// 画上去只会盖住更好的旧层 —— 用户看到的就是「整屏闪一下更糊的图」。
+                /// 父层只用于没有底衬可垫的首屏/平移缺口。
+                readonly property bool active: parentLevel >= 0
+                        && tileCell.tz === root.tileModelZoom
+                        && root.underlayZ < 0
+                        && !root.tileReady(tileCell.tz, tileCell.tx, tileCell.ty)
+                visible: active && fallbackImage.status === Image.Ready
                 Image {
+                    id: fallbackImage
                     width: parent.width * 4
                     height: parent.height * 4
                     // 父瓦片左上角对齐到 4×4 格块，再按本格在父块中的行列偏移窗口。
@@ -916,10 +934,6 @@ Item {
                     asynchronous: true
                     cache: true
                     smooth: true
-                    opacity: status === Image.Ready ? 1 : 0
-                    Behavior on opacity {
-                        NumberAnimation { duration: root.tileFadeMs; easing.type: Easing.OutCubic }
-                    }
                 }
             }
             Image {
@@ -930,11 +944,11 @@ Item {
                 asynchronous: true
                 cache: true
                 smooth: true
-                /// 就绪后淡入：底衬（旧层）在下方透出，跨层切换因此是渐变而非整块突变。
+                /// 就绪即 1:1 绘制，**不做 opacity 淡入**。
+                /// 跨层时整层瓦片同时就绪，若让它从 0 淡到 1，新旧两个 zoom 会在
+                /// 180ms 内半透明交叠（用户看到「其他 zoom 的瓦片淡出」）。
+                /// 缺口由父层兜底和底衬（underlayZ）保证，不需要靠透明度过渡。
                 opacity: status === Image.Ready ? 1 : 0
-                Behavior on opacity {
-                    NumberAnimation { duration: root.tileFadeMs; easing.type: Easing.OutCubic }
-                }
                 onStatusChanged: root.noteTileStatus(tileCell.tz, tileCell.tx, tileCell.ty, status)
             }
         }

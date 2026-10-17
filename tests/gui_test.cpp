@@ -615,6 +615,205 @@ private slots:
                  "zoom transition should retain at most two bounded tile layers");
     }
 
+    /// 复现/回归：跨 zoom 层级时不得让旧层瓦片在屏幕上「淡出」。
+    /// 旧的实现把两个层级的瓦片都做成 opacity 0→1 的淡入，且底衬层自己不淡出：
+    /// 跨层瞬间旧层新 delegate 从透明开始，用户看到整屏旧地图慢慢浮出/消失。
+    /// 这里用本地彩色瓦片（file URL），在跨层后连抓多帧，断言：
+    ///   1) 每一帧旧层瓦片都不以半透明形式存在（opacity 恒为 1）；
+    ///   2) 抓帧像素里不出现「旧层颜色与新层颜色各占一半」的过渡色。
+    void zoomTransitionKeepsTileLayersOpaque() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("TileOpacityTest");
+        qputenv("QML_DISABLE_DISK_CACHE", "1");
+
+        // 本地生成纯色瓦片：只需覆盖镜头附近的瓦片窗口（全量 z2..8 是 7 万多张，
+        // 会把测试拖到两分钟以上）。颜色按 tz 区分，同一层所有瓦片同色，
+        // 便于用像素判断「当前显示的是哪一层」。文件名 {z}/{x}/{y}.png，
+        // 配合 customBasemapUrl 的 file:// 模板。
+        const QString tileDir = isolated.path() + "/tiles";
+        auto levelColor = [](int z) {
+            // 每层一个高饱和主色，避免与背景/矢量层混淆。
+            static const QColor colors[] = {
+                QColor(0xE6, 0x39, 0x46), QColor(0xF7, 0x67, 0x06),
+                QColor(0xE9, 0xAB, 0x00), QColor(0x2E, 0x8B, 0x57),
+                QColor(0x1D, 0x7F, 0xD6), QColor(0x6E, 0x56, 0xCF),
+                QColor(0xC0, 0x36, 0x9B), QColor(0x8D, 0x6E, 0x63),
+                QColor(0x0F, 0x76, 0x6E),
+            };
+            return colors[z % 9];
+        };
+        auto tileXAt = [](double lon, int z) {
+            return int(std::floor((lon + 180.0) / 360.0 * (1 << z)));
+        };
+        auto tileYAt = [](double lat, int z) {
+            const double rad = lat * M_PI / 180.0;
+            const double y = (1.0 - std::log(std::tan(rad) + 1.0 / std::cos(rad)) / M_PI) / 2.0;
+            return int(std::floor(y * (1 << z)));
+        };
+        QImage img(256, 256, QImage::Format_RGB32);
+        for (int z = 2; z <= 8; ++z) {
+            const int n = 1 << z;
+            const int cx = tileXAt(105.0, z);
+            const int cy = tileYAt(30.0, z);
+            QVERIFY(QDir().mkpath(tileDir + "/" + QString::number(z)));
+            for (int x = cx - 7; x <= cx + 7; ++x) {
+                if (x < 0 || x >= n) continue;
+                const QString dir = tileDir + "/" + QString::number(z) + "/" + QString::number(x);
+                QVERIFY(QDir().mkpath(dir));
+                for (int y = cy - 5; y <= cy + 6; ++y) {
+                    if (y < 0 || y >= n) continue;
+                    img.fill(levelColor(z));
+                    QVERIFY2(img.save(dir + "/" + QString::number(y) + ".png"),
+                             "failed to write local tile");
+                }
+            }
+        }
+
+        AppController controller(nullptr, false);
+        controller.settings()->setCustomBasemapUrl("file://" + tileDir + "/{z}/{x}/{y}.png");
+        controller.settings()->setCustomBasemapDatum(0);
+        controller.settings()->setBasemapId("custom");
+        controller.settings()->setVectorOverlay(false);
+        controller.settings()->setShowStationLayer(false);
+        controller.settings()->setShowWavefront(false);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(mapView);
+
+        // 镜头放到固定位置、整数层级，等瓦片全部 Ready。
+        mapView->setProperty("centerLat", 30.0);
+        mapView->setProperty("centerLon", 105.0);
+        mapView->setProperty("zoom", 5.0);
+        QTRY_VERIFY_WITH_TIMEOUT(mapView->property("tileModelZoom").toInt() == 5, 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(mapView->property("topLayerTileCount").toInt() > 0, 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(mapView->property("topLayerPendingTiles").toInt() == 0, 5000);
+        window->grabWindow();
+
+        // 场景图里的 Image delegate 按 model 行序排列；找出 z=5 的瓦片节点，
+        // 其 opacity 必须是 1（旧层不得从 0 淡入）。
+        auto tileImages = [&](int tz) {
+            QList<QQuickItem*> out;
+            auto* renderLayer = window->findChild<QQuickItem*>("mapRenderLayer");
+            if (!renderLayer) return out;
+            for (auto* item : visualItems(renderLayer)) {
+                if (item->inherits("QQuickImage") && item->parentItem()
+                        && item->parentItem()->property("tz").toInt() == tz
+                        && item->parentItem()->property("tz").isValid()) {
+                    out.append(item);
+                }
+            }
+            return out;
+        };
+        // 自检：确实找到了瓦片节点，否则下面的断言会空转通过。
+        QTRY_VERIFY_WITH_TIMEOUT(!tileImages(5).isEmpty(), 2000);
+
+        // 跨层：z=5 → z=6。旧层立即成为底衬。
+        mapView->setProperty("zoom", 6.0);
+        // 换层是同步通知的：此刻新层瓦片还一张都没加载，底衬必须已经就位。
+        // （不能 QTRY 等——本地瓦片可能在下一帧就全部就绪，底衬随即被正常撤除。）
+        QCOMPARE(mapView->property("underlayZ").toInt(), 5);
+        // 确定性检查：新层集合建立时，父层兜底必须全部关闭。
+        QTRY_VERIFY_WITH_TIMEOUT(mapView->property("tileModelZoom").toInt() == 6, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(mapView->property("topLayerTileCount").toInt() > 0, 1000);
+        for (auto* item : visualItems(window->contentItem())) {
+            if (!item->inherits("QQuickImage")) continue;
+            auto* cell = item->parentItem();
+            if (!cell || !cell->property("parentLevel").isValid()) continue;
+            QVERIFY2(cell->property("parentLevel").toInt() < 0
+                     || !cell->property("active").toBool(),
+                     "tz-2 parent fallback is active while an underlay is present — "
+                     "users see a coarser zoom flash");
+        }
+
+        // 连续采样一个淡入窗口（180ms）加余量；同时容忍底衬在过渡中被撤除
+        // （本地瓦片加载极快时，整个过渡可能只持续几帧）。
+        const QColor newColor = levelColor(6);
+        const QColor oldColor = levelColor(5);
+        const QColor mixColor((oldColor.red() + newColor.red()) / 2,
+                              (oldColor.green() + newColor.green()) / 2,
+                              (oldColor.blue() + newColor.blue()) / 2);
+        auto near = [](const QColor& a, const QColor& b) {
+            return std::abs(a.red() - b.red()) < 20
+                && std::abs(a.green() - b.green()) < 20
+                && std::abs(a.blue() - b.blue()) < 20;
+        };
+        // 地图区域采样点：避开左上 HUD、右侧控件栏、左下角徽章。
+        auto sampleMapPixels = [&](const QImage& shot, auto&& fn) {
+            for (int y = shot.height() / 3; y < shot.height() * 2 / 3; y += 7)
+                for (int x = shot.width() / 4; x < shot.width() / 2; x += 7)
+                    fn(shot.pixelColor(x, y));
+        };
+        int oldSamples = 0, blendedFrames = 0, parentBlinkFrames = 0;
+        for (int frame = 0; frame < 12; ++frame) {
+            QTest::qWait(20);
+            const QImage shot = window->grabWindow();
+            for (auto* img : tileImages(5)) {
+                oldSamples++;
+                QVERIFY2(img->opacity() > 0.999,
+                         qPrintable(QStringLiteral("underlay tile at opacity %1 — "
+                                                   "old zoom tiles visibly fade")
+                                    .arg(img->opacity())));
+            }
+            // 当前层瓦片一旦出现在屏幕上，也不能是半透明的（淡入会让新旧层混色）。
+            for (auto* img : tileImages(6)) {
+                if (img->opacity() > 0 && img->opacity() < 0.999)
+                    QFAIL("top-layer tile is rendering half-transparent (cross-fade between zooms)");
+            }
+            // 父层兜底（tz-2）在跨层过渡期绝不能被画出来：它比底衬更糊，
+            // 一旦显示就是「整屏闪一下更粗的 zoom」。底衬存在时必须始终不可见。
+            bool parentVisible = false;
+            for (auto* item : visualItems(window->contentItem())) {
+                if (!item->inherits("QQuickImage")) continue;
+                auto* parent = item->parentItem();
+                if (!parent || !parent->property("parentLevel").isValid()) continue;
+                if (parent->property("parentLevel").toInt() >= 0 && item->isVisible()
+                        && item->opacity() > 0.01 && item->width() > 0 && item->height() > 0) {
+                    parentVisible = true;
+                }
+            }
+            if (parentVisible) parentBlinkFrames++;
+            // 像素层：过渡帧里不应出现「旧新各半」的混合色。
+            int blended = 0;
+            sampleMapPixels(shot, [&](const QColor& c) {
+                if (near(c, mixColor)) blended++;
+            });
+            if (blended > 2) blendedFrames++;
+        }
+        QVERIFY2(oldSamples > 0 || mapView->property("underlayZ").toInt() < 0,
+                 "no underlay tiles were sampled while the underlay was still alive");
+        QVERIFY2(parentBlinkFrames == 0,
+                 qPrintable(QStringLiteral("%1 transition frames drew the tz-2 parent fallback — "
+                                           "users see a coarser zoom flash")
+                                .arg(parentBlinkFrames)));
+        QVERIFY2(blendedFrames == 0,
+                 qPrintable(QStringLiteral("%1 transition frames showed blended old/new tile "
+                                           "colours — the two zoom levels cross-fade")
+                                .arg(blendedFrames)));
+
+        // 过渡结束后：只剩新层，旧层必须已撤除。
+        QTest::qWait(400);
+        const QImage shot = window->grabWindow();
+        int solidOld = 0, solidNew = 0;
+        sampleMapPixels(shot, [&](const QColor& c) {
+            if (near(c, oldColor)) solidOld++;
+            else if (near(c, newColor)) solidNew++;
+        });
+        QVERIFY2(solidNew > 0, "new zoom level did not render after transition");
+        QVERIFY2(solidOld == 0, "old zoom tiles still visible long after transition");
+    }
+
     void districtShadingClearsOnCanceledReport() {
         QTemporaryDir isolated;
         QVERIFY(isolated.isValid());
