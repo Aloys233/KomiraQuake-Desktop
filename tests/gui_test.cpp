@@ -19,6 +19,9 @@
 #include <QSGRendererInterface>
 #include <QQmlEngine>
 #include "map/vector_map_item.h"
+#include "map/station_map_item.h"
+#include "model/station_snapshot.h"
+#include "store/history_store.h"
 #define private public
 #include "app/app_controller.h"
 #include "service/alert_announcer.h"
@@ -78,6 +81,7 @@ private:
         if (done) return;
         done = true;
         qmlRegisterType<komira::VectorMapItem>("KomiraQuake", 1, 0, "VectorMapItem");
+        qmlRegisterType<komira::StationMapItem>("KomiraQuake", 1, 0, "StationMapItem");
     }
 
 private slots:
@@ -825,6 +829,194 @@ private slots:
         }
         qInfo() << "PROBE drag:" << frames << "frames, avg" << (total / frames) << "ms, worst"
                 << worst << "ms";
+    }
+
+    /// 回归：目录整表重发时，未变化的事件不应重复写库；新条目合并成一次事务。
+    /// 逐条 upsert + prune 实测 200 条约 400 ms，启动/复显时会把 GUI 线程卡住 1–2 s。
+    void historyWritesAreCoalesced() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("HistoryBatchTest");
+        AppController controller(nullptr, false);
+        QVERIFY(controller.historyStore_);
+        QVERIFY(controller.historyStore_->isReady());
+
+        EarthquakeEvent event;
+        event.id = "batch-1";
+        event.eventId = "batch-1";
+        event.source = "cenc";
+        event.sourceAgency = "CENC";
+        event.location = "测试";
+        event.magnitude = 5.0;
+        event.timestamp = 1700000000000LL;
+
+        QVERIFY(controller.upsertHistory(event));
+        controller.queueHistoryWrite(event);
+        QCOMPARE(int(controller.pendingHistoryWrites_.size()), 1);
+        QTest::qWait(250);   // 80 ms 合并窗口
+        QVERIFY(controller.pendingHistoryWrites_.empty());
+        QCOMPARE(controller.historyStore_->loadRecent(10).size(), 1);
+
+        // 目录重发同样内容：upsertHistory 返回 false，上层不会产生写库任务。
+        QVERIFY(!controller.upsertHistory(event));
+
+        // 内容变化：按最新值落库。
+        event.magnitude = 9.9;
+        QVERIFY(controller.upsertHistory(event));
+        controller.queueHistoryWrite(event);
+        controller.flushHistoryWrites();
+        QCOMPARE(controller.historyStore_->loadRecent(10).size(), 1);
+        QCOMPARE(controller.historyStore_->loadRecent(10)[0].magnitude, 9.9);
+    }
+
+    /// 回归：地图上的 UI 浮层必须盖住测站层（测站层 z=2）。
+    /// 曾经右侧工具条没有写 z（默认 0），测站直接画在按钮上面。
+    void mapOverlaysStayAboveStationLayer() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("MapOverlayZTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("vector");
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* station = window->findChild<QQuickItem*>("stationIntensityLayer");
+        auto* toolbar = window->findChild<QQuickItem*>("mapToolbar");
+        QVERIFY(station && toolbar);
+        QVERIFY2(toolbar->z() > station->z(), "右侧工具条被测站层盖住");
+    }
+
+    /// 回归：测站图层必须真的画出内容，且与 QML 的 screenX/screenY 同源。
+    /// 该图层从 QML Canvas 改成 C++ 离屏缓存 + 仿射贴图（2026-10）：Canvas 版每次相机
+    /// 变化都在 JS 里整层重画，600 个 CSIS 方标实测约 60 ms/帧。缓存复用分支在矢量层
+    /// 曾经造成过缩放错位与整屏空白，这里用同一组断言守住这两类回归。
+    void stationLayerDrawsAndStaysAligned() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("StationLayerTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("vector");
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        auto* layer = window->findChild<QQuickItem*>("stationIntensityLayer");
+        QVERIFY(mapView && layer);
+        QTest::qWait(400);
+        window->grabWindow();
+
+        komira::StationSnapshot snapshot;
+        layer->setProperty("snapshot", QVariant::fromValue(static_cast<QObject*>(&snapshot)));
+
+        auto makeEntries = [](int nied, int csis) {
+            std::vector<komira::StationSnapshot::Entry> entries;
+            entries.reserve(nied + csis);
+            for (int i = 0; i < nied; ++i) {
+                komira::StationSnapshot::Entry e;
+                e.lat = 20.0 + (i % 400) * 0.08;
+                e.lon = 95.0 + (i / 400) * 0.5 + (i % 37) * 0.05;
+                e.raw = double(i % 70) / 10.0 - 3.0;
+                e.csis = false;
+                entries.push_back(e);
+            }
+            for (int i = 0; i < csis; ++i) {
+                komira::StationSnapshot::Entry e;
+                e.lat = 25.0 + (i % 300) * 0.06;
+                e.lon = 100.0 + (i / 300) * 0.4 + (i % 23) * 0.05;
+                e.raw = double(i % 13);
+                e.csis = true;
+                entries.push_back(e);
+            }
+            return entries;
+        };
+
+        // 非空绘制护栏：同一相机下，有/无测站两帧应出现成片差异像素。
+        mapView->setProperty("centerLat", 35.0);
+        mapView->setProperty("centerLon", 105.0);
+        mapView->setProperty("zoom", 6.0);
+        snapshot.setEntries({});
+        QTest::qWait(100);
+        const QImage empty = window->grabWindow();
+        snapshot.setEntries(makeEntries(1749, 600));
+        QTest::qWait(100);
+        const QImage drawn = window->grabWindow();
+        int changed = 0;
+        for (int y = 0; y < drawn.height(); ++y) {
+            const QRgb* a = reinterpret_cast<const QRgb*>(empty.constScanLine(y));
+            const QRgb* b = reinterpret_cast<const QRgb*>(drawn.constScanLine(y));
+            for (int x = 0; x < drawn.width(); ++x) {
+                if (qAbs(qRed(a[x]) - qRed(b[x])) + qAbs(qGreen(a[x]) - qGreen(b[x])) +
+                        qAbs(qBlue(a[x]) - qBlue(b[x])) >
+                    24) {
+                    ++changed;
+                }
+            }
+        }
+        QVERIFY2(changed > 500, "测站图层没有画出内容");
+
+        auto qmlNum = [&](const char* fn, double arg) -> double {
+            QVariant ret;
+            const bool ok = QMetaObject::invokeMethod(mapView, fn, Q_RETURN_ARG(QVariant, ret),
+                                                      Q_ARG(QVariant, QVariant(arg)));
+            return ok ? ret.toDouble() : qQNaN();
+        };
+        auto aligned = [&]() -> bool {
+            for (const QPointF& p : {QPointF(116.4, 39.9), QPointF(121.5, 31.2),
+                                     QPointF(104.1, 30.6)}) {
+                QPointF got;
+                QMetaObject::invokeMethod(layer, "screenPosForTest", Q_RETURN_ARG(QPointF, got),
+                                          Q_ARG(double, p.y()), Q_ARG(double, p.x()));
+                const double expX = qmlNum("screenX", p.x());
+                const double expY = qmlNum("screenY", p.y());
+                if (!(std::hypot(got.x() - expX, got.y() - expY) < 1.0)) {
+                    qWarning() << "station layer misaligned" << p << "got" << got << "expected"
+                               << expX << expY;
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto waitAligned = [&]() -> bool {
+            for (int i = 0; i < 50; ++i) {
+                QTest::qWait(20);
+                window->grabWindow();
+                if (aligned()) return true;
+            }
+            return false;
+        };
+        QVERIFY2(waitAligned(), "整数层级下测站层与 QML 投影错位");
+        // 轻微缩放会走「缓存位图按比例贴回」分支；旧实现在这里会停在旧比例上。
+        mapView->setProperty("zoom", 6.02);
+        window->grabWindow();
+        QVERIFY2(waitAligned(), "缓存缩放贴图后测站层与 QML 投影错位");
+        mapView->setProperty("zoom", 7.3);
+        mapView->setProperty("centerLon", 118.0);
+        window->grabWindow();
+        QVERIFY2(waitAligned(), "平移+缩放后测站层与 QML 投影错位");
     }
 
     /// 回归：波前淡出后「跟随震中」按钮仍然生效。

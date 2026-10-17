@@ -5,6 +5,9 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QPainter>
+#include <QQuickWindow>
+#include <QSGImageNode>
+#include <QSGTexture>
 #include <QtMath>
 
 #include "core/coordinate_transform.h"
@@ -60,7 +63,7 @@ QMutex VectorMapItem::geometryCacheMutex_;
 std::unordered_map<std::string, VectorMapItem::GeometryCachePtr>
     VectorMapItem::geometryCaches_;
 
-VectorMapItem::VectorMapItem(QQuickPaintedItem* parent) : QQuickPaintedItem(parent) {
+VectorMapItem::VectorMapItem(QQuickItem* parent) : QQuickItem(parent) {
     // QML 里尺寸由 anchors 决定，这里不自己算。
     setFlag(ItemHasContents, true);
     // 默认不裁剪到自身边界之外（地图会画出可视区边缘）。
@@ -270,77 +273,115 @@ void VectorMapItem::rebuildCache() {
     }
 }
 
-void VectorMapItem::paint(QPainter* painter) {
+QSGNode* VectorMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) {
     ensureLoaded();
 
     if (!pathsBuilt_ || gcjShift_ != cachedGcjShift_ || layerName_ != cachedLayer_) {
         rebuildCache();
         cacheValid_ = false;   // 投影结构变了，离屏缓存作废
     }
-    if (!geometryCache_ || geometryCache_->paths.empty()) return;
+    if (!geometryCache_ || geometryCache_->paths.empty() || width() <= 0 || height() <= 0) {
+        return nullptr;
+    }
+
+    // 相机与尺寸只读一次：渲染线程与 GUI 线程并发，同一次绘制里混用新旧值会让
+    // 位图与 cacheWorldX_ 对不上（矢量层会相对标记整体偏移）。
+    const double lat = centerLat_;
+    const double lon = centerLon_;
+    const double zoom = zoom_;
+    const double w = width();
+    const double h = height();
+    // 矢量层仍按 1x 光栅化：位图只在「移出 margin / 缩放 / 样式变化」时重渲，
+    // 而 dpr 光栅化会让三层缓存各涨到 4 倍（高 DPI 下上百 MB），重渲也慢 4 倍。
+    // 放大由 GPU 采样完成，观感与旧的 QQuickPaintedItem 路径一致（缓存本来就是 1x）。
+    const qreal dpr = 1.0;
+    const double cw = w + 2 * kCacheMarginPx;
+    const double ch = h + 2 * kCacheMarginPx;
+    // 渲染尺寸比视口再多留一圈余量：右上角事件列表开合会连续改变控件宽度，
+    // 缓存与视口严格等大时每一帧都要整层重绘（三个矢量层 × 上百个多边形），
+    // 150ms 的开合动画直接变成幻灯片。缓存偏大时按 1:1 绘制、由 MapView 裁剪，
+    // 缩小时可以一直复用，放大时也能撑住几帧才重绘。
+    const double cwRender = cw + kCacheGrowSlackPx;
+    const double chRender = ch + kCacheGrowSlackPx;
+    const QSize wantSize(static_cast<int>(std::ceil(cw * dpr)),
+                         static_cast<int>(std::ceil(ch * dpr)));
 
     const double refSize = worldSize(kRefZoom);
-    const double scale = std::pow(2.0, zoom_ - kRefZoom);
-    // 相机中心在参考层级世界像素里的位置；乘 scale 即当前屏幕比例下的世界像素。
-    const double centerWX = projX(centerLon_, refSize);
-    const double centerWY = projY(centerLat_, refSize);
+    const double scale = std::pow(2.0, zoom - kRefZoom);
+    const double centerWX = projX(lon, refSize);
+    const double centerWY = projY(lat, refSize);
     const double curWorldX = centerWX * scale;
     const double curWorldY = centerWY * scale;
 
-    // 命中缓存：相机仍在缓存覆盖的范围内、缩放系数未明显偏离、外观未变 —— 对位图做
-    // 一次仿射变换即可，不再光栅化多边形。这是拖动/缩放流畅的关键：QQuickPaintedItem
-    // 是 CPU 光栅化，每帧重画上千条路径实测约 6-10 ms，仿射贴图则是常量级。
-    if (cacheValid_ && cacheStyleVersion_ == styleVersion_ &&
-        cache_.width() == static_cast<int>(std::ceil(width())) + 2 * kCacheMarginPx &&
-        cache_.height() == static_cast<int>(std::ceil(height())) + 2 * kCacheMarginPx) {
-        const double r = scale / cacheScale_;
-        const double cacheCenterWX = cacheWorldX_ / cacheScale_;
-        const double cacheCenterWY = cacheWorldY_ / cacheScale_;
-        // 覆盖判定：位图连同 margin 必须罩住当前视口。位图被缩放回当前比例后，
-        // 可用 margin 会随之变化（缩小倍率越低、可用 margin 越少），故按精确条件判。
-        const double invR = cacheScale_ / scale;
-        const double boundX = kCacheMarginPx + width() / 2.0 * (1.0 - invR);
-        const double boundY = kCacheMarginPx + height() / 2.0 * (1.0 - invR);
-        const bool inRange =
-            std::abs((centerWX - cacheCenterWX) * cacheScale_) <= boundX &&
-            std::abs((centerWY - cacheCenterWY) * cacheScale_) <= boundY &&
-            std::abs(r - 1.0) <= kCacheScaleTol;
-        // 停在整数层级（滚轮与自动取景的落点）时位图必须与像素 1:1，否则放大后发虚。
-        const bool atRestInteger = std::abs(zoom_ - std::round(zoom_)) < 1e-9;
-        if (inRange && !(atRestInteger && std::abs(r - 1.0) > 1e-9)) {
-            // 位图按 r 精确等比贴回：由墨卡托的线性可知，位图里的世界点与屏幕的映射
-            // 与直接投影逐字一致，故矢量层与震中/定位标记严格同源。
-            // 旧实现只平移、不缩放，缩放时位图停在旧比例上 —— 标记因此逐渐错位，
-            // 并在平移量超出 margin 触发重渲时整屏跳变（"抖动"）。
-            const double tx = r * (cacheWorldX_ - width() / 2.0 - kCacheMarginPx) - curWorldX
-                              + width() / 2.0;
-            const double ty = r * (cacheWorldY_ - height() / 2.0 - kCacheMarginPx) - curWorldY
-                              + height() / 2.0;
-            painter->save();
-            if (std::abs(r - 1.0) > 1e-6) {
-                painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
-            }
-            painter->translate(tx, ty);
-            painter->scale(r, r);
-            painter->drawImage(QPointF(0, 0), cache_);
-            painter->restore();
-            drawnScale_ = scale;
-            drawnCenterX_ = centerWX;
-            drawnCenterY_ = centerWY;
-            return;
-        }
+    // 用 QSGImageNode 而不是 QQuickPaintedItem：后者每次 update() 都要把整张位图
+    // 重新 CPU 合成并上传纹理，高 DPI 下矢量三层每帧要搬上百 MB。
+    auto* node = static_cast<QSGImageNode*>(oldNode);
+    if (!node) {
+        node = window()->createImageNode();
+        node->setOwnsTexture(true);
+        textureValid_ = false;
     }
 
-    renderToCache();
-    cacheWorldX_ = curWorldX;
-    cacheWorldY_ = curWorldY;
-    cacheScale_ = scale;
-    cacheStyleVersion_ = styleVersion_;
-    cacheValid_ = true;
-    painter->drawImage(QPointF(-kCacheMarginPx, -kCacheMarginPx), cache_);
+    double r = 1.0;
+    bool reuseGeometry = false;
+    // 缓存大于视口即可复用：>= 而不是 ==。地图在侧栏动画里持续变窄时，
+    // 早已渲染好的大图只需平移裁剪，不必每帧重画整层矢量。
+    if (cacheValid_ && cacheStyleVersion_ == styleVersion_ && cacheDpr_ == dpr &&
+        cache_.width() >= wantSize.width() && cache_.height() >= wantSize.height()) {
+        r = scale / cacheScale_;
+        const double cacheCenterWX = cacheWorldX_ / cacheScale_;
+        const double cacheCenterWY = cacheWorldY_ / cacheScale_;
+        const double invR = cacheScale_ / scale;
+        const double cacheW = cache_.width() / dpr;
+        const double cacheH = cache_.height() / dpr;
+        // 缓存半宽换算到当前比例后，扣掉视口自身需要的半宽，剩下的就是可容忍的位移。
+        const double boundX = cacheW / 2.0 - w / 2.0 * invR;
+        const double boundY = cacheH / 2.0 - h / 2.0 * invR;
+        const bool inRange = std::abs((centerWX - cacheCenterWX) * cacheScale_) <= boundX &&
+                             std::abs((centerWY - cacheCenterWY) * cacheScale_) <= boundY &&
+                             std::abs(r - 1.0) <= kCacheScaleTol;
+        // 停在整数层级时位图必须与像素 1:1，否则放大后发虚。
+        const bool atRestInteger = std::abs(zoom - std::round(zoom)) < 1e-9;
+        reuseGeometry = inRange && !(atRestInteger && std::abs(r - 1.0) > 1e-9);
+    }
+
+    if (!reuseGeometry) {
+        renderToCache(dpr, cwRender, chRender);
+        cacheWorldX_ = curWorldX;
+        cacheWorldY_ = curWorldY;
+        cacheScale_ = scale;
+        cacheDpr_ = dpr;
+        cacheStyleVersion_ = styleVersion_;
+        cacheValid_ = true;
+        textureValid_ = false;
+    }
+
+    if (!textureValid_) {
+        QSGTexture* texture =
+            window()->createTextureFromImage(cache_, QQuickWindow::TextureHasAlphaChannel);
+        if (!texture) return nullptr;
+        texture->setFiltering(QSGTexture::Linear);
+        texture->setMipmapFiltering(QSGTexture::None);
+        node->setTexture(texture);
+        textureValid_ = true;
+    }
+
+    // 位图实际尺寸（可能因余量而大于视口）；绘制矩形必须按它来，否则会被二次缩放。
+    const double cacheW = cache_.width() / dpr;
+    const double cacheH = cache_.height() / dpr;
+    if (reuseGeometry) {
+        const double tx = r * (cacheWorldX_ - cacheW / 2.0) - curWorldX + w / 2.0;
+        const double ty = r * (cacheWorldY_ - cacheH / 2.0) - curWorldY + h / 2.0;
+        node->setRect(QRectF(tx, ty, cacheW * r, cacheH * r));
+    } else {
+        // 位图与视口同心：左上角相对 item 左上的偏移是 (w - cacheW)/2。
+        node->setRect(QRectF((w - cacheW) / 2.0, (h - cacheH) / 2.0, cacheW, cacheH));
+    }
+
     drawnScale_ = scale;
     drawnCenterX_ = centerWX;
     drawnCenterY_ = centerWY;
+    return node;
 }
 
 QPointF VectorMapItem::screenPosForTest(double lat, double lon) const {
@@ -350,14 +391,15 @@ QPointF VectorMapItem::screenPosForTest(double lat, double lon) const {
     return QPointF(x, y);
 }
 
-void VectorMapItem::renderToCache() {
-    const int cw = static_cast<int>(std::ceil(width())) + 2 * kCacheMarginPx;
-    const int ch = static_cast<int>(std::ceil(height())) + 2 * kCacheMarginPx;
-    if (cache_.size() != QSize(cw, ch)) {
-        cache_ = QImage(cw, ch, QImage::Format_ARGB32_Premultiplied);
-    }
+void VectorMapItem::renderToCache(qreal dpr, double cw, double ch) {
+    const int pw = std::max(1, static_cast<int>(std::ceil(cw * dpr)));
+    const int ph = std::max(1, static_cast<int>(std::ceil(ch * dpr)));
+    if (cache_.size() != QSize(pw, ph)) cache_ = QImage(pw, ph, QImage::Format_ARGB32_Premultiplied);
     cache_.fill(Qt::transparent);
     QPainter painter(&cache_);
+    // 按实际像素比缩放而不是直接用 dpr：像素尺寸取整后略有偏差，用实际比例才能保证
+    // 逻辑坐标与 QML 的投影逐像素一致。
+    painter.scale(double(pw) / cw, double(ph) / ch);
     drawLayerContent(painter, cw, ch);
     painter.end();
 }

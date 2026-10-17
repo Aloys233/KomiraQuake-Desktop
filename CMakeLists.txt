@@ -39,6 +39,8 @@ qt_add_executable(komiraquake WIN32
     # model / core
     src/model/event_list_model.h
     src/model/event_list_model.cpp
+    src/model/station_snapshot.h
+    src/model/station_snapshot.cpp
     src/core/quake_calculator.cpp
     src/core/intensity_calculator.cpp
     src/core/coordinate_transform.cpp
@@ -167,6 +169,8 @@ qt_add_qml_module(komiraquake
     SOURCES
         src/map/vector_map_item.h
         src/map/vector_map_item.cpp
+        src/map/station_map_item.h
+        src/map/station_map_item.cpp
 )
 
 file(GLOB KOMIRA_ICON_FILES CONFIGURE_DEPENDS qml/icons/*.svg qml/icons/LICENSE.txt)

@@ -4,6 +4,7 @@
 #include <QHash>
 #include <QList>
 #include <QObject>
+#include <map>
 #include <QPointF>
 #include <QStringList>
 #include <functional>
@@ -19,6 +20,7 @@
 #include "model/data_source_info.h"
 #include "model/event_list_model.h"
 #include "model/earthquake_event.h"
+#include "model/station_snapshot.h"
 #include "prefs/settings_store.h"
 #include "service/autostart.h"
 #include "service/update_service.h"
@@ -86,9 +88,9 @@ class AppController : public QObject {
     Q_PROPERTY(QVariantMap waveRadii READ waveRadii NOTIFY waveRadiiChanged)
     /// 区县名 -> CSIS 烈度原始值，供矢量地图按烈度给区县面填色。
     Q_PROPERTY(QVariantMap districtIntensity READ districtIntensity NOTIFY districtIntensityChanged)
-    /// 实时测站震度（**仅显示，不参与预警**）：合并各测站源，逐站 `{ lat, lon, raw }`，
-    /// `raw` 为连续震度（缺测 -3；PancakesSeis 的 PGA 已折算为計測震度）。供地图测站图层绘制。
-    Q_PROPERTY(QVariantList stationIntensity READ stationIntensity NOTIFY stationIntensityChanged)
+    /// 实时测站震度的**快照对象**（**仅显示，不参与预警**）：合并各测站源，地图项直接读
+    /// C++ vector。指针恒定，内容更新走 StationSnapshot::changed()，不经 QVariantList/JS 转换。
+    Q_PROPERTY(QObject* stationSnapshot READ stationSnapshot CONSTANT)
     /// 逐测站源的实时最大值卡片数据：`[{ id, name, caption, hasData, raw, text, stationCount, frameTime }]`。
     Q_PROPERTY(QVariantList stationSources READ stationSources NOTIFY stationIntensityChanged)
 
@@ -137,7 +139,7 @@ public:
     int hudCount() const;
     QVariantMap waveRadii() const;
     QVariantMap districtIntensity() const { return districtIntensity_; }
-    QVariantList stationIntensity() const;
+    QObject* stationSnapshot() const { return stationSnapshot_; }
     QVariantList stationSources() const;
 
     /// HUD 左右切换：在全部活动事件间循环（按发震时刻倒序，0 为最新）。
@@ -198,7 +200,12 @@ private:
     void handleEvent(const EarthquakeEvent& event, bool replay, bool inDirectory,
                      EarthquakeSource* source = nullptr);
     /// 同 id 就地更新或追加；避免重启后「DB 载入 + 首次目录轮询」在列表留下重复条目。
-    void upsertHistory(const EarthquakeEvent& event);
+    /// 写入内存历史；返回持久化字段是否真的变化（未变则无需写库）。
+    bool upsertHistory(const EarthquakeEvent& event);
+    /// 把事件排进下一批写库；同 id 去重。
+    void queueHistoryWrite(const EarthquakeEvent& event);
+    /// 一次事务写完全部待写事件，并 prune 一次。
+    void flushHistoryWrites();
     void onTick();
     void recomputeEvents();
     void syncWarning();
@@ -214,8 +221,10 @@ private:
     bool hudWindowOpen(const EarthquakeEvent& event, long long now) const;
     /// 安排一次 HUD 可见性重算（跨过 10 分钟窗口时隐藏自动焦点的 HUD）。
     void scheduleHudRefresh();
-    /// 将高频测站帧合并为固定频率的 QML 快照刷新，避免每条站点帧都重建大列表。
+    /// 将高频测站帧合并为固定频率的快照刷新，避免每条站点帧都重建整张表。
     void scheduleStationIntensityRefresh();
+    /// 按三路源的最新读数重建 StationSnapshot（纯 POD 拷贝，不发 QML 信号）。
+    void refreshStationSnapshot();
     /// 全部活动事件按发震时刻倒序（最新在前）的 identity 列表。
     std::vector<std::string> orderedActiveKeys() const;
     /// HUD 左右切换的公共实现：delta 为 ±1 时循环切换所选预警。
@@ -294,6 +303,11 @@ private:
     bool systemDark_ = false;
     QTimer countdownTimer_;
     QTimer stationIntensityRefreshTimer_;
+    StationSnapshot* stationSnapshot_ = nullptr;
+    /// 目录同步会把上百条事件一条条送进来；逐条写库 + 逐条 prune 会在启动/复显时
+    /// 阻塞 GUI 线程一秒以上（实测 200 条约 400 ms，慢盘更久）。合并成一次事务。
+    QTimer historyFlushTimer_;
+    std::map<std::string, EarthquakeEvent> pendingHistoryWrites_;
 
     /// 地图焦点：用户从列表选中，或被实时 EEW 自动接管。
     EarthquakeEvent mapFocus_;

@@ -2,6 +2,7 @@
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
@@ -21,6 +22,7 @@
 #include "core/ip_geo_lookup.h"
 #include "core/quake_calculator.h"
 #include "core/travel_time_service.h"
+#include "model/station_snapshot.h"
 #include "prefs/settings_store.h"
 #include "service/alert_announcer.h"
 #include "service/alert_sound_service.h"
@@ -51,6 +53,19 @@ namespace {
 
 /// 校时时钟固定显示时区：UTC+8。《NATIVE_PORT_SPEC》 §12。
 constexpr int kClockUtc8OffsetSeconds = 8 * 3600;
+
+/// 只比较会落库的字段：目录每次整表重发，字段没变就不必再写一次库。
+bool sameStoredEvent(const EarthquakeEvent& a, const EarthquakeEvent& b) {
+    return a.eventId == b.eventId && a.magnitude == b.magnitude && a.latitude == b.latitude &&
+           a.longitude == b.longitude && a.depth == b.depth && a.location == b.location &&
+           a.timestamp == b.timestamp && a.reportTime == b.reportTime && a.source == b.source &&
+           a.sourceProvider == b.sourceProvider && a.sourceAgency == b.sourceAgency &&
+           a.distanceKm == b.distanceKm && a.estimatedIntensity == b.estimatedIntensity &&
+           a.rawIntensity == b.rawIntensity && a.maxIntensityRaw == b.maxIntensityRaw &&
+           a.maxIntensityText == b.maxIntensityText && a.pWaveArrival == b.pWaveArrival &&
+           a.sWaveArrival == b.sWaveArrival && a.warningLevel == b.warningLevel &&
+           a.reportNum == b.reportNum && a.isFinal == b.isFinal && a.isCanceled == b.isCanceled;
+}
 
 QVariantMap toMap(const EarthquakeEvent& e, IntensityStandard standard = IntensityStandard::Csis) {
     QVariantMap m;
@@ -224,6 +239,8 @@ AppController::AppController(QObject* parent, bool startServices)
     seisSource_ = new PancakesSeisSource(this);
     // Wolfx SeisJS 测站显示源：同上。
     wolfxSeisSource_ = new WolfxSeisSource(this);
+    // 测站快照：地图项直接读这个对象，避免每 100 ms 经历 QVariantList/JS 数组的往返转换。
+    stationSnapshot_ = new StationSnapshot(this);
     clock_ = new NtpClock(this);
     autoStart_ = new AutoStartService(this);
     updater_ = new UpdateService(this);
@@ -244,10 +261,18 @@ AppController::AppController(QObject* parent, bool startServices)
     stationIntensityRefreshTimer_.setSingleShot(true);
     stationIntensityRefreshTimer_.setInterval(100);
     connect(&stationIntensityRefreshTimer_, &QTimer::timeout, this, [this]() {
+        refreshStationSnapshot();
+        // 卡片（stationSources）仍走属性通知；地图图层走快照的 changed()。
         emit stationIntensityChanged();
     });
 
     // 波前圆按显示帧率重算，只在焦点事件"还年轻"时跑（见 updateWaveTimer）。
+    // 目录事件逐条写库会变成「每条一个事务 + 一次 prune」，启动/复显时能把 GUI 线程
+    // 卡住 1–2 s（实测 200 条约 400 ms）。攒 80 ms 一次事务写回。
+    historyFlushTimer_.setSingleShot(true);
+    historyFlushTimer_.setInterval(80);
+    connect(&historyFlushTimer_, &QTimer::timeout, this, &AppController::flushHistoryWrites);
+
     waveTimer_.setInterval(16);
     connect(&waveTimer_, &QTimer::timeout, this, &AppController::updateWaveRadii);
 
@@ -277,6 +302,7 @@ long long AppController::nowMs() const {
 }
 
 AppController::~AppController() {
+    flushHistoryWrites();   // 退出前把还没落盘的目录事件写掉
     if (historyStore_) delete historyStore_;
 }
 
@@ -636,48 +662,54 @@ QVariantMap AppController::waveRadii() const {
     return m;
 }
 
-QVariantList AppController::stationIntensity() const {
-    QVariantList list;
-    // NIED Kmoni：raw 为 JMA 計測震度（缺测哨兵 -3）；`src` 供 QML 按源选色阶。
+void AppController::refreshStationSnapshot() {
+    if (!stationSnapshot_) return;
+    std::vector<StationSnapshot::Entry> entries;
+
+    // NIED Kmoni：raw 为 JMA 計測震度（缺测哨兵 -3）。
     if (stationSource_ && stationSource_->hasData()) {
         const auto& stations = stationSource_->stations();
         const auto& intensity = stationSource_->intensity();
-        list.reserve(stations.size());
+        entries.reserve(entries.size() + stations.size());
         for (int i = 0; i < stations.size(); ++i) {
-            QVariantMap m;
-            m["src"] = QStringLiteral("kmoni");
-            m["lat"] = stations[i].latitude;
-            m["lon"] = stations[i].longitude;
-            m["raw"] = i < intensity.size() ? intensity[i] : KmoniStationProtocol::kMissing;
-            list.push_back(m);
+            StationSnapshot::Entry e;
+            e.lat = stations[i].latitude;
+            e.lon = stations[i].longitude;
+            e.raw = i < intensity.size() ? intensity[i] : KmoniStationProtocol::kMissing;
+            e.csis = false;
+            entries.push_back(e);
         }
     }
     // PancakesSeis：PGA（Gal）折算为中国地震烈度（CSIS）；缺测哨兵 -1。
     if (seisSource_ && seisSource_->hasData()) {
         const auto& stations = seisSource_->stations();
         const auto& pga = seisSource_->pga();
+        entries.reserve(entries.size() + stations.size());
         for (int i = 0; i < stations.size(); ++i) {
-            QVariantMap m;
-            m["src"] = QStringLiteral("pancakes_seis");
-            m["lat"] = stations[i].latitude;
-            m["lon"] = stations[i].longitude;
+            StationSnapshot::Entry e;
+            e.lat = stations[i].latitude;
+            e.lon = stations[i].longitude;
             const double value = i < pga.size() ? pga[i] : PancakesSeisProtocol::kMissingPga;
-            m["raw"] = value > 0.0 ? IntensityCalculator::csisFromPga(value) : kMissingCsis;
-            list.push_back(m);
+            e.raw = value > 0.0 ? IntensityCalculator::csisFromPga(value) : kMissingCsis;
+            e.csis = true;
+            entries.push_back(e);
         }
     }
     // Wolfx SeisJS：报文自带中国地震烈度 `Intensity`，直接进入 CSIS 域。
     if (wolfxSeisSource_ && wolfxSeisSource_->hasData()) {
-        for (const auto& station : wolfxSeisSource_->stations()) {
-            QVariantMap m;
-            m["src"] = QStringLiteral("wolfx_seis");
-            m["lat"] = station.latitude;
-            m["lon"] = station.longitude;
-            m["raw"] = station.csis >= 0 ? static_cast<double>(station.csis) : kMissingCsis;
-            list.push_back(m);
+        const auto& stations = wolfxSeisSource_->stations();
+        entries.reserve(entries.size() + stations.size());
+        for (const auto& station : stations) {
+            StationSnapshot::Entry e;
+            e.lat = station.latitude;
+            e.lon = station.longitude;
+            e.raw = station.csis >= 0 ? static_cast<double>(station.csis) : kMissingCsis;
+            e.csis = true;
+            entries.push_back(e);
         }
     }
-    return list;
+
+    stationSnapshot_->setEntries(std::move(entries));
 }
 
 QVariantList AppController::stationSources() const {
@@ -1063,7 +1095,7 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
             return;
         }
         if (isAlertLevel(event.warningLevel)) event.warningLevel = WarningLevel::Watch;
-        upsertHistory(event);
+        if (upsertHistory(event)) queueHistoryWrite(event);
         if (hasMapFocus_ && mapFocus_.identity() == event.identity() &&
             !sessions_.active.count(event.identity())) {
             // 目录事件没有推送时间；保留实时链路已知的最后一报推送时间，
@@ -1071,10 +1103,6 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
             const long long reportTime = mapFocus_.reportTime;
             mapFocus_ = event;
             if (mapFocus_.reportTime <= 0) mapFocus_.reportTime = reportTime;
-        }
-        if (historyStore_->isReady()) {
-            historyStore_->upsertAll({event});
-            historyStore_->prune(400);
         }
         scheduleDirectoryUiRefresh();
         admit(event, AdmissionStatus::Applied);
@@ -1137,14 +1165,35 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
     admit(event, AdmissionStatus::Applied);
 }
 
-void AppController::upsertHistory(const EarthquakeEvent& event) {
+bool AppController::upsertHistory(const EarthquakeEvent& event) {
     for (int i = 0; i < history_.size(); ++i) {
         if (history_[i].id == event.id) {
+            if (sameStoredEvent(history_[i], event)) return false;
             history_[i] = event;
-            return;
+            return true;
         }
     }
     history_.push_back(event);
+    return true;
+}
+
+void AppController::queueHistoryWrite(const EarthquakeEvent& event) {
+    if (!historyStore_ || !historyStore_->isReady()) return;
+    pendingHistoryWrites_[event.id] = event;   // 同 id 覆盖，避免重复写
+    if (!historyFlushTimer_.isActive()) historyFlushTimer_.start();
+}
+
+void AppController::flushHistoryWrites() {
+    historyFlushTimer_.stop();
+    if (pendingHistoryWrites_.empty()) return;
+    QVector<EarthquakeEvent> batch;
+    batch.reserve(static_cast<int>(pendingHistoryWrites_.size()));
+    for (const auto& entry : pendingHistoryWrites_) batch.push_back(entry.second);
+    pendingHistoryWrites_.clear();
+    if (!historyStore_ || !historyStore_->isReady()) return;
+    // upsertAll 内部是一个事务；prune 每次同步最多跑一次。
+    historyStore_->upsertAll(batch);
+    historyStore_->prune(400);
 }
 
 bool AppController::isProtectedAlert(const EarthquakeEvent& e, long long clockNow) const {

@@ -65,21 +65,15 @@ QtObject {
         const c = severity(tag);
         return Qt.rgba(c.r, c.g, c.b, 0.14);
     }
-    /// 中国地震烈度色阶（对齐 kanameishi CSIS 配色）。
+    /// 中国地震烈度色阶（对齐 kanameishi CSIS 配色），下标即烈度等级 0..12。
+    /// 地图上的测站方标也直接消费这张表（StationMapItem.csisColors）。
+    readonly property var csisColorBand: [
+        "#9F9F9F", "#9F9F9F", "#CFCFCF", "#5FCFFF", "#3FAFFF", "#5FDF8F",
+        "#F7E757", "#FF8F00", "#FF4F00", "#DF0F0F", "#7F007F", "#7F007F", "#7F007F"
+    ]
     function intensityColor(raw) {
         const level = Math.round(raw);
-        switch (level) {
-        case 1: return "#9F9F9F";
-        case 2: return "#CFCFCF";
-        case 3: return "#5FCFFF";
-        case 4: return "#3FAFFF";
-        case 5: return "#5FDF8F";
-        case 6: return "#F7E757";
-        case 7: return "#FF8F00";
-        case 8: return "#FF4F00";
-        case 9: return "#DF0F0F";
-        default: return level >= 10 ? "#7F007F" : "#9F9F9F";
-        }
+        return csisColorBand[Math.max(0, Math.min(csisColorBand.length - 1, level))];
     }
     /// NIED 测站色阶（对齐 kanameishi `colorBand.nied`）：连续震度 → 深蓝→青→绿→黄→橙→红。
     /// 低值/缺测（<= -3，Jian 用 -3 表示"无观测/低于基线"）都落在最低的深蓝，形成常态蓝色测站网。

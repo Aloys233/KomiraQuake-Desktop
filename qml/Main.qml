@@ -16,6 +16,9 @@ ApplicationWindow {
     readonly property bool desktop: width >= 1024
     onDesktopChanged: if (!desktop) showList = false
     property bool showSettings: false
+    /// 设置页第一次打开后常驻（仅隐藏），避免每次进出都重建、丢失页内状态。
+    property bool settingsVisited: false
+    onShowSettingsChanged: if (showSettings) settingsVisited = true
     property bool showList: false
     property bool initialLocationApplied: false
     function sameEvent(a, b) { return !!a && !!b && a.id === b.id && a.sourceTag === b.sourceTag; }
@@ -44,7 +47,6 @@ ApplicationWindow {
             hasUser: app.hasLocation
             userLat: app.userLatitude; userLon: app.userLongitude
             event: window.mapEvent
-            stations: app.stationIntensity
             hasFocus: app.hasMapFocus
             warningActive: !!app.activeWarning
             hudWidth: hud.visible ? hud.width : 0
@@ -104,6 +106,7 @@ ApplicationWindow {
         anchors.leftMargin: 16; anchors.topMargin: 16
         theme: appTheme
         backdropSource: map ? map.renderLayer : null
+        backdropLive: !!map && map.cameraMoving
         event: window.hudEvent; active: window.hudActive
         selected: !!event && app.isMapFocused(event.id)
         pageIndex: app.hudIndex
@@ -119,6 +122,7 @@ ApplicationWindow {
         anchors.left: parent.left; anchors.bottom: clockBadge.top
         anchors.leftMargin: 16; anchors.bottomMargin: 8
         theme: appTheme; backdropSource: map ? map.renderLayer : null
+        backdropLive: !!map && map.cameraMoving
         width: sourceRow.implicitWidth + 24; height: 34; radius: 10
         visible: !window.showSettings
         // 只展示真正在跑的源：已启用且已配置（与启动门控一致）。
@@ -170,6 +174,7 @@ ApplicationWindow {
         objectName: "clockBadge"
         anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 16
         theme: appTheme; backdropSource: map ? map.renderLayer : null
+        backdropLive: !!map && map.cameraMoving
         width: badgeRow.implicitWidth + 24; height: 34; radius: 10
         readonly property bool synced: app.clockInfo.synced === true
         property string timeText: ""
@@ -204,10 +209,17 @@ ApplicationWindow {
         hasLocation: app.hasLocation
         onToggleRequested: window.showList = !window.showList
     }
-    SettingsPage {
-        anchors.fill: parent; visible: window.showSettings; theme: appTheme
-        onBack: window.showSettings = false
-        onPickLocationRequested: { window.showSettings = false; if (map) map.pickingLocation = true; globalToast.show("点击地图设置基准位置"); }
+    // 设置页包含全部分区，构造一次要几十毫秒；只在第一次打开时才建，之后常驻隐藏。
+    Loader {
+        anchors.fill: parent
+        active: window.showSettings || window.settingsVisited
+        visible: window.showSettings
+        sourceComponent: SettingsPage {
+            anchors.fill: parent
+            theme: appTheme
+            onBack: window.showSettings = false
+            onPickLocationRequested: { window.showSettings = false; if (map) map.pickingLocation = true; globalToast.show("点击地图设置基准位置"); }
+        }
     }
     // 桌面端不使用全屏预警：主 HUD 下方再放一张预警卡承载本地到时与操作。
     WarningHud {
@@ -220,6 +232,7 @@ ApplicationWindow {
         visible: !!app.activeWarning && app.alertEligible && (hud.visible || window.hasProtectedWarning)
         theme: appTheme
         backdropSource: map ? map.renderLayer : null
+        backdropLive: !!map && map.cameraMoving
         event: app.activeWarning
         countdown: app.countdown
         onMuted: app.muteWarning()

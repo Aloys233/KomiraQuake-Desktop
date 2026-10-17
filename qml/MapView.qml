@@ -25,56 +25,26 @@ Item {
     /// 是否有显式焦点（活动预警或用户点击）。仅此时才自动取景，
     /// 否则「最近一次事件」只画标记，不抢镜头。
     property bool hasFocus: false
+    /// 相机是否在动（拖动 / 缩放动画 / 波前跟随）。玻璃卡片的背景模糊只在移动时逐帧
+    /// 重采样：live 模糊源会让场景图永不空闲，窗口静止时也持续渲染地图子树。
+    property bool cameraMoving: false
+    Timer {
+        id: cameraMotionTimer
+        interval: 180
+        onTriggered: root.cameraMoving = false
+    }
+    function noteCameraMoved() {
+        root.cameraMoving = true;
+        cameraMotionTimer.restart();
+    }
+    onCenterLatChanged: noteCameraMoved()
+    onCenterLonChanged: noteCameraMoved()
+    onZoomChanged: noteCameraMoved()
     /// 是否存在活动预警：空闲自动归位时优先回到预警震中而非我的位置。
     property bool warningActive: false
     property real userLat: 0.0
     property real userLon: 0.0
     property bool hasUser: false
-    /// NIED Kmoni 测站震度：逐站 `{ lat, lon, raw }`（raw 为连续震度，缺测 -3）。
-    /// 由 AppController.stationIntensity 注入；仅用于地图显示。
-    property var stations: []
-    /// 预纠偏后的测站坐标（GCJ-02）。测站震度是高频变化数据，但坐标通常不变；
-    /// 坐标缓存避免每个数据帧都对上千站跨 JS/C++ 调用一次 `shiftCoord`。
-    property var shiftedStations: []
-    property var stationCoordinateCache: ({})
-
-    function rebuildShiftedStations() {
-        const list = root.stations;
-        if (!list || list.length === 0) {
-            root.shiftedStations = [];
-            root.stationCoordinateCache = ({});
-            return;
-        }
-
-        const cache = root.stationCoordinateCache;
-        const out = root.shiftedStations && root.shiftedStations.length === list.length
-            ? root.shiftedStations : new Array(list.length);
-        for (let i = 0; i < list.length; ++i) {
-            const s = list[i];
-            const lat = Number(s.lat);
-            const lon = Number(s.lon);
-            const key = lat + ":" + lon;
-            let point = cache[key];
-            if (!point) {
-                const shifted = root.shiftCoord(lat, lon);
-                point = { lat: shifted.lat, lon: shifted.lon };
-                cache[key] = point;
-            }
-            // 复用输出对象；只有 raw/src 随实时帧更新。
-            const item = out[i] || {};
-            item.lat = point.lat;
-            item.lon = point.lon;
-            item.raw = s.raw;
-            item.src = s.src;
-            out[i] = item;
-        }
-        root.shiftedStations = out;
-    }
-
-    onStationsChanged: {
-        root.rebuildShiftedStations();
-        stationLayer.requestPaint();
-    }
     /// 镜头是否锁定在焦点事件上（工具条的"跟随震中"按下态）。默认不跟随：无定位时地图是全国概览。
     property bool following: false
     /// 用户是否手动控制过镜头（拖动/缩放/回到我的位置/复位）。用于避免定位到达时抢镜头。
@@ -89,6 +59,9 @@ Item {
     readonly property bool gcjDatum: basemap === "amap_vector" ||
                                      basemap === "petal" ||
                                      (basemap === "custom" && app.settings.customBasemapDatum === 1)
+    /// 瓦片源支持的最低层级：Petal 自建服务没有 z0（预热与缓存从 z1 起），
+    /// 父层兜底不能越过这个下界，否则会反复请求 404。
+    readonly property int tileMinZoom: basemap === "petal" ? 1 : 0
     property bool previousGcjDatum: gcjDatum
 
     // 地图交互选点模式（桌面端关键功能）
@@ -118,16 +91,93 @@ Item {
     function clampLat(lat) { return Math.max(-85.05112878, Math.min(85.05112878, lat)); }
     /// 镜头动画：程序化切换（滚轮/按钮缩放、事件取景、回到我的位置、复位）平滑补间；
     /// 拖动平移保持 1:1 跟手，直接写属性并停掉动画。
-    readonly property int cameraDuration: theme.reduceMotion ? 0 : 420
+    readonly property int cameraDuration: theme.reduceMotion ? 0 : 600
     readonly property int zoomDuration: theme.reduceMotion ? 0 : 180
 
-    ParallelAnimation {
+    /// 三段式镜头缓动（与 Android 侧同名函数一致），平移与缩放共用时间轴、各自分配路程：
+    ///   1. 0–35%   快速平移（走完 60% 路程），缩放只走 10%；
+    ///   2. 35–75%  缩放主段（再走 75%），平移明显降速，只走 34%；
+    ///   3. 75–100% 收尾，平移最后 6%、缩放最后 15% 一起缓慢落位。
+    /// 用分段三次 Hermite：节点间速度连续（无顿挫），且各段单调（不冲过头）。
+    function cameraHermite(t, ts, ps, ms) {
+        if (t <= 0) return 0;
+        if (t >= 1) return 1;
+        let i = 0;
+        while (i < ts.length - 2 && t > ts[i + 1]) i++;
+        const h = ts[i + 1] - ts[i];
+        const u = (t - ts[i]) / h;
+        const u2 = u * u, u3 = u2 * u;
+        return (2 * u3 - 3 * u2 + 1) * ps[i]
+             + (u3 - 2 * u2 + u) * h * ms[i]
+             + (-2 * u3 + 3 * u2) * ps[i + 1]
+             + (u3 - u2) * h * ms[i + 1];
+    }
+    /// 平移：先快后慢，缩放主段内速度压到最低。
+    function cameraPanEase(t) {
+        return cameraHermite(t, [0, 0.35, 0.75, 1], [0, 0.60, 0.94, 1], [0, 2.0, 0.45, 0]);
+    }
+    /// 缩放：前段只轻微启动，主体集中在平移降速的第二段，尾段收口。
+    function cameraZoomEase(t) {
+        return cameraHermite(t, [0, 0.35, 0.75, 1], [0, 0.10, 0.85, 1], [0, 0.7, 1.05, 0]);
+    }
+    /// 纯缩放步进（滚轮/按钮）：立即起步的 OutCubic，180ms 内不拖沓。
+    function cameraZoomStepEase(t) {
+        const u = 1 - t;
+        return 1 - u * u * u;
+    }
+
+    // 补间只驱动一个线性进度，平移与缩放各用自己的曲线映射，
+    // 保证缩放进行时平移已进入慢速段。
+    property real cameraProgress: 0
+    /// "flight"：聚焦/复位的三段式；"zoom"：纯缩放步进（保持光标锚点不动）。
+    property string cameraTweenMode: "flight"
+    /// 纯缩放时的锚点：归一化世界坐标 + 相对屏幕中心的像素偏移。
+    property real cameraAnchorX: 0
+    property real cameraAnchorY: 0
+    property real cameraAnchorOffsetX: 0
+    property real cameraAnchorOffsetY: 0
+    property real cameraStartLat: 0
+    property real cameraStartLon: 0
+    property real cameraStartZoom: 0
+    property real cameraTargetLat: 0
+    property real cameraTargetLon: 0
+    property real cameraTargetZoom: 0
+
+    NumberAnimation {
         id: cameraMove
-        NumberAnimation { id: camLat; target: root; property: "centerLat"; easing.type: Easing.OutCubic }
-        NumberAnimation { id: camLon; target: root; property: "centerLon"; easing.type: Easing.OutCubic }
-        NumberAnimation { id: camZoom; target: root; property: "zoom"; easing.type: Easing.OutCubic }
-        // 跨 ±180° 的插值会落在 [-180, 180] 之外，结束后归一化。
-        onStopped: root.centerLon = root.wrapLon(root.centerLon)
+        target: root
+        property: "cameraProgress"
+        from: 0
+        to: 1
+        easing.type: Easing.Linear
+        onStopped: {
+            // 正常结束：精确落位并归一化跨 ±180° 的目标经度。
+            // 中途被打断（拖动/新目标）则保持当前位置，不回弹。
+            if (root.cameraProgress >= 1) {
+                root.centerLat = root.cameraTargetLat;
+                root.centerLon = root.wrapLon(root.cameraTargetLon);
+                root.zoom = root.cameraTargetZoom;
+            }
+            root.centerLon = root.wrapLon(root.centerLon);
+            // 补间结束才允许结算底衬（见 refreshTopLayerState）。
+            root.refreshTopLayerState();
+        }
+    }
+    onCameraProgressChanged: {
+        if (cameraTweenMode === "zoom") {
+            // 纯缩放：由锚点反解中心，光标下的地理点全程不动。
+            // （平移与缩放若各用一条曲线，中途锚点会先漂走再回来，感觉"缩放中心不对"。）
+            zoom = cameraStartZoom + (cameraTargetZoom - cameraStartZoom) * cameraZoomStepEase(cameraProgress);
+            const world = worldSize(zoom);
+            centerLon = unprojLon(cameraAnchorX * world - cameraAnchorOffsetX, zoom);
+            centerLat = clampLat(unprojLat(cameraAnchorY * world - cameraAnchorOffsetY, zoom));
+            return;
+        }
+        const pan = cameraPanEase(cameraProgress);
+        const z = cameraZoomEase(cameraProgress);
+        centerLat = cameraStartLat + (cameraTargetLat - cameraStartLat) * pan;
+        centerLon = cameraStartLon + (cameraTargetLon - cameraStartLon) * pan;
+        zoom = cameraStartZoom + (cameraTargetZoom - cameraStartZoom) * z;
     }
 
     // 跟随波前时，波前半径每 100ms 才更新一次；若把目标值直接赋值，缩放会一格一格地跳。
@@ -176,9 +226,10 @@ Item {
 
     /// 平滑移动镜头；duration 为 0 或开启"减少动态效果"时立即生效。
     /// 经度按最短路径插值，避免跨 ±180° 时绕行一整圈。
-    function moveCamera(lat, lon, z, duration) {
+    function moveCamera(lat, lon, z, duration, mode) {
         const d = duration === undefined ? cameraDuration : duration;
         cameraMove.stop();
+        cameraTweenMode = mode === undefined ? "flight" : mode;
         const targetLat = clampLat(lat);
         const targetLon = centerLon + wrapLon(lon - centerLon);
         const targetZoom = clampZoom(z);
@@ -188,9 +239,13 @@ Item {
             zoom = targetZoom;
             return;
         }
-        camLat.from = centerLat; camLat.to = targetLat; camLat.duration = d;
-        camLon.from = centerLon; camLon.to = targetLon; camLon.duration = d;
-        camZoom.from = zoom; camZoom.to = targetZoom; camZoom.duration = d;
+        cameraStartLat = centerLat;
+        cameraStartLon = centerLon;
+        cameraStartZoom = zoom;
+        cameraTargetLat = targetLat;
+        cameraTargetLon = targetLon;
+        cameraTargetZoom = targetZoom;
+        cameraMove.duration = d;
         cameraMove.start();
     }
 
@@ -374,7 +429,7 @@ Item {
     }
     /// 当前（或目标）整数缩放层级：相机动画进行中取动画目标，否则取当前值。
     /// 以目标为基准，快速连续滚动时每一格都实打实 ±1，不会被进行中的补间吞掉。
-    readonly property int zoomLevel: cameraMove.running ? Math.round(camZoom.to) : Math.round(zoom)
+    readonly property int zoomLevel: cameraMove.running ? Math.round(cameraTargetZoom) : Math.round(zoom)
 
     /// 滚轮/按钮缩放：每次动作按整数层级步进，并吸附到整数 z（对齐参考项目 Leaflet 的整数缩放）。
     /// 整数层级下瓦片以 1:1 像素渲染（tileScale == 1），不会因非整数倍拉伸而发虚或反复切层。
@@ -390,7 +445,12 @@ Item {
         const anchorY = (projY(centerLat, zoom) + y - height / 2) / oldSize;
         const lat = unprojLat(anchorY * worldSize(z) - y + height / 2, z);
         const lon = unprojLon(anchorX * worldSize(z) - x + width / 2, z);
-        moveCamera(lat, lon, z, zoomDuration);
+        // 记录锚点：补间过程中由 zoom 反解中心，鼠标下的地点全程钉住。
+        cameraAnchorX = anchorX;
+        cameraAnchorY = anchorY;
+        cameraAnchorOffsetX = x - width / 2;
+        cameraAnchorOffsetY = y - height / 2;
+        moveCamera(lat, lon, z, zoomDuration, "zoom");
     }
     onWidthChanged: {
         applyDefaultOverview();
@@ -413,20 +473,13 @@ Item {
     // 窗口尺寸变化后最小缩放随之变化：当前缩放若已低于新下界就抬上来，避免露出背景带。
     onMinZoomChanged: if (root.zoom < root.minZoom) moveCamera(root.centerLat, root.centerLon, root.minZoom, 0)
     onGcjDatumChanged: {
-        if (previousGcjDatum === gcjDatum) {
-            root.stationCoordinateCache = ({});
-            root.rebuildShiftedStations();
-            return;
-        }
+        if (previousGcjDatum === gcjDatum) return;
         const pt = gcjDatum ? app.wgs84ToGcj02(centerLat, centerLon)
                             : app.gcj02ToWgs84(centerLat, centerLon);
         cameraMove.stop();
         centerLat = clampLat(pt.y);
         centerLon = wrapLon(pt.x);
         previousGcjDatum = gcjDatum;
-        root.stationCoordinateCache = ({});
-        root.rebuildShiftedStations();
-        stationLayer.requestPaint();
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
     }
 
@@ -487,7 +540,6 @@ Item {
     onLastTileYChanged: Qt.callLater(syncTiles)
     // 切到/切出纯矢量底图时要立即重算瓦片集合（要么清空，要么按当前相机重建）。
     Component.onCompleted: {
-        root.rebuildShiftedStations();
         if (root.tileModelZoom < 0) root.tileModelZoom = root.tileZoom;
         Qt.callLater(syncTiles);
         Qt.callLater(applyDefaultOverview);
@@ -554,6 +606,12 @@ Item {
     /// 就绪后再等 tileFadeMs，让新层淡入完成，避免淡入期间露底。
     function refreshTopLayerState() {
         if (underlayZ < 0) return;
+        // 镜头补间期间不撤底衬：新视口边缘的瓦片是移动途中才加入集合的，
+        // 提前撤掉旧层会让后半程露白。补间结束（onStopped）后再结算。
+        if (cameraMove.running) {
+            underlayFadeTimer.stop();
+            return;
+        }
         if (topLayerTileCount > 0 && topLayerPendingTiles === 0) {
             if (!underlayFadeTimer.running) underlayFadeTimer.start();
         } else {
@@ -785,6 +843,37 @@ Item {
             width: size + 1
             height: size + 1
             Component.onDestruction: root.forgetTileStatus(tileCell.tz, tileCell.tx, tileCell.ty)
+            /// 父层兜底：本格瓦片未就绪时先铺放大后的粗层，避免飞行/平移途中露白。
+            /// 取 tz-2（4×4 个格子共享一张父瓦片），通常已在此前缩放经过的层级加载过。
+            /// 用「整张父瓦片放大 4× + 裁剪到本格」而不是 sourceClipRect：后者按**源像素**
+            /// 裁切，遇到 512px 瓦片源（Petal）会裁错区域，表现为别的瓦片影子叠在本格上。
+            Item {
+                id: fallbackCell
+                anchors.fill: parent
+                clip: true
+                /// 父层级别；低于图源下界（Petal 无 z0）时为 -1，直接不兜底。
+                readonly property int parentLevel: tileCell.tz - 2 >= root.tileMinZoom ? tileCell.tz - 2 : -1
+                // 只给当前层兜底：底衬层自身已就绪，再加载父层纯属浪费。
+                readonly property bool active: parentLevel >= 0 && tileCell.tz === root.tileModelZoom
+                Image {
+                    width: parent.width * 4
+                    height: parent.height * 4
+                    // 父瓦片左上角对齐到 4×4 格块，再按本格在父块中的行列偏移窗口。
+                    x: -root.wrapTile(tileCell.tx, 4) * parent.width
+                    y: -root.wrapTile(tileCell.ty, 4) * parent.height
+                    source: fallbackCell.active
+                            ? root.tileUrl(root.wrapTile(Math.floor(tileCell.tx / 4), Math.pow(2, fallbackCell.parentLevel)),
+                                           Math.floor(tileCell.ty / 4), fallbackCell.parentLevel)
+                            : ""
+                    asynchronous: true
+                    cache: true
+                    smooth: true
+                    opacity: status === Image.Ready ? 1 : 0
+                    Behavior on opacity {
+                        NumberAnimation { duration: root.tileFadeMs; easing.type: Easing.OutCubic }
+                    }
+                }
+            }
             Image {
                 anchors.fill: parent
                 source: root.tileUrl(root.wrapTile(tileCell.tx, tileCell.side), tileCell.ty, tileCell.tz)
@@ -929,115 +1018,22 @@ Item {
     } // mapRenderLayer
 
     // ---- 测站强度层 ------------------------------------------------------
-    // 用单个 Canvas 批量绘制测站（上千个点，逐 Item 会拖垮场景图）。
+    // 上千个测站由 C++ 一次批量绘制（逐 Item 会拖垮场景图）。
     // NIED（JMA 計測震度）沿用 kanameishi：常态圆点，颜色随连续震度色阶。
     // Pancakes / Wolfx（中国地震烈度 CSIS）对齐 flutterRhythmQuake：活跃测站画带烈度数字的
     // 圆角方标（高烈度白实边），缺测画蓝点。
-    Canvas {
+    StationMapItem {
         id: stationLayer
         objectName: "stationIntensityLayer"
         anchors.fill: parent
         z: 2
-        visible: root.stations.length > 0
-
-        function hexToRgba(hex, a) {
-            const r = parseInt(hex.substr(1, 2), 16);
-            const g = parseInt(hex.substr(3, 2), 16);
-            const b = parseInt(hex.substr(5, 2), 16);
-            return "rgba(" + r + "," + g + "," + b + "," + a + ")";
-        }
-        function luminance(hex) {
-            const r = parseInt(hex.substr(1, 2), 16) / 255;
-            const g = parseInt(hex.substr(3, 2), 16) / 255;
-            const b = parseInt(hex.substr(5, 2), 16) / 255;
-            return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        }
-        function roundRect(ctx, x, y, w, h, r) {
-            ctx.beginPath();
-            ctx.moveTo(x + r, y);
-            ctx.arcTo(x + w, y, x + w, y + h, r);
-            ctx.arcTo(x + w, y + h, x, y + h, r);
-            ctx.arcTo(x, y + h, x, y, r);
-            ctx.arcTo(x, y, x + w, y, r);
-            ctx.closePath();
-        }
-
-        onPaint: {
-            const ctx = getContext("2d");
-            ctx.reset();
-            const list = root.shiftedStations;   // 已纠偏，直接投影即可
-            if (!list || list.length === 0) return;
-            const w = stationLayer.width;
-            const h = stationLayer.height;
-            const zoom = root.zoom;
-            // NIED 圆点：所有测站同一尺寸，仅随缩放整体变化（对齐 kanameishi）。
-            const dotRadius = Math.max(1.6, Math.min(4.5, 1.2 + (zoom - 4) * 0.45));
-            // CSIS 方标尺寸（对齐 flutterRhythmQuake：社区测站给可读下限，放大时略增）。
-            const markerSize = Math.max(16, Math.min(24, 16 + (zoom - 4) * 1.4));
-            const idleRadius = Math.max(5, Math.min(9, 5 + (zoom - 3) * 0.8));
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
-            for (let i = 0; i < list.length; ++i) {
-                const s = list[i];
-                const x = root.screenX(s.lon);
-                const y = root.screenY(s.lat);
-                if (s.src === "pancakes_seis" || s.src === "wolfx_seis") {
-                    const raw = (s.raw === undefined) ? -1 : s.raw;
-                    if (raw >= 0) {
-                        // 活跃测站：带烈度数字的圆角方标。
-                        const level = Math.max(0, Math.min(12, Math.round(raw)));
-                        const color = root.theme.intensityColor(level);
-                        const half = markerSize / 2;
-                        if (x < -half || y < -half || x > w + half || y > h + half) continue;
-                        stationLayer.roundRect(ctx, x - half, y - half, markerSize, markerSize,
-                                               markerSize * 0.22);
-                        ctx.fillStyle = stationLayer.hexToRgba(color, 0.75);
-                        ctx.fill();
-                        // 高烈度用白实边强调；低烈度浅白边。
-                        ctx.lineWidth = level >= 5 ? 1.6 : 0.9;
-                        ctx.strokeStyle = level >= 5 ? "rgba(255,255,255,0.95)"
-                                                     : "rgba(255,255,255,0.45)";
-                        ctx.stroke();
-                        ctx.fillStyle = stationLayer.luminance(color) > 0.42 ? "#000000" : "#FFFFFF";
-                        ctx.font = "bold " + Math.round(markerSize * (level >= 5 ? 0.58 : 0.48))
-                            + "px sans-serif";
-                        ctx.fillText(String(level), x, y);
-                    } else if (x >= -idleRadius && y >= -idleRadius
-                               && x <= w + idleRadius && y <= h + idleRadius) {
-                        // 缺测测站：蓝点。
-                        ctx.beginPath();
-                        ctx.arc(x, y, idleRadius, 0, Math.PI * 2);
-                        ctx.fillStyle = "rgba(68,102,170,0.5)";
-                        ctx.fill();
-                        ctx.lineWidth = 1.2;
-                        ctx.strokeStyle = "rgba(68,102,170,0.7)";
-                        ctx.stroke();
-                    }
-                    continue;
-                }
-                // NIED：常态圆点（静稳=深蓝，活跃=按色阶）。
-                if (x < -dotRadius || y < -dotRadius || x > w + dotRadius || y > h + dotRadius) {
-                    continue;
-                }
-                const jma = (s.raw === undefined || s.raw <= -3) ? -3 : s.raw;
-                ctx.beginPath();
-                ctx.arc(x, y, dotRadius, 0, Math.PI * 2);
-                ctx.fillStyle = root.theme.niedStationColor(jma);
-                ctx.fill();
-            }
-        }
-        Connections {
-            target: app
-            function onStationIntensityChanged() { stationLayer.requestPaint(); }
-        }
-        Connections {
-            target: root
-            function onCenterLatChanged() { stationLayer.requestPaint(); }
-            function onCenterLonChanged() { stationLayer.requestPaint(); }
-            function onZoomChanged() { stationLayer.requestPaint(); }
-            function onWidthChanged() { stationLayer.requestPaint(); }
-            function onHeightChanged() { stationLayer.requestPaint(); }
-        }
+        centerLat: root.centerLat
+        centerLon: root.centerLon
+        zoom: root.zoom
+        snapshot: app.stationSnapshot
+        gcjShift: root.gcjDatum
+        niedColors: root.theme.niedColorBand
+        csisColors: root.theme.csisColorBand
     }
 
     // 右上角：各测站源的实时最大值（仅显示，不参与预警）；每个源一张小卡，横向排列。
@@ -1049,17 +1045,20 @@ Item {
         spacing: 8
         z: 10
         visible: !root.pickingLocation
+        // model 用**长度**而不是数组本身：stationSources 每 100 ms 全量重建，
+        // 若直接当 model，Repeater 会把三张玻璃卡（含模糊层）反复销毁重建。
         Repeater {
-            model: app.stationSources
+            model: app.stationSources.length
             delegate: StationIntensityCard {
-                required property var modelData
+                required property int index
                 Layout.alignment: Qt.AlignTop
                 theme: root.theme
                 backdropSource: mapRenderLayer
-                sourceName: modelData.name
-                caption: modelData.caption
-                standard: modelData.standard
-                maxInfo: modelData
+                backdropLive: root.cameraMoving
+                maxInfo: app.stationSources[index] || ({})
+                sourceName: maxInfo.name
+                caption: maxInfo.caption
+                standard: maxInfo.standard
             }
         }
     }
@@ -1132,6 +1131,7 @@ Item {
         height: 64
         theme: root.theme
         backdropSource: mapRenderLayer
+        backdropLive: root.cameraMoving
         z: 30
         RowLayout {
             anchors.fill: parent; anchors.margins: 12
@@ -1142,14 +1142,18 @@ Item {
     }
 
     // One frosted toolbar, rather than a capture for every icon.
+    // z 必须高于测站层（z: 2），否则测站会画到工具条上面。
     GlassCard {
+        objectName: "mapToolbar"
         anchors.right: parent.right
         anchors.rightMargin: 16
         anchors.verticalCenter: parent.verticalCenter
         width: 48
+        z: 10
         height: mapActions.implicitHeight + 8
         theme: root.theme
         backdropSource: mapRenderLayer
+        backdropLive: root.cameraMoving
         radius: 14
         Column {
             id: mapActions
@@ -1200,6 +1204,7 @@ Item {
     GlassCard {
         theme: root.theme
         backdropSource: mapRenderLayer
+        backdropLive: root.cameraMoving
         anchors.right: parent.right
         anchors.rightMargin: 16
         anchors.bottom: parent.bottom

@@ -9,6 +9,10 @@ Item {
     objectName: "backdropBlur"
     required property Item sourceItem
     property real cornerRadius: 16
+    /// 背景是否逐帧重采样。live=true 会让 SceneGraph 永不空闲：实测窗口可见但静止时
+    /// 仍以 ~86 fps 渲染、吃掉约 25% CPU（每个玻璃卡片都在重绘整棵地图子树）。
+    /// 相机移动时才置 true；静止时由下面的定时器低频补帧。
+    property bool live: true
     readonly property int blurRadius: 64
     // Keep the sample margin at least as wide as the full blur kernel.
     readonly property real padding: blurRadius
@@ -49,11 +53,22 @@ Item {
                              Math.ceil((root.height + 2 * root.padding) / 2))
         width: root.width + 2 * root.padding
         height: root.height + 2 * root.padding
-        live: Window.window ? Window.window.visible : true
+        live: root.live && (Window.window ? Window.window.visible : true)
         recursive: false
         hideSource: false
         visible: false
         smooth: true
+    }
+    // 静止时每 500 ms 补一帧，兼顾「不持续渲染」与「数据/瓦片更新后背景不过期」。
+    Timer {
+        objectName: "backdropRefresh"
+        interval: 500
+        repeat: true
+        // Timer 的作用域对象不是 Item，必须显式从 root 取附着的 Window，
+        // 否则 Window.window 会报 “only supports types derived from Item”。
+        running: !root.live && root.visible
+                 && (root.Window.window ? root.Window.window.visible : true)
+        onTriggered: sample.scheduleUpdate()
     }
     Item {
         id: mask

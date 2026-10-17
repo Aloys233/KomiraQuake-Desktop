@@ -5,13 +5,16 @@
 #include <QMutex>
 #include <QtGlobal>
 #include <QPainterPath>
-#include <QQuickPaintedItem>
+#include <QQuickItem>
 #include <QVariantMap>
 #include <QtQml/qqmlregistration.h>
 #include <memory>
 #include <unordered_map>
 
 #include "core/vector_map_data.h"
+
+class QPainter;
+class QSGNode;
 
 namespace komira {
 
@@ -25,7 +28,7 @@ namespace komira {
 ///
 /// 洞（多环）交给 QPainterPath 的 OddEvenFill 处理 —— 175 个区县是多环，
 /// 填洞会让底图出现错误色块，故必须按 even-odd 规则原样保留。
-class VectorMapItem : public QQuickPaintedItem {
+class VectorMapItem : public QQuickItem {
     Q_OBJECT
     /// 注册到 KomiraQuake 模块，供 QML 直接 `VectorMapItem { }` 使用。
     QML_ELEMENT
@@ -50,7 +53,7 @@ class VectorMapItem : public QQuickPaintedItem {
     Q_PROPERTY(int featureCount READ featureCount NOTIFY readyChanged)
 
 public:
-    explicit VectorMapItem(QQuickPaintedItem* parent = nullptr);
+    explicit VectorMapItem(QQuickItem* parent = nullptr);
     ~VectorMapItem() override;
 
     QString layerName() const { return layerName_; }
@@ -81,7 +84,7 @@ public:
     bool ready() const { return ready_; }
     int featureCount() const { return featureCount_; }
 
-    void paint(QPainter* painter) override;
+    QSGNode* updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData* data) override;
 
     /// 最近一帧实际绘制所用的「参考层级世界像素 -> 屏幕」映射：
     ///   screenX = (projX(lon, worldSize(kRefZoom)) - drawnCenterX_) * drawnScale_ + width()/2
@@ -158,6 +161,9 @@ private:
     /// QQuickPaintedItem 是 CPU 光栅化，每帧重画上千条路径会直接吃掉帧预算
     ///（实测 world 层单层就 6 ms/帧）。
     static constexpr int kCacheMarginPx = 192;
+    /// 渲染缓存时额外多渲染的总尺寸（左右各一半）：侧栏开合会连续改变宽度，
+    /// 有这圈余量时缩窄可以一直复用，变宽也要跨过余量才重绘一次。
+    static constexpr int kCacheGrowSlackPx = 256;
     /// 复用位图时允许的缩放系数偏差（|scale/cacheScale-1|）。超出即重渲，兼顾
     /// 「缩放动画流畅」与「静止时边缘锐利」——位图放大太多会发虚。
     static constexpr double kCacheScaleTol = 0.15;
@@ -169,6 +175,10 @@ private:
     /// 缓存渲染时所用的缩放系数 2^(zoom-kRefZoom)。任何缩放都要按 s/此值放大位图，
     /// 否则位图停留在旧比例上 —— 曾因此让矢量层在缩放时与标记错位并跳变。
     double cacheScale_ = 1.0;
+    /// 缓存位图的设备像素比；变化即重渲。
+    qreal cacheDpr_ = 1.0;
+    /// 场景图节点上是否已有与 cache_ 对应的纹理（节点重建时置 false）。
+    bool textureValid_ = false;
     /// 任何影响外观的 setter 都自增；与 cacheStyleVersion_ 不等即作废缓存。
     int styleVersion_ = 0;
     int cacheStyleVersion_ = -1;
@@ -183,8 +193,8 @@ private:
         ++styleVersion_;
         cacheValid_ = false;
     }
-    /// 按当前相机把本层画进 cache_。
-    void renderToCache();
+    /// 按当前相机把本层画进 cache_（按 dpr 渲染，贴图时再缩小回逻辑尺寸）。
+    void renderToCache(qreal dpr, double cw, double ch);
     /// 把本层内容画到 painter 上，视口为 (vw, vh)，中心为当前相机。
     void drawLayerContent(QPainter& painter, double vw, double vh);
 };

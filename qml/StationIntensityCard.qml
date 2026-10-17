@@ -20,7 +20,9 @@ GlassCard {
     readonly property string valueText: hasData ? (maxInfo.text || "--") : "--"
 
     // 三个测站源使用同一宽度，避免标题长度导致右上角卡片跳宽。
-    readonly property real cardWidth: 84
+    // 90 而不是 84：标题 11px 下 PancakesSeis/WolfxSeisJS 需要约 71px，
+    // 84 的内宽只有 70px，分数缩放下会挤到字母粘连。
+    readonly property real cardWidth: 90
     implicitWidth: cardWidth
     Layout.minimumWidth: cardWidth
     Layout.preferredWidth: cardWidth
@@ -41,7 +43,8 @@ GlassCard {
             text: root.sourceName
             color: root.theme.textPrimary
             font.family: root.theme.fontFamily
-            font.pixelSize: 10
+            // 10px 在 1.3/1.5 分数缩放下 i/s 容易粘连（「i 看起来像 ii」），11px 明显更稳。
+            font.pixelSize: 11
             font.weight: Font.Bold
         }
         Rectangle {

@@ -4,6 +4,8 @@ Rectangle {
     id: root
     property Theme theme: Theme {}
     property Item backdropSource: null
+    /// 背景是否逐帧重采样（见 BackdropBlur.live）。地图卡片只在相机移动时打开。
+    property bool backdropLive: true
     property bool interactive: false
     property bool active: false
     property string accessibleName: ""
@@ -34,7 +36,11 @@ Rectangle {
         z: -1
         active: root.blurActive && root.visible && root.windowVisible
         sourceComponent: Component {
-            BackdropBlur { sourceItem: root.backdropSource; cornerRadius: root.radius }
+            BackdropBlur {
+                sourceItem: root.backdropSource
+                cornerRadius: root.radius
+                live: root.backdropLive
+            }
         }
     }
     MouseArea {
