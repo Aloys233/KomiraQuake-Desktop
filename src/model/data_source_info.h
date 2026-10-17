@@ -58,6 +58,8 @@ inline const QString kSimulated = QStringLiteral("simulated");
 /// 因此与事件源分开管理启停。
 namespace StationSourceIds {
 inline const QString kKmoni = QStringLiteral("kmoni");
+inline const QString kSnet = QStringLiteral("snet");
+inline const QString kKma = QStringLiteral("kma_station");
 inline const QString kPancakesSeis = QStringLiteral("pancakes_seis");
 inline const QString kWolfxSeis = QStringLiteral("wolfx_seis");
 }

@@ -226,6 +226,22 @@ Column {
             onToggled: app.settings.setStationSourceEnabled("kmoni", checked)
         }
         GlassSwitch {
+            objectName: "snetStationSwitch"
+            width: parent.width; theme: root.theme
+            text: "S-Net 海底观测网"
+            description: "經 Jian 转发的日本近海海底地震仪实时震度（JMA 計測震度）。"
+            checked: app.settings.isStationSourceEnabled("snet")
+            onToggled: app.settings.setStationSourceEnabled("snet", checked)
+        }
+        GlassSwitch {
+            objectName: "kmaStationSwitch"
+            width: parent.width; theme: root.theme
+            text: "KMA PEWS 测站"
+            description: "經 Jian 转发的韩国气象厅实时测站烈度（韩国 MMI）。"
+            checked: app.settings.isStationSourceEnabled("kma_station")
+            onToggled: app.settings.setStationSourceEnabled("kma_station", checked)
+        }
+        GlassSwitch {
             objectName: "pancakesSeisSwitch"
             width: parent.width; theme: root.theme
             text: "PancakesSeis 加速度台站"

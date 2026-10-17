@@ -29,12 +29,14 @@
 #include "service/sentry_service.h"
 #include "source/eew_parser.h"
 #include "source/jian_parser.h"
+#include "source/kma_station_parser.h"
 #include "source/kmoni_station_parser.h"
 #include "source/pancakes_parser.h"
 #include "source/pancakes_protocol.h"
 #include "source/pancakes_seis_parser.h"
 #include "source/simulated_parser.h"
 #include "source/simulated_protocol.h"
+#include "source/snet_station_parser.h"
 #include "source/whews_parser.h"
 #include "source/whews_protocol.h"
 #include "source/wolfx_seis_parser.h"
@@ -132,6 +134,61 @@ private slots:
         QCOMPARE(jmaShindoText(4.6), QStringLiteral("5弱"));
         QCOMPARE(jmaShindoText(5.2), QStringLiteral("5強"));
         QCOMPARE(jmaShindoText(6.7), QStringLiteral("7"));
+    }
+
+    // S-Net 测站通道：首包台站表（code/lat/lon/name/type）+ 增量 int[] 解析。
+    void snetStationParsesStationsAndIntensity() {
+        const QJsonObject stationsFrame = QJsonDocument::fromJson(R"({
+            "type":"s-net","timestamp":1791893685468,
+            "stations":[
+                {"code":"N.S1N01","lat":35.8968,"lon":141.0535,"name":"S1N01","type":"S-net"},
+                {"code":"N.ST1H","lat":34.59556,"lon":139.91831,"name":"ST1H","type":"sagami"}
+            ]})").object();
+        const auto stations = SnetStationParser::parseStations(stationsFrame);
+        QVERIFY(stations.has_value());
+        QCOMPARE(stations->size(), 2);
+        QCOMPARE(stations->at(0).code, QStringLiteral("N.S1N01"));
+        QCOMPARE(stations->at(0).latitude, 35.8968);
+        QCOMPARE(stations->at(0).name, QStringLiteral("S1N01"));
+        QCOMPARE(stations->at(1).stationType, QStringLiteral("sagami"));
+        // 首包不含 int[]；增量帧不含 stations。
+        QVERIFY(!SnetStationParser::parseIntensity(stationsFrame).has_value());
+
+        const QJsonObject frame = QJsonDocument::fromJson(R"({
+            "type":"s-net","time":"20261017105400","timestamp":1791893685468,
+            "int":[-3, 2.4, 99]})").object();
+        const auto intensity = SnetStationParser::parseIntensity(frame);
+        QVERIFY(intensity.has_value());
+        QCOMPARE(intensity->size(), 3);
+        QCOMPARE(intensity->at(0), -3.0);
+        QCOMPARE(intensity->at(1), 2.4);
+        // 饱和值原样保留（显示层按上限处理）。
+        QCOMPARE(intensity->at(2), 99.0);
+        QVERIFY(!SnetStationParser::parseStations(frame).has_value());
+    }
+
+    // KMA 测站通道：首包坐标数组（仅 lat/lon）+ 增量 mmi[] 解析。
+    void kmaStationParsesStationsAndMmi() {
+        const QJsonObject stationsFrame = QJsonDocument::fromJson(R"({
+            "type":"kma-station","timestamp":1791893685065,
+            "stations":[{"lat":36.41,"lon":128.94},{"lat":36.57,"lon":128.7}]})").object();
+        const auto stations = KmaStationParser::parseStations(stationsFrame);
+        QVERIFY(stations.has_value());
+        QCOMPARE(stations->size(), 2);
+        QCOMPARE(stations->at(0).latitude, 36.41);
+        QCOMPARE(stations->at(1).longitude, 128.7);
+        QVERIFY(!KmaStationParser::parseMmi(stationsFrame).has_value());
+
+        const QJsonObject frame = QJsonDocument::fromJson(R"({
+            "type":"kma-station","time":"20261017105545","timestamp":1791893685065,
+            "phase":1,"phase_name":"normal","mmi":[1, -3, 4]})").object();
+        const auto mmi = KmaStationParser::parseMmi(frame);
+        QVERIFY(mmi.has_value());
+        QCOMPARE(mmi->size(), 3);
+        QCOMPARE(mmi->at(0), 1.0);
+        QCOMPARE(mmi->at(1), -3.0);
+        QCOMPARE(mmi->at(2), 4.0);
+        QVERIFY(!KmaStationParser::parseStations(frame).has_value());
     }
 
     // PancakesSeis 测站通道：首包台站表 + 逐站三轴加速度帧解析，及 PGA->計測震度折算。

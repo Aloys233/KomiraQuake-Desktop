@@ -63,6 +63,10 @@ qt_add_executable(komiraquake WIN32
     src/source/jian_source.cpp
     src/source/kmoni_station_parser.cpp
     src/source/kmoni_station_source.cpp
+    src/source/snet_station_parser.cpp
+    src/source/snet_station_source.cpp
+    src/source/kma_station_parser.cpp
+    src/source/kma_station_source.cpp
     src/source/pancakes_seis_parser.cpp
     src/source/pancakes_seis_source.cpp
     src/source/whews_protocol.cpp
@@ -255,6 +259,8 @@ if(BUILD_TESTING)
         src/source/pancakes_parser.cpp src/source/pancakes_source.cpp
         src/source/jian_protocol.cpp src/source/jian_parser.cpp src/source/jian_source.cpp
         src/source/kmoni_station_parser.cpp src/source/kmoni_station_source.cpp
+        src/source/snet_station_parser.cpp src/source/snet_station_source.cpp
+        src/source/kma_station_parser.cpp src/source/kma_station_source.cpp
         src/source/pancakes_seis_parser.cpp src/source/pancakes_seis_source.cpp
         src/source/whews_protocol.cpp src/source/whews_parser.cpp src/source/whews_source.cpp
         src/source/wolfx_seis_parser.cpp src/source/wolfx_seis_source.cpp

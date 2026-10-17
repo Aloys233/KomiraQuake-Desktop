@@ -15,10 +15,13 @@ public:
     struct Entry {
         double lat = 0.0;
         double lon = 0.0;
-        /// 连续震度（NIED）或 CSIS 烈度（Pancakes/Wolfx）；缺测为负值。
+        /// 连续震度（NIED/S-Net）、中国地震烈度（Pancakes/Wolfx）或韩国 MMI（KMA）；
+        /// 缺测均为负值。
         double raw = -3.0;
-        /// true 表示该站用中国地震烈度（CSIS）方标，false 表示 NIED 圆点。
+        /// true 表示该站用中国地震烈度（CSIS）方标，false 表示圆点。
         bool csis = false;
+        /// true 表示该站为 KMA MMI：低烈度画 KMA 色阶圆点，MMI ≥ 2 画带数字方标。
+        bool kma = false;
     };
 
     explicit StationSnapshot(QObject* parent = nullptr) : QObject(parent) {}

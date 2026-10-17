@@ -49,6 +49,29 @@ Item {
     property bool following: false
     /// 用户是否手动控制过镜头（拖动/缩放/回到我的位置/复位）。用于避免定位到达时抢镜头。
     property bool userMovedCamera: false
+    /// 指针正按在地图上（按下到松开）。手势期间到达的新事件聚焦、波前逐帧跟随、
+    /// 空闲/结束归位一律推迟——这些程序化镜头会与拖拽逐帧抢写 center/zoom，
+    /// 手感上就是"鼠标被抢走"。
+    property bool gestureActive: false
+    /// 手势期间收到的**新焦点**（新实时事件、列表中显式选中）：记住，松开后再飞过去。
+    /// 波前逐帧跟随不记——松手后跟随循环下一帧自然追上；空闲/结束归位直接作废
+    /// （用户正在自己看地图，拖动已重启空闲计时）。
+    property bool pendingFocus: false
+    function beginGesture() {
+        gestureActive = true;
+    }
+    function endGesture() {
+        if (!gestureActive) return;
+        gestureActive = false;
+        if (pendingFocus) {
+            pendingFocus = false;
+            frameEventImpl(undefined);
+        }
+        // 手势中窗口尺寸可能变过（minZoom 抬升），补做一次下界检查。
+        if (root.zoom < root.minZoom) moveCamera(root.centerLat, root.centerLon, root.minZoom, 0);
+    }
+    // 窗口隐藏/离开时可能收不到松开事件：不能把手势态卡在 true，否则之后所有镜头都会被冻结。
+    onVisibleChanged: if (!visible) endGesture()
     /// 左侧 HUD 的**宽度**（px）：取景时按它让开左侧竖栏。
     property real hudWidth: 0
     /// 左侧 HUD 的**高度**（px，含余量）：取景时按它让开顶部。
@@ -181,9 +204,9 @@ Item {
     }
 
     // 跟随波前时，波前半径每 100ms 才更新一次；若把目标值直接赋值，缩放会一格一格地跳。
-    // 用 Behavior 把目标值插值到显示帧率，跟随才够细腻。拖动（following=false）、
+    // 用 Behavior 把目标值插值到显示帧率，跟随才够细腻。拖动（following=false 或指针按住）、
     // 程序化补间（cameraMove 进行中）或"减少动态效果"时禁用，保持 1:1 跟手。
-    readonly property bool followSmoothing: following && !cameraMove.running && !theme.reduceMotion && root.visible
+    readonly property bool followSmoothing: following && !gestureActive && !cameraMove.running && !theme.reduceMotion && root.visible
     readonly property int followSmoothMs: 120
     Behavior on zoom {
         enabled: root.followSmoothing
@@ -257,7 +280,10 @@ Item {
         moveCamera(shiftedUser.lat, shiftedUser.lon, 6, cameraDuration);
     }
     /// 还原默认视野：停止跟随，回到用户位置（无定位时回到全国概览）。
+    /// 指针按在地图上时作废：用户正拖着/正要点地图，不该把视野拉走；
+    /// 空闲计时已由拖动重启，松手后自然会再触发。
     function resetView() {
+        if (gestureActive) return;
         idleResetTimer.stop();
         following = false;
         userMovedCamera = true;
@@ -275,6 +301,8 @@ Item {
     /// 再把版图中心对齐到可视区中心。取整到**整数层级**（对齐 Leaflet fitBounds 的 floor 行为），
     /// 保证静止时瓦片 1:1 渲染、无缩放拉伸。取代原先写死的 `zoom 6`。
     function frameChina(animate) {
+        // 指针按住地图期间不重取景（布局/尺寸变化会走到这里）。
+        if (gestureActive) return;
         if (width <= 0 || height <= 0) return;
         const b = chinaBounds;
         const x0 = projX(b.lonMin, 0), x1 = projX(b.lonMax, 0);
@@ -302,15 +330,22 @@ Item {
     }
     /// **显式**聚焦震中：工具条「跟随震中」按钮与「选中事件」都走这里。
     /// 与自动跟随共用同一套可见波前半径，显式动作也能把镜头带到仍在淡出的波前。
+    /// 按住/拖动地图期间不抢镜头：记下来，松开后再飞过去（新事件不该打断拖拽）。
     function focusEvent() {
+        if (gestureActive) {
+            pendingFocus = true;
+            return;
+        }
         frameEventImpl(undefined);
     }
     /// 自动聚焦震中区域（不并入用户所在地）：半径跟随 P/S 波前，连续（无级）缩放。
-    /// animate === false 用于波前逐帧重取景，避免与 420ms 补间互相追赶。
+    /// animate === false 用于波前逐帧重取景，避免与补间互相追赶。
     function frameEvent(animate) {
         frameEventImpl(animate);
     }
     function frameEventImpl(animate) {
+        // 手势期间一律不写镜头：逐帧跟随会与拖拽抢同一组属性，手感就是"鼠标被抢"。
+        if (gestureActive) return;
         following = true;
         idleResetTimer.stop();
         if (!hasEvent || width <= 0 || height <= 0) return;
@@ -360,6 +395,8 @@ Item {
         interval: root.eventEndResetMs
         repeat: false
         onTriggered: {
+            // 用户正按着地图：稍后再归位，别在指针下把画面抽走。
+            if (root.gestureActive) { eventEndResetTimer.restart(); return; }
             const currentId = root.eventIdentity();
             // 空事件表示原事件已从焦点中移除；同一 ID 则表示仍停留在已结束事件。
             // 只有切换到了另一场事件才取消本次延迟回位。
@@ -387,6 +424,9 @@ Item {
                 }
                 if (!root.following || !root.hasFocus) return;
                 if (cameraMove.running) return;
+                // 用户正按住地图：推迟到松开后再重新取景，避免与拖拽抢镜头。
+                // 不记为待执行动作——松手后跟随循环会在下一帧自然追到新半径。
+                if (root.gestureActive) return;
                 root.frameEvent(false);
                 return;
             }
@@ -412,6 +452,8 @@ Item {
         interval: root.idleResetMs
         onTriggered: {
             if (root.pickingLocation || root.following) return;
+            // 用户仍按着地图：本轮作废，重新计时；松开后无操作自然再触发。
+            if (root.gestureActive) { idleResetTimer.restart(); return; }
             // 有活动预警时归位到预警震中并重新跟随；否则回到我的位置（无定位则全国概览）。
             if (root.warningActive && root.hasEvent) root.frameEvent();
             else root.resetView();
@@ -454,11 +496,13 @@ Item {
     }
     onWidthChanged: {
         applyDefaultOverview();
+        if (root.gestureActive) return;
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
         else if (!hasFocus && !hasUser && !userMovedCamera) Qt.callLater(() => frameChina(false));
     }
     onHeightChanged: {
         applyDefaultOverview();
+        if (root.gestureActive) return;
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
         else if (!hasFocus && !hasUser && !userMovedCamera) Qt.callLater(() => frameChina(false));
     }
@@ -467,11 +511,14 @@ Item {
     /// HUD 尺寸或视口变化后重取景：与 onWidth/onHeight 同一套逻辑，抽出来避免三处重复。
     function reframeForLayout() {
         applyDefaultOverview();
+        if (root.gestureActive) return;
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
         else if (!hasFocus && !hasUser && !userMovedCamera) Qt.callLater(() => frameChina(false));
     }
     // 窗口尺寸变化后最小缩放随之变化：当前缩放若已低于新下界就抬上来，避免露出背景带。
-    onMinZoomChanged: if (root.zoom < root.minZoom) moveCamera(root.centerLat, root.centerLon, root.minZoom, 0)
+    // 手势期间不写镜头（松开后由 endGesture 补做）。
+    onMinZoomChanged: if (!gestureActive && root.zoom < root.minZoom)
+                          moveCamera(root.centerLat, root.centerLon, root.minZoom, 0)
     onGcjDatumChanged: {
         if (previousGcjDatum === gcjDatum) return;
         const pt = gcjDatum ? app.wgs84ToGcj02(centerLat, centerLon)
@@ -1020,9 +1067,10 @@ Item {
 
     // ---- 测站强度层 ------------------------------------------------------
     // 上千个测站由 C++ 一次批量绘制（逐 Item 会拖垮场景图）。
-    // NIED（JMA 計測震度）沿用 kanameishi：常态圆点，颜色随连续震度色阶。
+    // NIED / S-Net（JMA 計測震度）沿用 kanameishi：常态圆点，颜色随连续震度色阶。
     // Pancakes / Wolfx（中国地震烈度 CSIS）对齐 flutterRhythmQuake：活跃测站画带烈度数字的
-    // 圆角方标（高烈度白实边），缺测画蓝点。
+    // 圆角方标（高烈度白实边），缺测画蓝点。KMA（韩国 MMI）低烈度画 KMA 灰点，
+    // MMI ≥ 2 画带数字方标。
     StationMapItem {
         id: stationLayer
         objectName: "stationIntensityLayer"
@@ -1036,6 +1084,8 @@ Item {
         gcjShift: root.gcjDatum
         niedColors: root.theme.niedColorBand
         csisColors: root.theme.csisColorBand
+        kmaColors: root.theme.kmaColorBand
+        kmaDotColors: root.theme.kmaDotColorBand
     }
 
     // 右上角：各测站源的实时最大值（仅显示，不参与预警）；每个源一张小卡，横向排列。
@@ -1066,9 +1116,11 @@ Item {
     }
 
     MouseArea {
+        id: mapMouseArea
         anchors.fill: parent
         acceptedButtons: Qt.LeftButton
-        cursorShape: root.pickingLocation ? Qt.CrossCursor : Qt.ArrowCursor
+        cursorShape: root.pickingLocation ? Qt.CrossCursor
+                     : root.gestureActive ? Qt.ClosedHandCursor : Qt.ArrowCursor
         property real lastX: 0
         property real lastY: 0
         property real pressX: 0
@@ -1092,7 +1144,12 @@ Item {
             lastY = mouse.y;
             pressX = mouse.x;
             pressY = mouse.y;
+            // 从按下的第一刻起就冻结程序化镜头：即便还没产生位移，新事件/波前跟随
+            // 也不该在指针下把画面抽走。
+            root.beginGesture();
         }
+        // 松开或被其它控件抢走抓取时都回到自由态（canceled 同样会置 pressed=false）。
+        onPressedChanged: if (!pressed) root.endGesture()
         onPositionChanged: (mouse) => {
             if (!pressed) return;
             root.following = false;
@@ -1122,6 +1179,9 @@ Item {
                 root.pickingLocation = false;
             }
         }
+        // 松开、失去抓取或被取消时都回到自由态：endGesture 幂等，重复调用无副作用。
+        onReleased: root.endGesture()
+        onCanceled: root.endGesture()
     }
 
     GlassCard {

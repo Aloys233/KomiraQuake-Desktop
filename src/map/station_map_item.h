@@ -46,6 +46,12 @@ class StationMapItem : public QQuickItem {
     Q_PROPERTY(QVariantList niedColors READ niedColors WRITE setNiedColors NOTIFY colorsChanged)
     /// CSIS 烈度色带（下标 0..12）。
     Q_PROPERTY(QVariantList csisColors READ csisColors WRITE setCsisColors NOTIFY colorsChanged)
+    /// KMA MMI 色带（下标 0..13 = MMI+2：0–3 灰、4 浅灰、5 天蓝、6 蓝、7 绿、8 黄、
+    /// 9 橙、10 深橙、11 红、12+ 紫；对齐 kanameishi `kmaIntColorBand`）。
+    Q_PROPERTY(QVariantList kmaColors READ kmaColors WRITE setKmaColors NOTIFY colorsChanged)
+    /// KMA 普通圆点色带（14 档，对齐 kanameishi `kmaColorBand.nied`）。
+    Q_PROPERTY(QVariantList kmaDotColors READ kmaDotColors WRITE setKmaDotColors
+                   NOTIFY colorsChanged)
 
 public:
     explicit StationMapItem(QQuickItem* parent = nullptr);
@@ -67,6 +73,10 @@ public:
     void setNiedColors(const QVariantList& v);
     QVariantList csisColors() const { return csisColors_; }
     void setCsisColors(const QVariantList& v);
+    QVariantList kmaColors() const { return kmaColors_; }
+    void setKmaColors(const QVariantList& v);
+    QVariantList kmaDotColors() const { return kmaDotColors_; }
+    void setKmaDotColors(const QVariantList& v);
 
     /// 最近一帧实际绘制所用的投影（与 MapView 的 screenX/screenY 同源），供回归测试断言。
     Q_INVOKABLE QPointF screenPosForTest(double lat, double lon) const;
@@ -90,7 +100,8 @@ private:
     void rebuildProjectedPositions();
     void invalidateRenderCache();
 
-    /// 图集：13 个 CSIS 方标 + 21 档 NIED 圆点 + 1 个缺测蓝点。
+    /// 图集：13 个 CSIS 方标 + 10 个 KMA 方标 + 14 档 KMA 圆点 + 21 档 NIED 圆点
+    /// + 1 个缺测蓝点。
     static void stationSizes(double zoom, int* csisPx, int* dotPx, int* idlePx);
     /// 软件后端（CI 的 QT_QUICK_BACKEND=software）不支持 QSGTextureMaterial 的顶点绘制，
     /// 退回「整层位图 + QSGImageNode」：只在测试/无 GPU 环境使用，性能不敏感。
@@ -98,7 +109,11 @@ private:
                                 double h, qreal dpr);
     void ensureAtlas(qreal dpr, int csisPx, int dotPx, int idlePx);
     void drawMarkerTile(QPainter& painter, const QRectF& rect, int level) const;
+    /// KMA 方标：MMI 数字直接作为标签（kanameishi `getMmiFromKmaLevel` 的 `level - 2`）。
+    void drawKmaMarkerTile(QPainter& painter, const QRectF& rect, int mmi) const;
     QColor csisColor(int level) const;
+    QColor kmaColor(int level) const;
+    QColor kmaDotColor(int level) const;
     QColor niedColor(int idx) const;
 
     static constexpr int kCsisTile = 24;
@@ -114,6 +129,8 @@ private:
     std::vector<QPointF> positions_;
     QVariantList niedColors_;
     QVariantList csisColors_;
+    QVariantList kmaColors_;
+    QVariantList kmaDotColors_;
 
     double centerLat_ = 35.0;
     double centerLon_ = 105.0;
@@ -124,6 +141,10 @@ private:
     qreal atlasDpr_ = -1.0;
     int atlasVersion_ = -1;
     QVector<QRectF> csisUv_;
+    /// KMA MMI+2 档圆点（下标 0..13 对应 holdLevel = MMI+2）。
+    QVector<QRectF> kmaDotUv_;
+    /// KMA 带数字方标（下标 0..9 对应 holdLevel 4..13）。
+    QVector<QRectF> kmaMarkerUv_;
     QVector<QRectF> niedUv_;
     QRectF idleUv_;
     int csisTilePx_ = 0;

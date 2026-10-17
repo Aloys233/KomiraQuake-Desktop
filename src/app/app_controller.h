@@ -32,6 +32,8 @@ class JianSource;
 class WhewsSource;
 class SimulatedSource;
 class KmoniStationSource;
+class SnetStationSource;
+class KmaStationSource;
 class PancakesSeisSource;
 class WolfxSeisSource;
 class HistoryStore;
@@ -226,7 +228,7 @@ private:
     void scheduleHudRefresh();
     /// 将高频测站帧合并为固定频率的快照刷新，避免每条站点帧都重建整张表。
     void scheduleStationIntensityRefresh();
-    /// 按三路源的最新读数重建 StationSnapshot（纯 POD 拷贝，不发 QML 信号）。
+    /// 按各测站源的最新读数重建 StationSnapshot（纯 POD 拷贝，不发 QML 信号）。
     void refreshStationSnapshot();
     /// 全部活动事件按发震时刻倒序（最新在前）的 identity 列表。
     std::vector<std::string> orderedActiveKeys() const;
@@ -280,6 +282,10 @@ private:
     SimulatedSource* simulated_ = nullptr;
     /// NIED Kmoni 实时测站显示源（非 EEW，不入 sources_ 事件注册表）。
     KmoniStationSource* stationSource_ = nullptr;
+    /// S-Net 海底观测网实时测站显示源（非 EEW）。
+    SnetStationSource* snetSource_ = nullptr;
+    /// KMA PEWS 实时测站显示源（非 EEW）。
+    KmaStationSource* kmaSource_ = nullptr;
     /// PancakesSeis 实时测站显示源（非 EEW，不入 sources_ 事件注册表）。
     PancakesSeisSource* seisSource_ = nullptr;
     /// Wolfx SeisJS 实时测站显示源（非 EEW，不入 sources_ 事件注册表）。

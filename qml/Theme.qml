@@ -89,16 +89,39 @@ QtObject {
         const idx = Math.max(0, Math.min(20, Math.round((raw + 3) * 2)));
         return niedColorBand[idx];
     }
+    /// KMA MMI 色阶（对齐 kanameishi `kmaIntColorBand`，下标 = MMI + 2，即 0..13）。
+    /// MMI 0–3 为灰/浅灰；4 起天蓝→蓝→绿→黄→橙→深橙→红→紫。
+    readonly property var kmaColorBand: [
+        "#9F9F9F", "#9F9F9F", "#9F9F9F", "#9F9F9F", "#CFCFCF", "#5FCFFF", "#3FAFFF",
+        "#5FDF8F", "#F7E757", "#FF8F00", "#FF4F00", "#DF0F0F", "#7F007F", "#7F007F"
+    ]
+    /// KMA 普通测站圆点色阶（'kmaColorBand.nied' 顺序）。该通道静稳基线是 MMI 1，
+    /// 0/1 两档统一用与 NIED 缺测点相同的深蓝（`#0003cf`），保证两张测站网的静稳蓝一致；
+    /// MMI ≥ 2 改用 `kmaColorBand` 方标。
+    readonly property var kmaDotColorBand: [
+        "#0003cf", "#0003cf", "#05d384", "#50fb30", "#ccff09", "#fdfc00", "#ffca00",
+        "#ff7900", "#ff4700", "#f91900", "#e10000", "#af0000", "#ae0000", "#ad0000"
+    ]
+    /// KMA MMI → 颜色：MMI 0/1 是常态基线，取圆点色阶的蓝；MMI ≥ 2 取 `kmaColorBand`
+    /// （下标 = MMI+2，对齐 kanameishi `kmaIntColorBand`）。
+    function kmaStationColor(raw) {
+        const mmi = Math.max(0, Math.min(11, Math.round(raw)));
+        if (mmi < 2) return kmaDotColorBand[mmi];
+        return kmaColorBand[Math.min(kmaColorBand.length - 1, mmi + 2)];
+    }
     /// 卡片大号数字用的颜色：色阶原色在浅色卡上偏亮、深色卡上偏暗，
     /// 这里按主题做对比度校正（浅色卡压暗、深色卡提亮），保证数字可读。
     function stationTextColor(raw) {
         const base = niedStationColor(raw);
         return dark ? Qt.lighter(base, 1.45) : Qt.darker(base, 1.5);
     }
-    /// 卡片大号数字用色（按数据源制式）：`csis` 用中国烈度色阶，其余用 NIED 连续色阶；
-    /// 同样按主题做对比度校正，保证数字可读。
+    /// 卡片大号数字用色（按数据源制式）：`csis` 用中国烈度色阶、`kma` 用韩国 MMI 色阶，
+    /// 其余用 NIED 连续色阶；同样按主题做对比度校正，保证数字可读。
     function stationTextColorFor(raw, standard) {
-        const base = standard === "csis" ? intensityColor(raw) : niedStationColor(raw);
+        let base;
+        if (standard === "csis") base = intensityColor(raw);
+        else if (standard === "kma") base = kmaStationColor(raw);
+        else base = niedStationColor(raw);
         return dark ? Qt.lighter(base, 1.45) : Qt.darker(base, 1.5);
     }
     function magnitudeColor(m) {

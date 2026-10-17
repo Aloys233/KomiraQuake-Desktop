@@ -142,6 +142,22 @@ void StationMapItem::setCsisColors(const QVariantList& v) {
     update();
 }
 
+void StationMapItem::setKmaColors(const QVariantList& v) {
+    if (kmaColors_ == v) return;
+    kmaColors_ = v;
+    ++colorVersion_;
+    emit colorsChanged();
+    update();
+}
+
+void StationMapItem::setKmaDotColors(const QVariantList& v) {
+    if (kmaDotColors_ == v) return;
+    kmaDotColors_ = v;
+    ++colorVersion_;
+    emit colorsChanged();
+    update();
+}
+
 void StationMapItem::rebuildProjectedPositions() {
     positions_.resize(stations_.size());
     for (std::size_t i = 0; i < stations_.size(); ++i) {
@@ -254,6 +270,32 @@ QSGNode* StationMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
         const double x = w / 2.0 + dx / 360.0 * world;
         const double y = h / 2.0 + (projY(pos.y(), refSize) - centerRefY) * scale;
 
+        if (s.kma) {
+            if (s.raw >= 0.0) {
+                // 该通道的韩国 MMI 静稳基线是 1（全站常年 1）。0/1 两档取圆点色阶的
+                // 深蓝（与 NIED 缺测点同色）；MMI >= 2 才改用 `kmaIntColorBand` 的
+                // 带数字方标（数字 = MMI，色档沿用 kanameishi 的 MMI+2）。
+                const int mmi = qBound(0, static_cast<int>(std::lround(s.raw)), 11);
+                if (mmi >= 2) {
+                    if (x < -csisSize || y < -csisSize || x > w + csisSize || y > h + csisSize) {
+                        continue;
+                    }
+                    addQuad(x, y, csisSize, kmaMarkerUv_[mmi - 2]);
+                } else {
+                    if (x < -dotSize || y < -dotSize || x > w + dotSize || y > h + dotSize) {
+                        continue;
+                    }
+                    addQuad(x, y, dotSize, kmaDotUv_[mmi]);
+                }
+            } else {
+                if (x < -idleSize || y < -idleSize || x > w + idleSize || y > h + idleSize) {
+                    continue;
+                }
+                addQuad(x, y, idleSize, idleUv_);
+            }
+            continue;
+        }
+
         if (s.csis) {
             if (s.raw >= 0.0) {
                 if (x < -csisSize || y < -csisSize || x > w + csisSize || y > h + csisSize) {
@@ -357,6 +399,29 @@ QSGNode* StationMapItem::updateSoftwareNode(QSGNode* oldNode, double lat, double
         const double x = w / 2.0 + dx / 360.0 * world;
         const double y = h / 2.0 + (projY(pos.y(), refSize) - centerRefY) * scale;
 
+        if (s.kma) {
+            if (s.raw >= 0.0) {
+                const int mmi = qBound(0, static_cast<int>(std::lround(s.raw)), 11);
+                if (mmi >= 2) {
+                    if (x < -csisSize || y < -csisSize || x > w + csisSize || y > h + csisSize) {
+                        continue;
+                    }
+                    drawTile(x, y, csisSize, kmaMarkerUv_[mmi - 2]);
+                } else {
+                    if (x < -dotSize || y < -dotSize || x > w + dotSize || y > h + dotSize) {
+                        continue;
+                    }
+                    drawTile(x, y, dotSize, kmaDotUv_[mmi]);
+                }
+            } else {
+                if (x < -idleSize || y < -idleSize || x > w + idleSize || y > h + idleSize) {
+                    continue;
+                }
+                drawTile(x, y, idleSize, idleUv_);
+            }
+            continue;
+        }
+
         if (s.csis) {
             if (s.raw >= 0.0) {
                 if (x < -csisSize || y < -csisSize || x > w + csisSize || y > h + csisSize) {
@@ -405,7 +470,7 @@ void StationMapItem::ensureAtlas(qreal dpr, int csisPx, int dotPx, int idlePx) {
     const int csisCell = csisPx + 2 * pad;
     const int dotCell = dotPx + 2 * pad;
     const int idleCell = idlePx + 2 * pad;
-    const int totalW = 13 * csisCell + 21 * dotCell + idleCell;
+    const int totalW = 13 * csisCell + 10 * csisCell + 14 * dotCell + 21 * dotCell + idleCell;
 
     const int imgW = std::max(1, static_cast<int>(std::ceil(totalW * dpr)));
     const int imgH = std::max(1, static_cast<int>(std::ceil(cellH * dpr)));
@@ -427,6 +492,27 @@ void StationMapItem::ensureAtlas(qreal dpr, int csisPx, int dotPx, int idlePx) {
         const QRectF r(x + pad, pad, csisPx, csisPx);
         drawMarkerTile(painter, r, level);
         csisUv_[level] = normalize(r);
+        x += csisCell;
+    }
+
+    // KMA：14 档普通圆点 + 10 个带数字方标（`kmaIntColorBand`，MMI 2..11）。
+    // 与 kanameishi 一致：普通态一律圆点，MMI >= 2 换成方标；0/1 两档在
+    // `kmaDotColorBand` 中都定义为与 NIED 缺测点相同的深蓝。
+    kmaDotUv_.resize(14);
+    for (int level = 0; level <= 13; ++level) {
+        const double y = (cellH - dotPx) / 2.0;
+        const QRectF r(x + pad, y, dotPx, dotPx);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(kmaDotColor(level));
+        painter.drawEllipse(r);
+        kmaDotUv_[level] = normalize(r);
+        x += dotCell;
+    }
+    kmaMarkerUv_.resize(10);
+    for (int i = 0; i < 10; ++i) {
+        const QRectF r(x + pad, pad, csisPx, csisPx);
+        drawKmaMarkerTile(painter, r, i + 2);
+        kmaMarkerUv_[i] = normalize(r);
         x += csisCell;
     }
 
@@ -481,10 +567,48 @@ void StationMapItem::drawMarkerTile(QPainter& painter, const QRectF& rect, int l
     painter.drawText(rect, Qt::AlignCenter, QString::number(level));
 }
 
+void StationMapItem::drawKmaMarkerTile(QPainter& painter, const QRectF& rect, int mmi) const {
+    const double size = rect.width();
+    const double border = mmi >= 5 ? 1.6 : 0.9;
+    const QRectF body = rect.adjusted(border / 2.0, border / 2.0, -border / 2.0, -border / 2.0);
+    const double radius = size * 0.22;
+
+    QColor fill = kmaColor(mmi + 2);
+    fill.setAlphaF(0.75);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(fill);
+    painter.drawRoundedRect(body, radius, radius);
+
+    painter.setPen(
+        QPen(mmi >= 5 ? QColor(255, 255, 255, 242) : QColor(255, 255, 255, 115), border));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(body, radius, radius);
+
+    QFont font(QStringLiteral("sans-serif"));
+    font.setBold(true);
+    font.setPixelSize(
+        std::max(1, static_cast<int>(std::lround(size * (mmi >= 5 ? 0.58 : 0.48)))));
+    painter.setFont(font);
+    painter.setPen(luminance(kmaColor(mmi + 2)) > 0.42 ? QColor(Qt::black) : QColor(Qt::white));
+    painter.drawText(rect, Qt::AlignCenter, QString::number(mmi));
+}
+
 QColor StationMapItem::csisColor(int level) const {
     if (csisColors_.isEmpty()) return QColor(QStringLiteral("#9F9F9F"));
     const int idx = qBound(0, level, csisColors_.size() - 1);
     return QColor(csisColors_.at(idx).toString());
+}
+
+QColor StationMapItem::kmaColor(int level) const {
+    if (kmaColors_.isEmpty()) return QColor(QStringLiteral("#9F9F9F"));
+    const int idx = qBound(0, level, kmaColors_.size() - 1);
+    return QColor(kmaColors_.at(idx).toString());
+}
+
+QColor StationMapItem::kmaDotColor(int level) const {
+    if (kmaDotColors_.isEmpty()) return QColor(QStringLiteral("#0003cf"));
+    const int idx = qBound(0, level, kmaDotColors_.size() - 1);
+    return QColor(kmaDotColors_.at(idx).toString());
 }
 
 QColor StationMapItem::niedColor(int idx) const {

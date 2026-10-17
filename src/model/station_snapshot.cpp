@@ -8,7 +8,8 @@ void StationSnapshot::setEntries(std::vector<Entry> entries) {
         for (std::size_t i = 0; i < entries.size(); ++i) {
             const Entry& a = entries[i];
             const Entry& b = entries_[i];
-            if (a.lat != b.lat || a.lon != b.lon || a.raw != b.raw || a.csis != b.csis) {
+            if (a.lat != b.lat || a.lon != b.lon || a.raw != b.raw || a.csis != b.csis ||
+                a.kma != b.kma) {
                 same = false;
                 break;
             }

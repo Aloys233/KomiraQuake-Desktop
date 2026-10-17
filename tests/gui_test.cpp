@@ -933,9 +933,9 @@ private slots:
         komira::StationSnapshot snapshot;
         layer->setProperty("snapshot", QVariant::fromValue(static_cast<QObject*>(&snapshot)));
 
-        auto makeEntries = [](int nied, int csis) {
+        auto makeEntries = [](int nied, int csis, int kma = 0) {
             std::vector<komira::StationSnapshot::Entry> entries;
-            entries.reserve(nied + csis);
+            entries.reserve(nied + csis + kma);
             for (int i = 0; i < nied; ++i) {
                 komira::StationSnapshot::Entry e;
                 e.lat = 20.0 + (i % 400) * 0.08;
@@ -952,6 +952,15 @@ private slots:
                 e.csis = true;
                 entries.push_back(e);
             }
+            // KMA：韩国 MMI（0–10，缺测 -3），走独立的圆点/方标图集。
+            for (int i = 0; i < kma; ++i) {
+                komira::StationSnapshot::Entry e;
+                e.lat = 34.5 + (i % 20) * 0.12;
+                e.lon = 126.2 + (i / 20) * 0.15;
+                e.raw = (i % 14 == 0) ? -3.0 : double(i % 11);
+                e.kma = true;
+                entries.push_back(e);
+            }
             return entries;
         };
 
@@ -962,7 +971,7 @@ private slots:
         snapshot.setEntries({});
         QTest::qWait(100);
         const QImage empty = window->grabWindow();
-        snapshot.setEntries(makeEntries(1749, 600));
+        snapshot.setEntries(makeEntries(1749, 600, 263));
         QTest::qWait(100);
         const QImage drawn = window->grabWindow();
         int changed = 0;
@@ -1090,6 +1099,81 @@ private slots:
         QVERIFY2(std::abs(map->property("centerLon").toDouble() - hypoLon) < 3.0,
                  qPrintable(QStringLiteral("跟随按钮未把镜头带回震中: center=%1 hypo=%2")
                                 .arg(map->property("centerLon").toDouble()).arg(hypoLon)));
+    }
+
+    /// 回归：按住地图拖动期间，新事件到达不得抢走镜头。
+    ///
+    /// 曾经新事件聚焦直接写 center/zoom，会与拖拽逐帧抢同一组属性，手感上就是
+    /// 「鼠标被抢」。现在手势期间只登记待执行聚焦，松开后再飞过去。
+    void newEventDoesNotStealCameraWhileDragging() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("DragFocusTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(map);
+        QTest::qWait(400);
+
+        EarthquakeEvent a;
+        a.id = a.eventId = "DRAG-A";
+        a.timestamp = now;
+        a.latitude = 30.6;
+        a.longitude = 104.0;
+        a.magnitude = 5.0;
+        a.depth = 10.0;
+        a.rawIntensity = 3.0;
+        controller.handleEvent(a, false, false);
+        QTest::qWait(700);   // 等入场取景补间结束
+        QVERIFY(map->property("following").toBool());
+        QVERIFY(!map->property("gestureActive").toBool());
+
+        // 按住并拖动：镜头 1:1 跟手，同时退出跟随。
+        const QPointF origin = map->mapToScene(QPointF(map->width() / 2, map->height() / 2));
+        QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, origin.toPoint());
+        QTest::mouseMove(window, (origin + QPointF(120, 0)).toPoint());
+        QTest::qWait(20);
+        QVERIFY(map->property("gestureActive").toBool());
+        QVERIFY(!map->property("following").toBool());
+        const double draggedLon = map->property("centerLon").toDouble();
+
+        // 仍按着时，远处新事件到达：只登记，不许写镜头。
+        EarthquakeEvent b = a;
+        b.id = b.eventId = "DRAG-B";
+        b.timestamp = now;
+        b.longitude = 112.0;
+        controller.handleEvent(b, false, false);
+        QTest::qWait(400);
+        QVERIFY(!map->property("following").toBool());
+        QVERIFY2(std::abs(map->property("centerLon").toDouble() - draggedLon) < 0.01,
+                 qPrintable(QStringLiteral("拖动期间镜头被抢: before=%1 after=%2")
+                                .arg(draggedLon).arg(map->property("centerLon").toDouble())));
+
+        // 松开后，被推迟的聚焦才执行，把镜头带到新事件震中。
+        QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier,
+                            (origin + QPointF(120, 0)).toPoint());
+        QVERIFY(!map->property("gestureActive").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(map->property("following").toBool(), 1000);
+        const double hypoLon = map->property("shiftedHypo").toMap().value("lon").toDouble();
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(map->property("centerLon").toDouble() - hypoLon) < 5.0, 3000);
     }
 
     void settingsNavigationAndTheme() {

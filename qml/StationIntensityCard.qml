@@ -11,7 +11,8 @@ GlassCard {
     property string sourceName: "NIED"
     /// 数值说明（如 当前最大震度）。
     property string caption: "当前最大震度"
-    /// 烈度制式：`jma`（計測震度，NIED）/ `csis`（中国地震烈度，Pancakes・WolfxSeisJS）。
+    /// 烈度制式：`jma`（計測震度，NIED・S-Net）/ `csis`（中国地震烈度，Pancakes・WolfxSeisJS）
+    /// / `kma`（韩国 MMI，KMA PEWS）。
     property string standard: "jma"
     /// `{ hasData, raw, text, standard, stationCount, frameTime }`，来自 app.stationSources。
     property var maxInfo: ({})
