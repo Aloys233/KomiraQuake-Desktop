@@ -96,7 +96,54 @@ Item {
                 Item { Layout.fillHeight: true }
                 Rectangle { Layout.fillWidth: true; Layout.margins: 12; height: 1; color: root.theme.glassBorder }
                 Text { Layout.leftMargin: 12; text: "KomiraQuake"; color: root.theme.textPrimary; font.pixelSize: 12; font.weight: Font.Medium }
-                Text { Layout.leftMargin: 12; Layout.bottomMargin: 8; text: "v" + app.updater.currentVersion; color: root.theme.outline; font.pixelSize: 11 }
+                Text {
+                    objectName: "settingsVersionLabel"
+                    Layout.leftMargin: 12
+                    Layout.bottomMargin: updateHint.visible ? 2 : 8
+                    text: "v" + app.updater.currentVersion
+                    color: root.theme.outline; font.pixelSize: 11
+                }
+                // 仅在有新版本时出现在版本号下方；无更新/检查中/失败都不占位。
+                AbstractButton {
+                    id: updateHint
+                    objectName: "settingsUpdateHint"
+                    visible: app.updater.state === "updateAvailable"
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 8; Layout.rightMargin: 8; Layout.bottomMargin: 10
+                    Layout.preferredHeight: visible ? 30 : 0
+                    hoverEnabled: true
+                    focusPolicy: Qt.StrongFocus
+                    Accessible.name: "发现新版本 v" + app.updater.latestVersion + "，打开下载页"
+                    ToolTip.visible: hovered
+                    ToolTip.text: app.updater.message
+                    onClicked: app.updater.openReleasePage()
+                    background: Rectangle {
+                        radius: 8
+                        color: updateHint.down ? root.theme.accent : root.theme.accentContainer
+                        border.width: updateHint.visualFocus ? 2 : 1
+                        border.color: updateHint.hovered || updateHint.down ? root.theme.accent : root.theme.accentBorder
+                    }
+                    contentItem: RowLayout {
+                        spacing: 6
+                        AppIcon {
+                            Layout.leftMargin: 8
+                            name: "refresh-cw"; size: 13
+                            color: updateHint.down ? root.theme.accentForeground : root.theme.accent
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: "新版本 v" + app.updater.latestVersion
+                            color: updateHint.down ? root.theme.accentForeground : root.theme.accent
+                            font.pixelSize: 11; font.weight: Font.Medium
+                            elide: Text.ElideRight
+                        }
+                        AppIcon {
+                            Layout.rightMargin: 8
+                            name: "arrow-right"; size: 12
+                            color: updateHint.down ? root.theme.accentForeground : root.theme.accent
+                        }
+                    }
+                }
             }
         }
         ColumnLayout {

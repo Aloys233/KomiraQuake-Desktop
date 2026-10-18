@@ -1635,6 +1635,32 @@ private slots:
         QCOMPARE(sidebar->position(), sidebarOrigin);
         QVERIFY(click("settingsNav-audio"));
         QTRY_COMPARE(scroll->property("contentY").toReal(), 0.0);
+        // 左下角版本号下方只在发现新版本时出现提示；其余状态不占位。
+        auto* versionLabel = findVisualItem(window, "settingsVersionLabel");
+        auto* updateHint = findVisualItem(window, "settingsUpdateHint");
+        QVERIFY(versionLabel && updateHint);
+        QVERIFY(versionLabel->isVisible());
+        QVERIFY(!updateHint->isVisible());
+        QCOMPARE(versionLabel->property("text").toString(),
+                 "v" + controller.updater()->currentVersion());
+        auto* updater = controller.updater();
+        for (const QString& state : {QString("idle"), QString("checking"),
+                                     QString("upToDate"), QString("error")}) {
+            updater->setState(state, QString());
+            QTest::qWait(20);
+            QVERIFY2(!updateHint->isVisible(), qPrintable("unexpected hint in " + state));
+        }
+        updater->latest_ = "9.9.9";
+        updater->setState(QStringLiteral("updateAvailable"), QStringLiteral("发现新版本 v9.9.9"));
+        QTRY_VERIFY(updateHint->isVisible());
+        bool hintTextFound = false;
+        for (auto* item : visualItems(updateHint)) {
+            if (item->property("text").toString() == "新版本 v9.9.9") hintTextFound = true;
+        }
+        QVERIFY(hintTextFound);
+        QVERIFY(capture("settings-update-available"));
+        updater->setState(QStringLiteral("upToDate"), QString());
+        QTRY_VERIFY(!updateHint->isVisible());
         page->forceActiveFocus();
         QTest::keyClick(window, Qt::Key_Escape);
         QTRY_VERIFY(!window->property("showSettings").toBool());
