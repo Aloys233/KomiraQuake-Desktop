@@ -1,6 +1,9 @@
 #include "map/station_map_item.h"
 
+#include <QFont>
+#include <QGuiApplication>
 #include <QPainter>
+#include <QPainterPath>
 #include <QQuickWindow>
 #include <QSGGeometryNode>
 #include <QSGImageNode>
@@ -31,6 +34,89 @@ double wrapLonDelta(double delta) { return delta - std::round(delta / 360.0) * 3
 
 double luminance(const QColor& c) {
     return 0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF();
+}
+
+/// 字形墨迹外框（原点为基线起点）。用 outline 而不是 QFontMetricsF::tightBoundingRect：
+/// 后者按整像素取整，小字号下与实际栅格结果差 ±0.5 px，且对部分字体会带上额外留白。
+/// 实测用 outline 得到的中心与 drawText 栅格结果偏差 < 0.05 px。
+QRectF inkBounds(const QFont& font, const QString& text) {
+    QPainterPath path;
+    path.addText(QPointF(0.0, 0.0), font, text);
+    return path.boundingRect();
+}
+
+/// 把文字画在 rect 的**视觉中心**。
+///
+/// drawText(rect, Qt::AlignCenter) 居中的是字体行盒（ascent + descent + leading），
+/// 而数字墨迹并不占满行盒：CJK 回退字体（Noto Sans CJK SC）的行盒比 Google Sans 高
+/// 4 px 左右，于是同一段代码在不同字体下会整体偏下；1.3 缩放、24 px 方标实测偏右下
+/// 约 1 px，看起来就是「数字没居中」。这里改为按墨迹外框对齐，字体、字号、DPI 都不再影响。
+void drawGlyphCentered(QPainter& painter, const QRectF& rect, const QString& text,
+                       const QFont& font, const QColor& color) {
+    painter.setFont(font);
+    painter.setPen(color);
+    const QRectF ink = inkBounds(font, text);
+    const QPointF center = rect.center();
+    painter.drawText(QPointF(center.x() - ink.center().x(), center.y() - ink.center().y()), text);
+}
+
+/// 方标里的数字字体：跟随应用字体（Google Sans + CJK 回退），并开启等宽数字，
+/// 与卡片/时钟一致；两位数字（10/11/12）在小方标里按可用宽度自动降一号字号。
+QFont markerFont(const QRectF& body, const QString& text, int size, double ratio, qreal dpr) {
+    QFont font = QGuiApplication::font();
+    font.setBold(true);
+    font.setPixelSize(std::max(1, static_cast<int>(std::lround(size * ratio))));
+    font.setFeature(QFont::Tag("tnum"), 1);
+    const double maxWidth = body.width() * 0.86;
+    const int floorPx = std::max(1, static_cast<int>(std::lround(6.0 * dpr)));
+    while (font.pixelSize() > floorPx && inkBounds(font, text).width() > maxWidth) {
+        font.setPixelSize(font.pixelSize() - 1);
+    }
+    return font;
+}
+
+/// 方标数值用色：对齐 kanameishi 的图标（0–7 黑字、8 起白字），阈值取亮度 0.5 ——
+/// 恰好把 #FF4F00（烈度 8）及更深的红/紫归到白字，绿黄橙档仍是黑字。
+QColor markerTextColor(const QColor& fill) {
+    return luminance(fill) < 0.5 ? QColor(Qt::white) : QColor(Qt::black);
+}
+
+/// 方标描边：高饱和底色用白边把方标从底图上抠出来；浅灰/近白底色（烈度 0–2）
+/// 白边等于隐形，改用同色压暗边。
+QColor markerRingColor(const QColor& fill, double strength) {
+    QColor ring = luminance(fill) > 0.72 ? fill.darker(190) : QColor(Qt::white);
+    ring.setAlphaF(strength);
+    return ring;
+}
+
+/// 方标本体（圆角底 + 描边 + 居中数字），CSIS 与 KMA 共用。
+///
+/// `rect` 是**设备像素**坐标：图集按设备像素排版，Qt 才会把字号栅格化到整设备像素，
+/// 数字与描边都比「先按逻辑像素画、再整体缩放 dpr」锐利得多。
+void drawLabeledMarker(QPainter& painter, const QRectF& rect, const QColor& fillColor,
+                       const QString& text, bool strong, qreal dpr) {
+    const double size = rect.width();
+    const double border = (strong ? 1.6 : 0.9) * dpr;
+    const QRectF body = rect.adjusted(border / 2.0, border / 2.0, -border / 2.0, -border / 2.0);
+    const double radius = size * 0.22;
+
+    // 带数字的方标要读数字，底色不做重度半透明：0.75 时浅灰档（烈度 0–2）在浅色
+    // 底图上几乎糊成一片，数字也跟着发灰。
+    QColor fill = fillColor;
+    fill.setAlphaF(strong ? 0.94 : 0.88);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(fill);
+    painter.drawRoundedRect(body, radius, radius);
+
+    // 描边只为把方标从底图上「抠」出来：高饱和底色用白边；浅灰/近白底色换同色压暗边，
+    // 否则白边 + 半透明灰块在浅色底图上看不见。
+    painter.setPen(QPen(markerRingColor(fillColor, strong ? 0.95 : 0.45), border));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(body, radius, radius);
+
+    const QFont font = markerFont(body, text, static_cast<int>(std::lround(size)),
+                                  strong ? 0.58 : 0.48, dpr);
+    drawGlyphCentered(painter, body, text, font, markerTextColor(fillColor));
 }
 
 /// 持有图集纹理的几何节点（QSGTextureMaterial 不接管纹理生命周期）。
@@ -343,6 +429,32 @@ QPointF StationMapItem::screenPosForTest(double lat, double lon) const {
     return QPointF(x, y);
 }
 
+QImage StationMapItem::markerTileForTest(int level, double zoom, double dpr) {
+    // 用一次性实例渲染，绝不碰正在显示的图层：GPU 后端下场景图渲染线程可能同时读
+    // this->atlas_，测试里改写它会变成数据竞争。
+    StationMapItem probe;
+    probe.setNiedColors(niedColors_);
+    probe.setCsisColors(csisColors_);
+    probe.setKmaColors(kmaColors_);
+    probe.setKmaDotColors(kmaDotColors_);
+    int csisPx = 0, dotPx = 0, idlePx = 0;
+    stationSizes(zoom, &csisPx, &dotPx, &idlePx);
+    probe.ensureAtlas(dpr, csisPx, dotPx, idlePx);
+    const int lv = qBound(0, level, probe.csisUv_.size() - 1);
+    const QRectF uv = probe.csisUv_.at(lv);
+    const int x = static_cast<int>(std::lround(uv.x() * probe.atlas_.width()));
+    const int w = static_cast<int>(std::lround(uv.width() * probe.atlas_.width()));
+    // 垫一层实心底色，测试才能直接按亮度找文字墨迹（图集本身是透明底）。
+    QColor under = probe.csisColor(lv);
+    under.setAlphaF(1.0);
+    QImage tile(std::max(1, w), probe.atlas_.height(), QImage::Format_ARGB32_Premultiplied);
+    tile.fill(under);
+    QPainter painter(&tile);
+    painter.drawImage(QRect(0, 0, tile.width(), tile.height()), probe.atlas_,
+                      QRect(x, 0, w, probe.atlas_.height()));
+    return tile;
+}
+
 void StationMapItem::stationSizes(double zoom, int* csisPx, int* dotPx, int* idlePx) {
     *csisPx = static_cast<int>(std::round(qBound(16.0, 16.0 + (zoom - 4.0) * 1.4, 24.0)));
     *dotPx = static_cast<int>(std::round(2.0 * qBound(1.6, 1.2 + (zoom - 4.0) * 0.45, 4.5)));
@@ -465,22 +577,28 @@ void StationMapItem::ensureAtlas(qreal dpr, int csisPx, int dotPx, int idlePx) {
     dotTilePx_ = dotPx;
     idleTilePx_ = idlePx;
 
-    const int pad = kTilePad;
-    const int cellH = std::max({csisPx, dotPx, idlePx}) + 2 * pad;
-    const int csisCell = csisPx + 2 * pad;
-    const int dotCell = dotPx + 2 * pad;
-    const int idleCell = idlePx + 2 * pad;
+    // 图集按**设备像素**排版：字号、描边、圆角都是整数设备像素，数字不再被整体缩放
+    // 采样一遍，1.25/1.3/1.5 这类分数缩放下也不会糊。
+    const auto toDevice = [dpr](double v) {
+        return std::max(1, static_cast<int>(std::lround(v * dpr)));
+    };
+    const int pad = std::max(1, toDevice(kTilePad));
+    const int csisDev = toDevice(csisPx);
+    const int dotDev = toDevice(dotPx);
+    const int idleDev = toDevice(idlePx);
+
+    const int cellH = std::max({csisDev, dotDev, idleDev}) + 2 * pad;
+    const int csisCell = csisDev + 2 * pad;
+    const int dotCell = dotDev + 2 * pad;
+    const int idleCell = idleDev + 2 * pad;
     const int totalW = 13 * csisCell + 10 * csisCell + 14 * dotCell + 21 * dotCell + idleCell;
 
-    const int imgW = std::max(1, static_cast<int>(std::ceil(totalW * dpr)));
-    const int imgH = std::max(1, static_cast<int>(std::ceil(cellH * dpr)));
-    atlas_ = QImage(imgW, imgH, QImage::Format_ARGB32_Premultiplied);
+    atlas_ = QImage(totalW, cellH, QImage::Format_ARGB32_Premultiplied);
     atlas_.fill(Qt::transparent);
 
     QPainter painter(&atlas_);
     painter.setRenderHint(QPainter::Antialiasing, true);
     painter.setRenderHint(QPainter::TextAntialiasing, true);
-    painter.scale(double(imgW) / totalW, double(imgH) / cellH);
 
     auto normalize = [&](const QRectF& r) {
         return QRectF(r.x() / totalW, r.y() / cellH, r.width() / totalW, r.height() / cellH);
@@ -489,8 +607,8 @@ void StationMapItem::ensureAtlas(qreal dpr, int csisPx, int dotPx, int idlePx) {
     int x = 0;
     csisUv_.resize(13);
     for (int level = 0; level <= 12; ++level) {
-        const QRectF r(x + pad, pad, csisPx, csisPx);
-        drawMarkerTile(painter, r, level);
+        const QRectF r(x + pad, pad, csisDev, csisDev);
+        drawMarkerTile(painter, r, level, dpr);
         csisUv_[level] = normalize(r);
         x += csisCell;
     }
@@ -500,8 +618,8 @@ void StationMapItem::ensureAtlas(qreal dpr, int csisPx, int dotPx, int idlePx) {
     // `kmaDotColorBand` 中都定义为与 NIED 缺测点相同的深蓝。
     kmaDotUv_.resize(14);
     for (int level = 0; level <= 13; ++level) {
-        const double y = (cellH - dotPx) / 2.0;
-        const QRectF r(x + pad, y, dotPx, dotPx);
+        const double y = (cellH - dotDev) / 2.0;
+        const QRectF r(x + pad, y, dotDev, dotDev);
         painter.setPen(Qt::NoPen);
         painter.setBrush(kmaDotColor(level));
         painter.drawEllipse(r);
@@ -510,16 +628,16 @@ void StationMapItem::ensureAtlas(qreal dpr, int csisPx, int dotPx, int idlePx) {
     }
     kmaMarkerUv_.resize(10);
     for (int i = 0; i < 10; ++i) {
-        const QRectF r(x + pad, pad, csisPx, csisPx);
-        drawKmaMarkerTile(painter, r, i + 2);
+        const QRectF r(x + pad, pad, csisDev, csisDev);
+        drawKmaMarkerTile(painter, r, i + 2, dpr);
         kmaMarkerUv_[i] = normalize(r);
         x += csisCell;
     }
 
-    const double dotY = (cellH - dotPx) / 2.0;
+    const double dotY = (cellH - dotDev) / 2.0;
     niedUv_.resize(21);
     for (int i = 0; i < 21; ++i) {
-        const QRectF r(x + pad, dotY, dotPx, dotPx);
+        const QRectF r(x + pad, dotY, dotDev, dotDev);
         painter.setPen(Qt::NoPen);
         painter.setBrush(niedColor(i));
         painter.drawEllipse(r);
@@ -528,10 +646,10 @@ void StationMapItem::ensureAtlas(qreal dpr, int csisPx, int dotPx, int idlePx) {
     }
 
     {
-        const double idleY = (cellH - idlePx) / 2.0;
-        const QRectF r(x + pad, idleY, idlePx, idlePx);
+        const double idleY = (cellH - idleDev) / 2.0;
+        const QRectF r(x + pad, idleY, idleDev, idleDev);
         painter.setBrush(QColor(68, 102, 170, 128));
-        painter.setPen(QPen(QColor(68, 102, 170, 179), 1.2));
+        painter.setPen(QPen(QColor(68, 102, 170, 179), std::max(1.0, 1.2 * dpr)));
         painter.drawEllipse(r);
         idleUv_ = normalize(r);
     }
@@ -541,56 +659,14 @@ void StationMapItem::ensureAtlas(qreal dpr, int csisPx, int dotPx, int idlePx) {
     atlasDpr_ = dpr;
 }
 
-void StationMapItem::drawMarkerTile(QPainter& painter, const QRectF& rect, int level) const {
-    const double size = rect.width();
-    QColor fill = csisColor(level);
-    const double border = level >= 5 ? 1.6 : 0.9;
-    const QRectF body = rect.adjusted(border / 2.0, border / 2.0, -border / 2.0, -border / 2.0);
-    const double radius = size * 0.22;
-
-    fill.setAlphaF(0.75);
-    painter.setPen(Qt::NoPen);
-    painter.setBrush(fill);
-    painter.drawRoundedRect(body, radius, radius);
-
-    painter.setPen(
-        QPen(level >= 5 ? QColor(255, 255, 255, 242) : QColor(255, 255, 255, 115), border));
-    painter.setBrush(Qt::NoBrush);
-    painter.drawRoundedRect(body, radius, radius);
-
-    QFont font(QStringLiteral("sans-serif"));
-    font.setBold(true);
-    font.setPixelSize(
-        std::max(1, static_cast<int>(std::lround(size * (level >= 5 ? 0.58 : 0.48)))));
-    painter.setFont(font);
-    painter.setPen(luminance(csisColor(level)) > 0.42 ? QColor(Qt::black) : QColor(Qt::white));
-    painter.drawText(rect, Qt::AlignCenter, QString::number(level));
+void StationMapItem::drawMarkerTile(QPainter& painter, const QRectF& rect, int level,
+                                    qreal dpr) const {
+    drawLabeledMarker(painter, rect, csisColor(level), QString::number(level), level >= 5, dpr);
 }
 
-void StationMapItem::drawKmaMarkerTile(QPainter& painter, const QRectF& rect, int mmi) const {
-    const double size = rect.width();
-    const double border = mmi >= 5 ? 1.6 : 0.9;
-    const QRectF body = rect.adjusted(border / 2.0, border / 2.0, -border / 2.0, -border / 2.0);
-    const double radius = size * 0.22;
-
-    QColor fill = kmaColor(mmi + 2);
-    fill.setAlphaF(0.75);
-    painter.setPen(Qt::NoPen);
-    painter.setBrush(fill);
-    painter.drawRoundedRect(body, radius, radius);
-
-    painter.setPen(
-        QPen(mmi >= 5 ? QColor(255, 255, 255, 242) : QColor(255, 255, 255, 115), border));
-    painter.setBrush(Qt::NoBrush);
-    painter.drawRoundedRect(body, radius, radius);
-
-    QFont font(QStringLiteral("sans-serif"));
-    font.setBold(true);
-    font.setPixelSize(
-        std::max(1, static_cast<int>(std::lround(size * (mmi >= 5 ? 0.58 : 0.48)))));
-    painter.setFont(font);
-    painter.setPen(luminance(kmaColor(mmi + 2)) > 0.42 ? QColor(Qt::black) : QColor(Qt::white));
-    painter.drawText(rect, Qt::AlignCenter, QString::number(mmi));
+void StationMapItem::drawKmaMarkerTile(QPainter& painter, const QRectF& rect, int mmi,
+                                       qreal dpr) const {
+    drawLabeledMarker(painter, rect, kmaColor(mmi + 2), QString::number(mmi), mmi >= 5, dpr);
 }
 
 QColor StationMapItem::csisColor(int level) const {

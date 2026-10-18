@@ -1,6 +1,7 @@
 #include <QtTest>
 #include <QImage>
 #include <QSet>
+#include <QHash>
 #include <QApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -1226,6 +1227,96 @@ private slots:
         mapView->setProperty("centerLon", 118.0);
         window->grabWindow();
         QVERIFY2(waitAligned(), "平移+缩放后测站层与 QML 投影错位");
+    }
+
+    /// 回归：CSIS/KMA 方标里的烈度数字必须画在**视觉中心**。
+    ///
+    /// 旧实现用 `drawText(rect, Qt::AlignCenter)`，居中的是字体行盒（ascent + descent）；
+    /// 数字墨迹并不占满行盒，1.3 缩放下 24 px 方标实测偏右下约 1 px，看起来就是「数字不居中」。
+    /// 现在按字形 outline 的墨迹外框对齐，并把图集按设备像素排版（1.25/1.5 这类分数缩放
+    /// 不再二次采样）。这里对 13 档烈度 × 3 组 (zoom, dpr) 断言墨迹中心与图块中心的偏差。
+    void stationMarkerDigitsAreOpticallyCentered() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("StationMarkerCenterTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("vector");
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        auto* layer = window->findChild<komira::StationMapItem*>("stationIntensityLayer");
+        QVERIFY(layer);
+
+        auto measure = [&](int level, double zoom, double dpr, double* dx, double* dy) -> bool {
+            QImage tile;
+            const bool ok = QMetaObject::invokeMethod(
+                layer, "markerTileForTest", Q_RETURN_ARG(QImage, tile), Q_ARG(int, level),
+                Q_ARG(double, zoom), Q_ARG(double, dpr));
+            if (!ok || tile.isNull() || tile.width() < 8) return false;
+            // 底色 = 图块里出现次数最多的颜色（方标本体占绝大多数像素），比取边角
+            // 像素稳：边角落在描边上时会误判明暗，进而找错方向的墨迹。
+            QHash<QRgb, int> histogram;
+            for (int y = 0; y < tile.height(); ++y)
+                for (int x = 0; x < tile.width(); ++x)
+                    ++histogram[tile.pixel(x, y)];
+            QRgb dominant = 0;
+            int best = 0;
+            for (auto it = histogram.constBegin(); it != histogram.constEnd(); ++it) {
+                if (it.value() > best) { best = it.value(); dominant = it.key(); }
+            }
+            const QColor fill = QColor::fromRgb(dominant);
+            const double fillLum = 0.2126 * fill.redF() + 0.7152 * fill.greenF() +
+                                   0.0722 * fill.blueF();
+            const bool wantBright = fillLum < 0.5;
+            int x0 = tile.width(), x1 = -1, y0 = tile.height(), y1 = -1;
+            const double cx = (tile.width() - 1) / 2.0, cy = (tile.height() - 1) / 2.0;
+            const double limit = tile.width() * 0.34;
+            for (int y = 0; y < tile.height(); ++y) {
+                for (int x = 0; x < tile.width(); ++x) {
+                    if (std::hypot(x - cx, y - cy) > limit) continue;
+                    const QColor c = tile.pixelColor(x, y);
+                    const double lum = 0.2126 * c.redF() + 0.7152 * c.greenF() +
+                                       0.0722 * c.blueF();
+                    if (wantBright ? lum > 0.94 : lum < 0.18) {
+                        x0 = qMin(x0, x); x1 = qMax(x1, x);
+                        y0 = qMin(y0, y); y1 = qMax(y1, y);
+                    }
+                }
+            }
+            if (x1 < 0) return false;
+            // 图块中心用**连续坐标** width/2（像素中心在 x+0.5），与绘制端一致；
+            // 用 (width-1)/2 会凭空引入 +0.5 px 的常量偏差。
+            *dx = (x0 + x1 + 1) / 2.0 - tile.width() / 2.0;
+            *dy = (y0 + y1 + 1) / 2.0 - tile.height() / 2.0;
+            return true;
+        };
+
+        for (const auto& cfg : {std::pair<double, double>{6.0, 1.0}, std::pair<double, double>{9.0, 1.3},
+                                std::pair<double, double>{12.0, 1.5}}) {
+            const double zoom = cfg.first;
+            const double dpr = cfg.second;
+            int measured = 0;
+            for (int level = 0; level <= 12; ++level) {
+                double dx = 0, dy = 0;
+                if (!measure(level, zoom, dpr, &dx, &dy)) continue;   // 该档字形太细，跳过
+                ++measured;
+                // 容差按设备像素给：允许四舍五入带来的半个像素 + 抗锯齿的半个像素。
+                const double tol = std::max(1.0, 0.75 * dpr);
+                QVERIFY2(std::hypot(dx, dy) <= tol,
+                         qPrintable(QStringLiteral("烈度 %1 的数字没居中：zoom %2 dpr %3 偏差 (%4, %5) px")
+                                        .arg(level).arg(zoom).arg(dpr).arg(dx, 0, 'f', 2)
+                                        .arg(dy, 0, 'f', 2)));
+            }
+            QVERIFY2(measured >= 10, "图集里可测量的方标太少，测试没有真正生效");
+        }
     }
 
     /// 回归：波前淡出后「跟随震中」按钮仍然生效。

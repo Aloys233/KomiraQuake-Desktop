@@ -80,6 +80,9 @@ public:
 
     /// 最近一帧实际绘制所用的投影（与 MapView 的 screenX/screenY 同源），供回归测试断言。
     Q_INVOKABLE QPointF screenPosForTest(double lat, double lon) const;
+    /// 按给定 zoom/dpr 重建图集并取出某一档 CSIS 方标的**设备像素**图块，供回归测试
+    /// 断言「数字墨迹居中」。会改写图集缓存，仅供测试调用。
+    Q_INVOKABLE QImage markerTileForTest(int level, double zoom, double dpr);
 
 signals:
     void snapshotChanged();
@@ -108,9 +111,10 @@ private:
     QSGNode* updateSoftwareNode(QSGNode* oldNode, double lat, double lon, double zoom, double w,
                                 double h, qreal dpr);
     void ensureAtlas(qreal dpr, int csisPx, int dotPx, int idlePx);
-    void drawMarkerTile(QPainter& painter, const QRectF& rect, int level) const;
+    /// `rect` 为图集内的**设备像素**矩形（图集按设备像素排版，字号才不会二次缩放）。
+    void drawMarkerTile(QPainter& painter, const QRectF& rect, int level, qreal dpr) const;
     /// KMA 方标：MMI 数字直接作为标签（kanameishi `getMmiFromKmaLevel` 的 `level - 2`）。
-    void drawKmaMarkerTile(QPainter& painter, const QRectF& rect, int mmi) const;
+    void drawKmaMarkerTile(QPainter& painter, const QRectF& rect, int mmi, qreal dpr) const;
     QColor csisColor(int level) const;
     QColor kmaColor(int level) const;
     QColor kmaDotColor(int level) const;
