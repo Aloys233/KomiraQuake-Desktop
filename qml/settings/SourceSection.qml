@@ -245,7 +245,7 @@ Column {
             objectName: "pancakesSeisSwitch"
             width: parent.width; theme: root.theme
             text: "PancakesSeis 加速度台站"
-            description: "PGA 折算为中国地震烈度（CSIS）。"
+            description: "设备端按 GB/T 17742-2020 计算的仪器烈度（CSIS）。"
             checked: app.settings.isStationSourceEnabled("pancakes_seis")
             onToggled: app.settings.setStationSourceEnabled("pancakes_seis", checked)
         }

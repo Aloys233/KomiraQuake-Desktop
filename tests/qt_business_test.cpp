@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkAccessManager>
@@ -14,9 +15,12 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QVector>
 #include <QWebSocket>
 #include <cmath>
 #include <functional>
+#include <optional>
+#include <vector>
 
 #include "core/ip_geo_lookup.h"
 #include "core/quake_calculator.h"
@@ -47,6 +51,7 @@
 // 合成一段而非多段：moc 处理本文件时也会看到这些宏，分段会让 vtable 声明失配。
 #define private public
 #include "source/wolfx_source.h"
+#include "source/pancakes_seis_source.h"
 #include "source/whews_source.h"
 #include "source/simulated_source.h"
 #undef private
@@ -191,39 +196,216 @@ private slots:
         QVERIFY(!KmaStationParser::parseStations(frame).has_value());
     }
 
-    // PancakesSeis 测站通道：首包台站表 + 逐站三轴加速度帧解析，及 PGA->計測震度折算。
+    // PancakesSeis 测站通道（v4 广播格式）：档案例报文 + 实时帧解析、sid 索引、
+    // 健康码剔除、以及 GB/T 17742-2020 仪器烈度换算。
     void pancakesSeisParsesStationsAndSamples() {
         const QJsonObject stationsFrame = QJsonDocument::fromJson(R"({
             "type":"stations","timestamp":1792147945777,"total":1,
             "data":[
-                {"sid":0,"name":"四川省成都市郫都区",
-                 "location":{"lat":30.797,"lon":103.9078,"region":"四川省成都市郫都区"}}
+                {"sid":0,"name":"四川成都郫都红光监测站 01",
+                 "location":{"lat":30.8105,"lon":103.8865,"alt":540,
+                             "region":"四川省成都市郫都区"}}
             ]})").object();
+        QVERIFY(PancakesSeisParser::isStationFrame(stationsFrame));
         const auto stations = PancakesSeisParser::parseStations(stationsFrame);
         QVERIFY(stations.has_value());
         QCOMPARE(stations->size(), 1);
         QCOMPARE(stations->at(0).sid, 0);
-        QCOMPARE(stations->at(0).latitude, 30.797);
-        QCOMPARE(stations->at(0).longitude, 103.9078);
+        QCOMPARE(stations->at(0).name, QStringLiteral("四川成都郫都红光监测站 01"));
+        QCOMPARE(stations->at(0).latitude, 30.8105);
+        QCOMPARE(stations->at(0).longitude, 103.8865);
+        QCOMPARE(stations->at(0).altitude, 540.0);
         QCOMPARE(stations->at(0).region, QStringLiteral("四川省成都市郫都区"));
-        // 台站表不含加速度字段；数据帧不含 type/data。
+        // 档案不含实时字段；实时帧不含 type。
         QVERIFY(!PancakesSeisParser::parseSample(stationsFrame).has_value());
 
+        // HTTP 列表与广播档案字段一致（无 `type`）。
+        const QJsonObject listRoot = QJsonDocument::fromJson(R"({
+            "code":200,"total":1,
+            "data":[{"sid":0,"name":"四川成都郫都红光监测站 01",
+                     "location":{"lat":30.8105,"lon":103.8865,"alt":540,
+                                 "region":"四川省成都市郫都区"}}]})").object();
+        const auto listed = PancakesSeisParser::parseStationList(listRoot);
+        QVERIFY(listed.has_value());
+        QCOMPARE(listed->size(), 1);
+        QCOMPARE(listed->at(0).sid, 0);
+        QVERIFY(!PancakesSeisParser::parseStationList(QJsonObject{}).has_value());
+
+        // 满字段帧：设备端算好的仪器烈度 `i` 与 2 分钟最大烈度 `m` 原样透传。
         const QJsonObject frame = QJsonDocument::fromJson(
-            R"({"s":0,"p":44.26,"x":27.019,"y":40.107,"z":9.378,"e":38.1,"t":1792147951411})")
-            .object();
+            R"({"s":0,"p":12.5,"v":8.75,"x":3.3,"y":1.1,"z":0.4,"i":3.7,"m":4.1,
+                "t":1729000000000})").object();
         const auto sample = PancakesSeisParser::parseSample(frame);
         QVERIFY(sample.has_value());
         QCOMPARE(sample->sid, 0);
-        QCOMPARE(sample->pga, 44.26);
-        QCOMPARE(sample->x, 27.019);
-        QCOMPARE(sample->timestamp, 1792147951411LL);
-        // `e`（芯片温度）不参与解析，缺 `type` 的帧不会被当成台站表。
-        QVERIFY(!PancakesSeisParser::parseStations(frame).has_value());
+        QCOMPARE(sample->pga, 12.5);
+        QCOMPARE(sample->pgv, 8.75);
+        QCOMPARE(sample->x, 3.3);
+        QCOMPARE(sample->y, 1.1);
+        QCOMPARE(sample->z, 0.4);
+        QCOMPARE(sample->intensity, 3.7);
+        QCOMPARE(sample->maxIntensity, 4.1);
+        QCOMPARE(sample->errorCode, 0);
+        QCOMPARE(sample->timestamp, 1729000000000LL);
 
-        // PGA（Gal）-> JMA 計測震度近似：100 Gal ≈ 4.94；缺测（<=0）取 -3。
-        QVERIFY(std::abs(shindoFromPga(100.0) - 4.94) < 1e-9);
-        QCOMPARE(shindoFromPga(0.0), -3.0);
+        // 静稳最短形态：可选字段整体省略，`i` 仍为 0（区分「烈度就是 0」与「无帧」）。
+        const QJsonObject idle = QJsonDocument::fromJson(
+            R"({"s":0,"p":0.005,"i":0,"t":1729000000000})").object();
+        const auto quiet = PancakesSeisParser::parseSample(idle);
+        QVERIFY(quiet.has_value());
+        QCOMPARE(quiet->pgv, 0.0);
+        QCOMPARE(quiet->intensity, 0.0);
+        QCOMPARE(quiet->maxIntensity, 0.0);
+
+        // 健康码 `ec` 非 0 原样解析（剔除由 source 负责）。
+        const QJsonObject bad = QJsonDocument::fromJson(
+            R"({"s":3,"p":9.5,"i":2.8,"ec":7,"t":1729000000000})").object();
+        const auto faulty = PancakesSeisParser::parseSample(bad);
+        QVERIFY(faulty.has_value());
+        QCOMPARE(faulty->sid, 3);
+        QCOMPARE(faulty->errorCode, 7);
+
+        // `ec` 为 0 时上游省略该字段。
+        QVERIFY(!frame.contains(QStringLiteral("ec")));
+        // 缺 `s` 或 `p` 的帧不是数据帧；带 `type` 的也不是。
+        QVERIFY(!PancakesSeisParser::parseSample(
+                     QJsonDocument::fromJson(R"({"p":1.0,"i":1.0})").object())
+                     .has_value());
+        QVERIFY(!PancakesSeisParser::parseSample(
+                     QJsonDocument::fromJson(R"({"type":"pong","s":0,"p":1.0})").object())
+                     .has_value());
+
+        // 线上抓到的真实报文样本（2026-10-18 18:15）：
+        // ① 档案既无 `alt`、站名也不带编号后缀；② `y` 是整数 `1` 而非 `1.0`；
+        // ③ `i` 与 GB/T 公式逐帧一致——这正是「直接用设备值」的对照基准。
+        const QJsonObject liveStations = QJsonDocument::fromJson(R"({
+            "data":[{"sid":0,"name":"四川省成都市郫都区",
+                     "location":{"lat":30.797,"lon":103.9078,
+                                 "region":"四川省成都市郫都区"}}],
+            "timestamp":1792318500280,"total":1,"type":"stations"})").object();
+        const auto live = PancakesSeisParser::parseStations(liveStations);
+        QVERIFY(live.has_value());
+        QCOMPARE(live->size(), 1);
+        QCOMPARE(live->at(0).name, QStringLiteral("四川省成都市郫都区"));
+        QCOMPARE(live->at(0).latitude, 30.797);
+        QCOMPARE(live->at(0).altitude, 0.0);   // 无 alt 时按 0，不伪造
+
+        struct LiveFrame {
+            const char* json;
+            double pga;
+            double intensity;
+            double maxIntensity;
+        };
+        const LiveFrame liveFrames[] = {
+            {R"({"s":0,"p":1.511,"v":0.202,"x":0.994,"y":1,"z":1.12,"i":2.4,"m":4.2,"t":1792318500985})",
+             1.511, 2.4, 4.2},
+            {R"({"s":0,"p":1.397,"v":0.086,"x":0.86,"y":0.984,"z":1.227,"i":2.3,"m":4.2,"t":1792318502985})",
+             1.397, 2.3, 4.2},
+            {R"({"s":0,"p":15.321,"v":0.32,"x":15.32,"y":1.228,"z":1.233,"i":4.1,"m":4.2,"t":1792318503985})",
+             15.321, 4.1, 4.2},
+        };
+        for (const LiveFrame& entry : liveFrames) {
+            const auto parsed =
+                PancakesSeisParser::parseSample(QJsonDocument::fromJson(entry.json).object());
+            QVERIFY(parsed.has_value());
+            QCOMPARE(parsed->pga, entry.pga);
+            QCOMPARE(parsed->intensity, entry.intensity);
+            QCOMPARE(parsed->maxIntensity, entry.maxIntensity);
+            QCOMPARE(parsed->errorCode, 0);
+            // 设备值与我方兜底公式必须逐帧吻合，否则说明两端换算口径已经分叉。
+            QCOMPARE(instrumentIntensityFromPga(entry.pga), entry.intensity);
+        }
+        // 整数 `y` 不应被当成缺失。
+        const auto intY = PancakesSeisParser::parseSample(
+            QJsonDocument::fromJson(R"({"s":0,"p":1.511,"y":1,"i":2.4,"t":1})").object());
+        QVERIFY(intY.has_value());
+        QCOMPARE(intY->y, 1.0);
+
+        // 仪器烈度换算（GB/T 17742-2020）：参考点 0.22→1.0、0.89→2.0、3.53→3.0、14.1→4.0。
+        QCOMPARE(instrumentIntensityFromPga(0.005), 0.0);
+        QCOMPARE(instrumentIntensityFromPga(0.01), 0.0);
+        QCOMPARE(instrumentIntensityFromPga(0.11), 0.5);
+        QCOMPARE(instrumentIntensityFromPga(0.22), 1.0);
+        QCOMPARE(instrumentIntensityFromPga(0.89), 2.0);
+        QCOMPARE(instrumentIntensityFromPga(3.53), 3.0);
+        QCOMPARE(instrumentIntensityFromPga(14.1), 4.0);
+        QCOMPARE(instrumentIntensityFromPga(0.0), 0.0);
+        // 上限 12。
+        QCOMPARE(instrumentIntensityFromPga(1e9), 12.0);
+    }
+
+    // PancakesSeis 源：`s` 按 sid（而非数组下标）对齐、健康码非 0 剔除、静默回落。
+    void pancakesSeisSourceAlignsBySidAndDropsFaultyFrames() {
+        PancakesSeisSource source;
+        source.running_ = true;   // 注入报文前不必真的建连
+        QSignalSpy stations(&source, &PancakesSeisSource::stationsChanged);
+        QSignalSpy data(&source, &PancakesSeisSource::dataChanged);
+        QVERIFY(stations.isValid());
+        QVERIFY(data.isValid());
+
+        auto feed = [&](const char* json) {
+            source.handleMessage(QString::fromUtf8(json));
+        };
+
+        // sid 非连续：数组下标 0/1 对应 sid 3/7，数据帧必须按 sid 找站。
+        feed(R"({"type":"stations","total":2,"timestamp":1729000000000,"data":[
+            {"sid":3,"name":"甲站","location":{"lat":30.0,"lon":103.0,"region":"四川"}},
+            {"sid":7,"name":"乙站","location":{"lat":31.0,"lon":104.0,"region":"云南"}}]})");
+        QCOMPARE(stations.count(), 1);
+        QCOMPARE(source.stations().size(), 2);
+        QCOMPARE(source.intensity().size(), 2);
+        QCOMPARE(source.intensity().at(0), PancakesSeisProtocol::kMissingIntensity);
+        QCOMPARE(source.intensity().at(1), PancakesSeisProtocol::kMissingIntensity);
+
+        feed(R"({"s":7,"p":12.5,"i":3.7,"t":1729000001000})");
+        QCOMPARE(data.count(), 1);
+        QCOMPARE(source.intensity().at(1), 3.7);   // sid 7 → 下标 1
+        QCOMPARE(source.intensity().at(0), PancakesSeisProtocol::kMissingIntensity);
+        QCOMPARE(source.maxIntensity(), 3.7);
+        QCOMPARE(source.lastTimestamp(), 1729000001000LL);
+
+        // 静稳帧：i 为 0 也要落值（区别于缺测哨兵）。
+        feed(R"({"s":3,"p":0.005,"i":0,"t":1729000002000})");
+        QCOMPARE(source.intensity().at(0), 0.0);
+        QCOMPARE(source.intensity().at(0) > PancakesSeisProtocol::kMissingIntensity, true);
+
+        // 健康码非 0：该站该秒必须剔除（回落缺测），且不影响其它站。
+        feed(R"({"s":3,"p":40.0,"i":6.2,"ec":5,"t":1729000003000})");
+        QCOMPARE(source.intensity().at(0), PancakesSeisProtocol::kMissingIntensity);
+        QCOMPARE(source.intensity().at(1), 3.7);
+
+        // 档案重发（测站上下线）：按 sid 保留仍在线的旧读数，不整网瞬时回落。
+        feed(R"({"type":"stations","total":2,"timestamp":1729000004000,"data":[
+            {"sid":7,"name":"乙站","location":{"lat":31.0,"lon":104.0,"region":"云南"}},
+            {"sid":9,"name":"丙站","location":{"lat":32.0,"lon":105.0,"region":"贵州"}}]})");
+        QCOMPARE(stations.count(), 2);
+        QCOMPARE(source.stations().size(), 2);
+        QCOMPARE(source.stations().at(0).sid, 7);
+        QCOMPARE(source.intensity().at(0), 3.7);   // 仍在线的乙站保留读数
+        QCOMPARE(source.intensity().at(1), PancakesSeisProtocol::kMissingIntensity);
+        // 档案里已无 sid 3：迟到的帧被忽略，不会写越界。
+        feed(R"({"s":3,"p":1.0,"i":1.0,"t":1729000005000})");
+        QCOMPARE(source.intensity().at(0), 3.7);
+        QCOMPARE(source.intensity().at(1), PancakesSeisProtocol::kMissingIntensity);
+
+        // 内容完全相同的档案重发不触发 stationsChanged（上游按变更广播，但常重复）。
+        feed(R"({"type":"stations","total":2,"timestamp":1729000006000,"data":[
+            {"sid":7,"name":"乙站","location":{"lat":31.0,"lon":104.0,"region":"云南"}},
+            {"sid":9,"name":"丙站","location":{"lat":32.0,"lon":105.0,"region":"贵州"}}]})");
+        QCOMPARE(stations.count(), 2);
+
+        // 静默超过 TTL：回落缺测（清掉 seenAt_ 后手动触发扫描）。
+        source.seenAt_.clear();
+        for (int sid : {7, 9}) {
+            source.seenAt_.insert(sid, QDateTime::currentMSecsSinceEpoch()
+                                          - PancakesSeisProtocol::kLiveTtlMs - 1000);
+        }
+        const int before = data.count();
+        source.expireStale();
+        QCOMPARE(data.count(), before + 1);
+        QCOMPARE(source.intensity().at(0), PancakesSeisProtocol::kMissingIntensity);
+        QCOMPARE(source.maxIntensity(), PancakesSeisProtocol::kMissingIntensity);
+        source.running_ = false;   // 不让析构去动未建立的连接
     }
 
     // Wolfx SeisJS 测站通道：自描述单站帧（自带坐标 + 計測震度）解析，及心跳/pong 判别。

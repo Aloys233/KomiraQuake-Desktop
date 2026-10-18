@@ -10,8 +10,11 @@ enum class IntensityStandard { Csis, Jma };
 class IntensityCalculator {
 public:
     static double rawCsis(double magnitude, double distanceKm, double depthKm = 10.0);
-    /// 实测 PGA（Gal，cm/s²）→ 中国地震烈度（GB/T 17742 仪器烈度，连续值、未分档）。
-    /// 单参数振幅式 `Ia = 3.17·log10(PGA/100) + 6.59`（100 Gal ≈ VI 度）；PGA <= 0 返回 0。
+    /// 实测 PGA（Gal，cm/s²）→ 仪器烈度（GB/T 17742-2020，按设备口径保留 1 位小数）：
+    /// `PGA <= 0.01` 为 0；`0.01~0.22` 线性映射 `PGA/0.22`；`>= 0.22` 用
+    /// `1.0 + 1.66·log10(PGA/0.22)`，上限 12。
+    /// **测站显示不要用它**：PancakesSeis 的实时帧已由设备算好 `i`，应直接用设备值；
+    /// 本函数只用于缺 `i` 时的兜底与换算校验。
     static double csisFromPga(double pgaGal);
     /// 波前"影响半径"：CSIS 烈度衰减到 level（默认 I，可感下限）时的最大震中距（km）。
     /// 有意取代参考实现 kanameishi 的经验式 clamp(50·M², 200, 2000)：这里用衰减关系按

@@ -1,5 +1,6 @@
 #include "source/pancakes_seis_source.h"
 
+#include <QDateTime>
 #include <QDebug>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -23,6 +24,9 @@ PancakesSeisSource::PancakesSeisSource(QObject* parent) : QObject(parent) {
         if (socket_) socket_->abort();
         scheduleReconnect();
     });
+
+    expiryTimer_.setInterval(PancakesSeisProtocol::kExpiryCheckMs);
+    connect(&expiryTimer_, &QTimer::timeout, this, &PancakesSeisSource::expireStale);
 }
 
 void PancakesSeisSource::start() {
@@ -31,6 +35,7 @@ void PancakesSeisSource::start() {
     ++generation_;
     retryCount_ = 0;
     connectSocket();
+    expiryTimer_.start();
 }
 
 void PancakesSeisSource::stop() {
@@ -39,6 +44,7 @@ void PancakesSeisSource::stop() {
     ++attempt_;
     reconnectTimer_.stop();
     heartbeatWatch_.stop();
+    expiryTimer_.stop();
     if (socket_) {
         socket_->disconnect(this);
         socket_->abort();
@@ -127,33 +133,97 @@ void PancakesSeisSource::handleMessage(const QString& text) {
     if (!doc.isObject()) return;
     const QJsonObject obj = doc.object();
 
-    // 首包（及重连后重发）的台站表：按 sid 对齐 PGA 数组，保留已知读数避免整网瞬时回落缺测。
-    if (const auto parsed = PancakesSeisParser::parseStations(obj)) {
-        stations_ = *parsed;
-        QVector<double> next(stations_.size(), PancakesSeisProtocol::kMissingPga);
-        for (int i = 0; i < stations_.size(); ++i) {
-            const int sid = stations_[i].sid;
-            if (sid >= 0 && sid < pga_.size()) next[i] = pga_[sid];
-        }
-        pga_ = next;
-        qInfo() << "[seis] stations" << stations_.size();
-        emit stationsChanged();
+    // 测站档案：连接建立时一次，此后测站上下线/改动会重发全量列表。
+    if (PancakesSeisParser::isStationFrame(obj)) {
+        if (auto parsed = PancakesSeisParser::parseStations(obj)) applyStations(std::move(*parsed));
         return;
     }
 
-    // 逐站加速度帧：`s` 为台站表下标。
+    // 实时帧：`s` 为档案里的 sid（不是数组下标）。
     const auto sample = PancakesSeisParser::parseSample(obj);
     if (!sample || !hasData()) return;
-    const int sid = sample->sid;
-    if (sid < 0 || sid >= pga_.size()) return;
-    pga_[sid] = sample->pga;
+    // 健康码非 0 的读数是坏数据：必须整站整秒剔除，不能拿来做着色/统计。
+    if (sample->errorCode != 0) {
+        const auto stale = indexBySid_.constFind(sample->sid);
+        const bool hadValue =
+            stale != indexBySid_.constEnd()
+            && intensity_[*stale] > PancakesSeisProtocol::kMissingIntensity;
+        if (hadValue) {
+            intensity_[*stale] = PancakesSeisProtocol::kMissingIntensity;
+            seenAt_.remove(sample->sid);
+            emit dataChanged();
+        }
+        return;
+    }
+    const auto found = indexBySid_.constFind(sample->sid);
+    if (found == indexBySid_.constEnd()) return;   // 档案里没有的站（竞态/已下线）
+    intensity_[*found] = sample->intensity;
+    seenAt_.insert(sample->sid, QDateTime::currentMSecsSinceEpoch());
     if (sample->timestamp > 0) lastTimestamp_ = sample->timestamp;
     emit dataChanged();
 }
 
-double PancakesSeisSource::maxPga() const {
-    double best = PancakesSeisProtocol::kMissingPga;
-    for (double value : pga_) {
+void PancakesSeisSource::applyStations(QVector<PancakesSeisStation> stations) {
+    // 档案是全量权威来源：按新表的 sid 重建对齐的烈度数组。仍在线的站保留旧读数，
+    // 避免这一刻整网瞬时回落缺测。用「sid+坐标+名称」判断表是否真有变化，没有就
+    // 不重建、不发信号（上游每次上下线都会重发全量，内容常常完全一样）。
+    std::vector<double> keep(stations.size(), PancakesSeisProtocol::kMissingIntensity);
+    for (int i = 0; i < stations.size(); ++i) {
+        const auto old = indexBySid_.constFind(stations[i].sid);
+        if (old == indexBySid_.constEnd()) continue;
+        const double value = intensity_[*old];
+        if (value > PancakesSeisProtocol::kMissingIntensity) keep[i] = value;
+    }
+
+    const bool same = stations.size() == stations_.size()
+                      && std::equal(stations.cbegin(), stations.cend(), stations_.cbegin(),
+                                    [](const PancakesSeisStation& a, const PancakesSeisStation& b) {
+                                        return a.sid == b.sid && a.name == b.name
+                                               && a.latitude == b.latitude
+                                               && a.longitude == b.longitude
+                                               && a.altitude == b.altitude
+                                               && a.region == b.region;
+                                    });
+
+    indexBySid_.clear();
+    stations_ = std::move(stations);
+    intensity_.clear();
+    intensity_.reserve(stations_.size());
+    for (int i = 0; i < stations_.size(); ++i) {
+        indexBySid_.insert(stations_[i].sid, i);
+        intensity_.push_back(keep[static_cast<std::size_t>(i)]);
+    }
+    // 下线测站的记录一并清掉，不让 seenAt_ 无限增长。
+    for (auto it = seenAt_.begin(); it != seenAt_.end();) {
+        if (!indexBySid_.contains(it.key())) it = seenAt_.erase(it);
+        else ++it;
+    }
+
+    if (same) return;
+    qInfo() << "[seis] stations" << stations_.size();
+    emit stationsChanged();
+}
+
+void PancakesSeisSource::expireStale() {
+    if (!running_) return;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    bool changed = false;
+    for (int i = 0; i < stations_.size(); ++i) {
+        if (intensity_[i] <= PancakesSeisProtocol::kMissingIntensity) continue;
+        const qint64 seen = seenAt_.value(stations_[i].sid, 0);
+        // 有读数却没有记录时刻（理论上不该发生）也按静默处理，避免旧值永久残留。
+        if (seen <= 0 || now - seen > PancakesSeisProtocol::kLiveTtlMs) {
+            intensity_[i] = PancakesSeisProtocol::kMissingIntensity;
+            seenAt_.remove(stations_[i].sid);
+            changed = true;
+        }
+    }
+    if (changed) emit dataChanged();
+}
+
+double PancakesSeisSource::maxIntensity() const {
+    double best = PancakesSeisProtocol::kMissingIntensity;
+    for (double value : intensity_) {
         if (value > best) best = value;
     }
     return best;

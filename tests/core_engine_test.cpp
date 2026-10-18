@@ -64,10 +64,16 @@ int main(int argc, char** argv) {
     check(near(IntensityCalculator::rawCsis(7.0, 0.0, 10.0), 9.3048, 1e-3), "CSIS M7 at epicenter");
     check(IntensityCalculator::formatCsis(4.2) == "IV", "CSIS roman IV");
     check(IntensityCalculator::formatCsis(20.0) == "XII", "CSIS roman clamp XII");
-    // 仪器烈度：由 PGA（Gal）折算，单参数振幅式；100 Gal ≈ 6.6 度，缺测（<=0）为 0。
-    check(near(IntensityCalculator::csisFromPga(100.0), 6.59, 1e-9), "csis VI at 100 Gal");
-    check(near(IntensityCalculator::csisFromPga(400.0), 8.50, 1e-2), "csis grows with PGA");
+    // 仪器烈度：GB/T 17742-2020 由 PGA（Gal）换算，与设备端同一式子；参考点
+    // 0.22→1.0、0.89→2.0、3.53→3.0、14.1→4.0，静稳（<=0.01）为 0，上限 12。
+    check(near(IntensityCalculator::csisFromPga(0.22), 1.0), "instrument intensity 1 at 0.22 Gal");
+    check(near(IntensityCalculator::csisFromPga(0.89), 2.0), "instrument intensity 2 at 0.89 Gal");
+    check(near(IntensityCalculator::csisFromPga(3.53), 3.0), "instrument intensity 3 at 3.53 Gal");
+    check(near(IntensityCalculator::csisFromPga(14.1), 4.0), "instrument intensity 4 at 14.1 Gal");
+    check(near(IntensityCalculator::csisFromPga(0.11), 0.5), "instrument intensity linear below 0.22");
+    check(near(IntensityCalculator::csisFromPga(0.005), 0.0), "instrument intensity zero when quiet");
     check(near(IntensityCalculator::csisFromPga(0.0), 0.0), "csis zero when no PGA");
+    check(near(IntensityCalculator::csisFromPga(1e9), 12.0), "instrument intensity capped at 12");
     check(IntensityCalculator::formatJma(9.0, 1.0, 1.0) == "7", "JMA band 7");
     // 波前影响半径（CSIS 可感下限 I）与分段渐隐。
     const double r6 = IntensityCalculator::distanceForCsis(6.0, 10.0, 1.0);

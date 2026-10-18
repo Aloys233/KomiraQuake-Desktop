@@ -804,17 +804,19 @@ void AppController::refreshStationSnapshot() {
             });
         }
     }
-    // PancakesSeis：PGA（Gal）折算为中国地震烈度（CSIS）；缺测哨兵 -1。
+    // PancakesSeis：设备端已按 GB/T 17742-2020 算好仪器烈度（帧 `i`），直接进 CSIS
+    // 域，不再用 PGA 二次折算；缺测哨兵 -1。
     if (seisSource_ && seisSource_->hasData()
         && settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis)) {
         const auto& stations = seisSource_->stations();
-        const auto& pga = seisSource_->pga();
+        const auto& intensity = seisSource_->intensity();
         for (int i = 0; i < stations.size(); ++i) {
             StationSnapshot::Entry e;
             e.lat = stations[i].latitude;
             e.lon = stations[i].longitude;
-            const double value = i < pga.size() ? pga[i] : PancakesSeisProtocol::kMissingPga;
-            e.raw = value > 0.0 ? IntensityCalculator::csisFromPga(value) : kMissingCsis;
+            const double value =
+                i < intensity.size() ? intensity[i] : PancakesSeisProtocol::kMissingIntensity;
+            e.raw = value > PancakesSeisProtocol::kMissingIntensity ? value : kMissingCsis;
             e.csis = true;
             push(e, [&](StationSnapshot::StationMeta& m) {
                 m.name = stations[i].name;
@@ -890,9 +892,10 @@ QVariantList AppController::stationSources() const {
                                    kmaSource_->frameTime()));
     }
     if (seisSource_ && settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis)) {
-        const double pga = seisSource_->maxPga();
-        const bool hasData = seisSource_->hasData() && pga > PancakesSeisProtocol::kMissingPga;
-        const double raw = hasData ? IntensityCalculator::csisFromPga(pga) : kMissingCsis;
+        // 卡片直接展示设备下发的最大仪器烈度（GB/T 17742-2020），不再由 PGA 折算。
+        const double raw = seisSource_->maxIntensity();
+        const bool hasData =
+            seisSource_->hasData() && raw > PancakesSeisProtocol::kMissingIntensity;
         const QString frameTime = seisSource_->lastTimestamp() > 0
             ? QDateTime::fromMSecsSinceEpoch(seisSource_->lastTimestamp(),
                                              QTimeZone(kClockUtc8OffsetSeconds))

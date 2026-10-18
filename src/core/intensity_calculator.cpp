@@ -39,9 +39,14 @@ double IntensityCalculator::rawCsis(double magnitude, double distanceKm, double 
 }
 
 double IntensityCalculator::csisFromPga(double pgaGal) {
-    if (pgaGal <= 0.0) return 0.0;
-    // GB/T 17742 仪器烈度单参数振幅式，PGA 取 Gal（cm/s²）：100 Gal ≈ VI 度。
-    return std::max(0.0, 3.17 * std::log10(pgaGal / 100.0) + 6.59);
+    if (!(pgaGal > 0.01)) return 0.0;
+    // GB/T 17742-2020 仪器烈度：0.01~0.22 Gal 线性映射（0.22 → 1.0），以上用
+    // 1.0 + 1.66·log10(PGA/0.22)，上限 12。与设备端（PancakesSeis 帧 `i`）同一式子，
+    // 结果保留 1 位小数。
+    double value = pgaGal < 0.22 ? pgaGal / 0.22
+                                 : 1.0 + 1.66 * std::log10(pgaGal / 0.22);
+    value = std::clamp(value, 0.0, 12.0);
+    return std::round(value * 10.0) / 10.0;
 }
 
 double IntensityCalculator::distanceForCsis(double magnitude, double depthKm, double level) {    if (magnitude <= 0.0) return 0.0;
