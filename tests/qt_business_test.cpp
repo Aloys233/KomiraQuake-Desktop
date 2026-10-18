@@ -231,18 +231,15 @@ private slots:
         QCOMPARE(listed->at(0).sid, 0);
         QVERIFY(!PancakesSeisParser::parseStationList(QJsonObject{}).has_value());
 
-        // 满字段帧：设备端算好的仪器烈度 `i` 与 2 分钟最大烈度 `m` 原样透传。
+        // 现行帧：设备端算好的仪器烈度 `i` 与 2 分钟最大烈度 `m` 原样透传。
+        // 上游已移除 `x`/`y`/`z` 三轴峰值加速度，帧里只剩 `s`/`p`/`v`/`i`/`m`/`t`。
         const QJsonObject frame = QJsonDocument::fromJson(
-            R"({"s":0,"p":12.5,"v":8.75,"x":3.3,"y":1.1,"z":0.4,"i":3.7,"m":4.1,
-                "t":1729000000000})").object();
+            R"({"s":0,"p":12.5,"v":8.75,"i":3.7,"m":4.1,"t":1729000000000})").object();
         const auto sample = PancakesSeisParser::parseSample(frame);
         QVERIFY(sample.has_value());
         QCOMPARE(sample->sid, 0);
         QCOMPARE(sample->pga, 12.5);
         QCOMPARE(sample->pgv, 8.75);
-        QCOMPARE(sample->x, 3.3);
-        QCOMPARE(sample->y, 1.1);
-        QCOMPARE(sample->z, 0.4);
         QCOMPARE(sample->intensity, 3.7);
         QCOMPARE(sample->maxIntensity, 4.1);
         QCOMPARE(sample->errorCode, 0);
@@ -275,9 +272,9 @@ private slots:
                      QJsonDocument::fromJson(R"({"type":"pong","s":0,"p":1.0})").object())
                      .has_value());
 
-        // 线上抓到的真实报文样本（2026-10-18 18:15）：
-        // ① 档案既无 `alt`、站名也不带编号后缀；② `y` 是整数 `1` 而非 `1.0`；
-        // ③ `i` 与 GB/T 公式逐帧一致——这正是「直接用设备值」的对照基准。
+        // 线上抓到的真实报文样本：① 2026-10-18 18:15 的旧帧（还带 `x`/`y`/`z`）；
+        // ② 2026-10-18 20:04 的现行帧——三轴已被上游**移除**，只剩 `s`/`p`/`i`/`m`/`t`。
+        // `i` 与 GB/T 公式逐帧一致——这正是「直接用设备值」的对照基准。
         const QJsonObject liveStations = QJsonDocument::fromJson(R"({
             "data":[{"sid":0,"name":"四川省成都市郫都区",
                      "location":{"lat":30.797,"lon":103.9078,
@@ -297,12 +294,19 @@ private slots:
             double maxIntensity;
         };
         const LiveFrame liveFrames[] = {
+            // 旧帧：三轴还在，解析时忽略、不影响其余字段。
             {R"({"s":0,"p":1.511,"v":0.202,"x":0.994,"y":1,"z":1.12,"i":2.4,"m":4.2,"t":1792318500985})",
              1.511, 2.4, 4.2},
             {R"({"s":0,"p":1.397,"v":0.086,"x":0.86,"y":0.984,"z":1.227,"i":2.3,"m":4.2,"t":1792318502985})",
              1.397, 2.3, 4.2},
             {R"({"s":0,"p":15.321,"v":0.32,"x":15.32,"y":1.228,"z":1.233,"i":4.1,"m":4.2,"t":1792318503985})",
              15.321, 4.1, 4.2},
+            // 现行帧（20:04）：三轴已移除；`p`、`i` 同为 0（静稳）也必须落值，
+            // `m` 仍保留 2 分钟窗口最大值。
+            {R"({"s":0,"p":0,"i":0,"m":3.1,"t":1792325082617})",
+             0.0, 0.0, 3.1},
+            {R"({"s":0,"p":2.096,"v":0.307,"i":2.6,"m":6.1,"t":1792325083616})",
+             2.096, 2.6, 6.1},
         };
         for (const LiveFrame& entry : liveFrames) {
             const auto parsed =
@@ -315,11 +319,11 @@ private slots:
             // 设备值与我方兜底公式必须逐帧吻合，否则说明两端换算口径已经分叉。
             QCOMPARE(instrumentIntensityFromPga(entry.pga), entry.intensity);
         }
-        // 整数 `y` 不应被当成缺失。
+        // 整数 `y` 是旧报文才有的字段；帧里出现与否都不影响 `parseSample`。
         const auto intY = PancakesSeisParser::parseSample(
             QJsonDocument::fromJson(R"({"s":0,"p":1.511,"y":1,"i":2.4,"t":1})").object());
         QVERIFY(intY.has_value());
-        QCOMPARE(intY->y, 1.0);
+        QCOMPARE(intY->intensity, 2.4);
 
         // 仪器烈度换算（GB/T 17742-2020）：参考点 0.22→1.0、0.89→2.0、3.53→3.0、14.1→4.0。
         QCOMPARE(instrumentIntensityFromPga(0.005), 0.0);

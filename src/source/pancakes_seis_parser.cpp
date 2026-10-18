@@ -70,10 +70,9 @@ std::optional<PancakesSeisSample> PancakesSeisParser::parseSample(const QJsonObj
     sample.sid = sid.toInt();
     sample.pga = pga.toDouble();
     // 可选字段：上游为 0 时省略，缺省即 0，不需要哨兵。
+    // 注意 `x`/`y`/`z` 三轴峰值加速度已由上游移除（实测帧只带 `s`/`p`/`i`/`m`/`t`），
+    // 这里不再解析；老报文带了也只是被忽略，不影响其余字段。
     sample.pgv = frame.value(QStringLiteral("v")).toDouble();
-    sample.x = frame.value(QStringLiteral("x")).toDouble();
-    sample.y = frame.value(QStringLiteral("y")).toDouble();
-    sample.z = frame.value(QStringLiteral("z")).toDouble();
     // `i` 按约定必现（静稳为 0）；若上游漏发，按同一 GB/T 17742-2020 公式由 PGA
     // 兜底换算，避免把「有读数」误判成「没带烈度」。
     const QJsonValue intensity = frame.value(QStringLiteral("i"));
