@@ -1229,6 +1229,249 @@ private slots:
         QVERIFY2(waitAligned(), "平移+缩放后测站层与 QML 投影错位");
     }
 
+    /// 回归：测站悬停浮层必须真的能命中、显示站名，并且不拖慢渲染。
+    ///
+    /// 设计约束（改实现前先看这里）：
+    /// - 上千个测站由 C++ 批量绘制，没有逐站 Item，所以浮层只能靠 stationAt() 命中；
+    /// - 命中是 O(n) 纯算术（缓存的投影 Y），不重建任何东西，也不该触发 update()；
+    /// - 浮层只有一个实例，相机一动就收起（否则锚点会与测站错位）。
+    void stationHoverTooltipShowsDetails() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("StationTooltipTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setShowStationLayer(true);
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        auto* layer = window->findChild<QQuickItem*>("stationIntensityLayer");
+        QVERIFY(mapView && layer);
+        mapView->setProperty("centerLat", 30.0);
+        mapView->setProperty("centerLon", 104.0);
+        mapView->setProperty("zoom", 7.0);
+        QTest::qWait(300);
+        window->grabWindow();
+
+        komira::StationSnapshot snapshot;
+        layer->setProperty("snapshot", QVariant::fromValue(static_cast<QObject*>(&snapshot)));
+
+        // 一眼能看到的三个站：成都（CSIS 方标）、日本（NIED 圆点）、韩国（KMA 圆点）。
+        auto makeEntries = []() {
+            std::vector<komira::StationSnapshot::Entry> entries;
+            std::vector<komira::StationSnapshot::StationMeta> metas;
+            auto add = [&](double lat, double lon, double raw, const char* name, const char* area,
+                           const char* code, const char* type, const char* source, bool csis,
+                           bool kma) {
+                komira::StationSnapshot::Entry e;
+                e.lat = lat; e.lon = lon; e.raw = raw; e.csis = csis; e.kma = kma;
+                e.meta = static_cast<int>(entries.size());
+                entries.push_back(e);
+                komira::StationSnapshot::StationMeta m;
+                m.name = QString::fromUtf8(name);
+                m.area = QString::fromUtf8(area);
+                m.code = QString::fromUtf8(code);
+                m.type = QString::fromUtf8(type);
+                m.source = QString::fromUtf8(source);
+                metas.push_back(m);
+            };
+            add(30.67, 104.06, 6.0, "成都高新", "四川省成都市", "SC.CD01", "CSIS", "PancakesSeis",
+                true, false);
+            add(35.68, 139.76, 4.6, "東京", "東京都", "TKY01", "KiK-net", "NIED Kmoni", false, false);
+            add(37.56, 126.97, 3.0, "", "", "", "", "KMA PEWS", false, true);
+            return std::make_pair(entries, metas);
+        };
+        auto [entries, metas] = makeEntries();
+        snapshot.setEntries(entries, metas);
+        QTest::qWait(120);
+        window->grabWindow();
+
+        // 1. 命中：把相机里成都的位置交给 stationAt，必须命中并带出站名/代码/来源。
+        QPointF chengdu;
+        QVERIFY(QMetaObject::invokeMethod(layer, "stationScreenPos", Q_RETURN_ARG(QPointF, chengdu),
+                                          Q_ARG(int, 0)));
+        QVERIFY2(chengdu.x() > 0 && chengdu.x() < layer->width(), "测试站不在视野内");
+        QVariantMap hit;
+        QVERIFY(QMetaObject::invokeMethod(layer, "stationAt", Q_RETURN_ARG(QVariantMap, hit),
+                                          Q_ARG(double, chengdu.x()), Q_ARG(double, chengdu.y())));
+        QVERIFY2(hit.value("found").toBool(), "指针落在测站上却没有命中");
+        QCOMPARE(hit.value("index").toInt(), 0);
+        QCOMPARE(hit.value("name").toString(), QStringLiteral("成都高新"));
+        QCOMPARE(hit.value("area").toString(), QStringLiteral("四川省成都市"));
+        QCOMPARE(hit.value("code").toString(), QStringLiteral("SC.CD01"));
+        QCOMPARE(hit.value("source").toString(), QStringLiteral("PancakesSeis"));
+        QCOMPARE(hit.value("standard").toString(), QStringLiteral("csis"));
+        QCOMPARE(hit.value("intensity").toString(), QStringLiteral("6"));
+
+        // 2. 未命中：离站点足够远处必须 found=false（不能把浮层挂在半空）。
+        QVariantMap miss;
+        QVERIFY(QMetaObject::invokeMethod(layer, "stationAt", Q_RETURN_ARG(QVariantMap, miss),
+                                          Q_ARG(double, chengdu.x() + 80),
+                                          Q_ARG(double, chengdu.y() + 80)));
+        QVERIFY(!miss.value("found").toBool());
+
+        // 3. 各制式的显示文本：NIED 用 JMA 震度阶，KMA 取整 MMI。
+        QVariantMap tokyo;
+        QVERIFY(QMetaObject::invokeMethod(layer, "stationAt", Q_RETURN_ARG(QVariantMap, tokyo),
+                                          Q_ARG(double, chengdu.x() + 400),
+                                          Q_ARG(double, chengdu.y())));
+        QVERIFY(!tokyo.value("found").toBool() || tokyo.value("index").toInt() != 0);
+        QPointF tokyoPos;
+        QVERIFY(QMetaObject::invokeMethod(layer, "stationScreenPos", Q_RETURN_ARG(QPointF, tokyoPos),
+                                          Q_ARG(int, 1)));
+        QVERIFY(QMetaObject::invokeMethod(layer, "stationAt", Q_RETURN_ARG(QVariantMap, tokyo),
+                                          Q_ARG(double, tokyoPos.x()), Q_ARG(double, tokyoPos.y())));
+        QVERIFY(tokyo.value("found").toBool());
+        QCOMPARE(tokyo.value("standard").toString(), QStringLiteral("jma"));
+        QCOMPARE(tokyo.value("intensity").toString(), QStringLiteral("5弱"));
+
+        // 4. 命中查询不得触发整层重绘（这是「注意性能」的硬约束）。
+        QSignalSpy frameSwapped(window, &QQuickWindow::frameSwapped);
+        for (int i = 0; i < 500; ++i) {
+            QVariantMap probe;
+            QMetaObject::invokeMethod(layer, "stationAt", Q_RETURN_ARG(QVariantMap, probe),
+                                      Q_ARG(double, chengdu.x()), Q_ARG(double, chengdu.y()));
+        }
+        QTest::qWait(150);
+        QVERIFY2(frameSwapped.count() <= 2,
+                 qPrintable(QStringLiteral("悬停命中触发了持续重绘：%1 帧/150 ms")
+                                .arg(frameSwapped.count())));
+
+        // 5. 真实指针路径：停在地图上 → 90 ms 去抖后浮层出现并显示站名。
+        auto* tooltip = findVisualItem(window, "stationTooltip");
+        QVERIFY(tooltip);
+        const QPoint scenePos =
+            mapView->mapToScene(chengdu + QPointF(0, 0)).toPoint();
+        QTest::mouseMove(window, QPoint(0, 0));
+        QTest::qWait(30);
+        QTest::mouseMove(window, scenePos);
+        QTRY_VERIFY_WITH_TIMEOUT(tooltip->isVisible(), 1500);
+        bool sawName = false;
+        for (auto* item : visualItems(tooltip)) {
+            if (item->property("text").toString() == QStringLiteral("成都高新")) sawName = true;
+        }
+        QVERIFY2(sawName, "浮层里没有站名");
+        // 浮层与其他地图玻璃卡同一套材质：GPU 后端下必须真的挂上 BackdropBlur，
+        // 且模糊源的 live 必须为 false（live 会让 SceneGraph 永不空闲）。
+        // 软件后端按设计降级成不透明底衬，只断言没有实例化模糊。
+        const bool software = window->rendererInterface()->graphicsApi()
+                              == QSGRendererInterface::Software;
+        // 只认**浮层自己**那棵子树里的模糊（tooltip 是 popup/visual 树之外的普通子项，
+        // 但 visualItems(tooltip) 仍可能带上 Loader 的实例）。用 parent 链回溯到 tooltip。
+        auto insideTooltip = [&](QQuickItem* item) {
+            for (auto* p = item; p; p = p->parentItem()) {
+                if (p == tooltip) return true;
+            }
+            return false;
+        };
+        QQuickItem* blurEffect = nullptr;
+        for (auto* item : visualItems(tooltip)) {
+            if (!insideTooltip(item)) continue;
+            if (item->objectName() == QLatin1String("backdropEffect")) blurEffect = item;
+        }
+        QQuickItem* backdrop = nullptr;
+        for (auto* item : visualItems(tooltip)) {
+            if (item->objectName() == QLatin1String("backdropBlur")) backdrop = item;
+        }
+        if (software) {
+            QVERIFY2(!blurEffect && !backdrop, "软件后端不应实例化模糊");
+        } else {
+            QVERIFY2(blurEffect && backdrop, "浮层缺少背景模糊");
+            // 看 BackdropBlur.live（本组件传给模糊源的那个属性）。不能看 ShaderEffectSource
+            // 自己的 live：MultiEffect 接管 source 后会把它改回自己的默认值 true，误判。
+            QVERIFY2(!backdrop->property("live").toBool(),
+                     "浮层的模糊源必须 live=false，否则会持续重绘地图");
+            // 真实成本判据：浮层静止、相机静止时场景图必须能空闲（只允许 500 ms 低频补帧）。
+            QSignalSpy idleFrames(window, &QQuickWindow::frameSwapped);
+            QTest::qWait(1200);
+            QVERIFY2(idleFrames.count() <= 8,
+                     qPrintable(QStringLiteral("悬停浮层让场景图持续重绘：1200 ms 内 %1 帧")
+                                    .arg(idleFrames.count())));
+        }
+        QTest::qWait(150);
+        window->grabWindow().save(evidenceDirectory(window) + "/13-station-tooltip.png");
+
+        // 5b. 悬停期间数据更新：浮层数值跟随快照刷新（震度 100 ms 级更新，
+        //     停在旧值上会误导）。只做一次 O(n) 命中，不重建图层。
+        {
+            auto live = entries;
+            live[0].raw = 9.0;
+            snapshot.setEntries(live, metas);
+            auto tooltipText = [&]() {
+                QStringList texts;
+                for (auto* item : visualItems(tooltip)) {
+                    const QString t = item->property("text").toString();
+                    if (!t.isEmpty()) texts << t;
+                }
+                return texts;
+            };
+            auto hasText = [&](const QString& want) {
+                for (const QString& t : tooltipText()) if (t == want) return true;
+                return false;
+            };
+            QTRY_VERIFY_WITH_TIMEOUT(hasText(QStringLiteral("9")), 1000);
+        }
+
+        // 5c. 关闭测站图层：浮层立刻收起（地图上已没有可指的点）。
+        controller.settings()->setShowStationLayer(false);
+        QTRY_VERIFY_WITH_TIMEOUT(!tooltip->isVisible(), 500);
+        controller.settings()->setShowStationLayer(true);
+
+        // 5d. 规模与预算：2500 站时一次命中必须远低于一帧（16 ms）。这是「注意性能」
+        //     的硬指标，避免以后把命中改成重建投影或逐站 QObject。
+        {
+            std::vector<komira::StationSnapshot::Entry> many;
+            std::vector<komira::StationSnapshot::StationMeta> manyMeta;
+            many.reserve(2500);
+            manyMeta.reserve(2500);
+            for (int i = 0; i < 2500; ++i) {
+                komira::StationSnapshot::Entry e;
+                e.lat = 24.0 + (i % 50) * 0.25;
+                e.lon = 100.0 + (i / 50) * 0.5;
+                e.raw = double(i % 70) / 10.0 - 3.0;
+                e.meta = i;
+                many.push_back(e);
+                komira::StationSnapshot::StationMeta m;
+                m.name = QStringLiteral("站%1").arg(i);
+                m.source = QStringLiteral("NIED Kmoni");
+                manyMeta.push_back(m);
+            }
+            snapshot.setEntries(many, manyMeta);
+            QTest::qWait(120);
+            window->grabWindow();
+            QElapsedTimer timer;
+            timer.start();
+            int hits = 0;
+            for (int i = 0; i < 200; ++i) {
+                QVariantMap probe;
+                QMetaObject::invokeMethod(layer, "stationAt", Q_RETURN_ARG(QVariantMap, probe),
+                                          Q_ARG(double, 300.0 + (i % 20) * 15.0),
+                                          Q_ARG(double, 200.0 + (i % 13) * 20.0));
+                if (probe.value("found").toBool()) ++hits;
+            }
+            const qint64 elapsedMs = timer.elapsed();
+            qInfo() << "[station] 2500 站 × 200 次命中:" << elapsedMs << "ms, hits" << hits;
+            QVERIFY2(elapsedMs < 200,
+                     qPrintable(QStringLiteral("命中查询过慢：2500 站 × 200 次 = %1 ms")
+                                    .arg(elapsedMs)));
+        }
+
+        // 6. 相机一动就收起：浮层锚在屏幕坐标上，跟着镜头漂会与测站错位。
+        mapView->setProperty("centerLon", 103.0);
+        QTRY_VERIFY_WITH_TIMEOUT(!tooltip->isVisible(), 500);
+    }
+
     /// 回归：CSIS/KMA 方标里的烈度数字必须画在**视觉中心**。
     ///
     /// 旧实现用 `drawText(rect, Qt::AlignCenter)`，居中的是字体行盒（ascent + descent）；

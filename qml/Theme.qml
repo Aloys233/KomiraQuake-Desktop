@@ -124,6 +124,15 @@ QtObject {
         else base = niedStationColor(raw);
         return dark ? Qt.lighter(base, 1.45) : Qt.darker(base, 1.5);
     }
+    /// 悬停浮层里的烈度小色块：取同一套测站色阶的低透明度色，
+    /// 让浮层与地图上刚指的那个站颜色对得上，同时不压过正文。
+    function stationFillColorFor(raw, standard) {
+        let base;
+        if (standard === "csis") base = intensityColor(raw);
+        else if (standard === "kma") base = kmaStationColor(raw);
+        else base = niedStationColor(raw);
+        return Qt.rgba(base.r, base.g, base.b, dark ? 0.30 : 0.18);
+    }
     function magnitudeColor(m) {
         if (m < 3.0) return "#00796B";
         if (m < 4.5) return "#F57F17";

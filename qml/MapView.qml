@@ -37,9 +37,10 @@ Item {
         root.cameraMoving = true;
         cameraMotionTimer.restart();
     }
-    onCenterLatChanged: noteCameraMoved()
-    onCenterLonChanged: noteCameraMoved()
-    onZoomChanged: noteCameraMoved()
+    // 相机一变就收起悬停浮层：它锚在屏幕坐标上，跟着镜头漂会与测站错位。
+    onCenterLatChanged: { noteCameraMoved(); stationHover.hide(); }
+    onCenterLonChanged: { noteCameraMoved(); stationHover.hide(); }
+    onZoomChanged: { noteCameraMoved(); stationHover.hide(); }
     /// 是否存在活动预警：空闲自动归位时优先回到预警震中而非我的位置。
     property bool warningActive: false
     property real userLat: 0.0
@@ -1102,6 +1103,98 @@ Item {
         kmaDotColors: root.theme.kmaDotColorBand
     }
 
+    // ---- 测站悬停浮层 ----------------------------------------------------
+    // 只有一个实例，命中靠 stationLayer.stationAt()（O(n) 纯算术，见 C++ 注释）。
+    // 指针扫过时不逐像素查询：停下 90 ms 才查一次；地图在动、正在拖拽、选点模式或
+    // 测站层隐藏时一律不显示。
+    StationTooltip {
+        id: stationTooltip
+        theme: root.theme
+        z: 20
+        viewport: Qt.size(root.width, root.height)
+        // 显示条件统一由 stationHover.query() 判定（它已经检查图层开关/手势/相机/选点），
+        // 这里不再复写一遍，避免两条判据分叉。
+        visible: stationHover.active
+        info: stationHover.info
+        anchor: stationHover.anchor
+        // 模糊只采样地图渲染层（瓦片/矢量/测站/波前），不采 HUD、工具条或浮层自身。
+        backdropSource: mapRenderLayer
+    }
+    QtObject {
+        id: stationHover
+        /// 最近一次命中的测站（未命中为 `{ found:false }`，浮层由 visible 隐藏）。
+        property var info: ({ found: false })
+        property point anchor: Qt.point(0, 0)
+        /// 本次查询对应的指针位置：去抖回调里用它判断指针是否又动过。
+        property point pending: Qt.point(-1, -1)
+        /// 最近一次已知的指针位置（不区分是否停稳），用于数据刷新时重查同一处。
+        property point pointer: Qt.point(-1, -1)
+        property bool active: false
+
+        function hide() {
+            hoverTimer.stop();
+            if (!active) return;
+            active = false;
+            info = ({ found: false });
+        }
+
+        /// 指针移动：重新计时，鼠标停稳后才真正查询。
+        function schedule(x, y) {
+            pending = Qt.point(x, y);
+            pointer = Qt.point(x, y);
+            if (active) {
+                // 已经显示时不要等满去抖间隔，但仍然限频：先立即查一次，继续移动则再排一次。
+                query(x, y, false);
+            }
+            hoverTimer.restart();
+        }
+
+        /// 查询并更新浮层。`settled` 为 true 表示指针已停稳（决定是否允许显示）。
+        function query(x, y, settled) {
+            if (!app.settings.showStationLayer || root.gestureActive || root.cameraMoving
+                || root.pickingLocation) {
+                hide();
+                return;
+            }
+            const hit = stationLayer.stationAt(x, y);
+            if (!hit.found) {
+                // 停稳时未命中：彻底收起；仍在移动时先留着，避免扫过空隙时闪断。
+                if (settled) hide();
+                return;
+            }
+            const pos = stationLayer.stationScreenPos(hit.index);
+            info = hit;
+            anchor = Qt.point(pos.x, pos.y);
+            active = true;
+        }
+
+        /// 数据帧到达时重查指针下的站：震度在 100 ms 级更新，悬停期间看到旧值会误导。
+        /// 只在浮层已经显示时做一次 O(n) 命中（见 StationMapItem::stationAt），不重建图层。
+        function refresh() {
+            if (active && pointer.x >= 0) query(pointer.x, pointer.y, true);
+        }
+    }
+    // 听图层自己的 stationsApplied()，而不是 StationSnapshot::changed()：QML Connections
+    // 可能在图层内部连接之前就绑上，直接听快照会读到上一帧数据（浮层显示旧震度）。
+    Connections {
+        target: stationLayer
+        function onStationsApplied() { stationHover.refresh(); }
+    }
+    // 关闭测站图层时浮层必须立刻收起：此时地图上已经没有可指的点了。
+    Connections {
+        target: app.settings
+        function onChanged() {
+            if (!app.settings.showStationLayer) stationHover.hide();
+        }
+    }
+    Timer {
+        id: hoverTimer
+        objectName: "stationHoverTimer"
+        // 指针停稳 90 ms 才查询：扫过地图时不会沿路闪出一串浮层。
+        interval: 90
+        onTriggered: stationHover.query(stationHover.pending.x, stationHover.pending.y, true)
+    }
+
     // 右上角：各测站源的实时最大值（仅显示，不参与预警）；每个源一张小卡，横向排列。
     RowLayout {
         anchors.right: parent.right
@@ -1133,6 +1226,8 @@ Item {
         id: mapMouseArea
         anchors.fill: parent
         acceptedButtons: Qt.LeftButton
+        // 悬停跟踪：指针停稳后由 hoverTimer 调 stationHover.query()，不逐像素查询。
+        hoverEnabled: true
         cursorShape: root.pickingLocation ? Qt.CrossCursor
                      : root.gestureActive ? Qt.ClosedHandCursor : Qt.ArrowCursor
         property real lastX: 0
@@ -1158,6 +1253,7 @@ Item {
             lastY = mouse.y;
             pressX = mouse.x;
             pressY = mouse.y;
+            stationHover.hide();
             // 从按下的第一刻起就冻结程序化镜头：即便还没产生位移，新事件/波前跟随
             // 也不该在指针下把画面抽走。
             root.beginGesture();
@@ -1165,7 +1261,12 @@ Item {
         // 松开或被其它控件抢走抓取时都回到自由态（canceled 同样会置 pressed=false）。
         onPressedChanged: if (!pressed) root.endGesture()
         onPositionChanged: (mouse) => {
-            if (!pressed) return;
+            // 悬停：不按住时只登记指针位置，停稳后由 hoverTimer 查询一次。
+            if (!pressed) {
+                stationHover.schedule(mouse.x, mouse.y);
+                return;
+            }
+            // 拖动：1:1 跟手平移镜头。
             root.following = false;
             root.userMovedCamera = true;
             root.noteCameraInteraction();
@@ -1196,6 +1297,8 @@ Item {
         // 松开、失去抓取或被取消时都回到自由态：endGesture 幂等，重复调用无副作用。
         onReleased: root.endGesture()
         onCanceled: root.endGesture()
+        // area 级 exited：指针离开地图（含移入浮层/工具条）时收起浮层。
+        onExited: stationHover.hide()
     }
 
     GlassCard {

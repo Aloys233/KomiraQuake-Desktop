@@ -319,6 +319,13 @@ void AppController::scheduleStationIntensityRefresh() {
     if (!stationIntensityRefreshTimer_.isActive()) stationIntensityRefreshTimer_.start();
 }
 
+void AppController::noteStationTablesChanged() {
+    // 台站表可能变化时才让 refreshStationSnapshot 重建元数据。震度帧走另一条路径，
+    // 不受影响 —— 悬停浮层的站名只在首包/名录更新/启用切换时才会变。
+    stationMetaDirty_ = true;
+    scheduleStationIntensityRefresh();
+}
+
 long long AppController::nowMs() const {
     return nowProvider_ ? nowProvider_() : clock_->now();
 }
@@ -390,7 +397,8 @@ void AppController::wire() {
         syncStation(settings_->isStationSourceEnabled(StationSourceIds::kKma), kmaSource_);
         syncStation(settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis), seisSource_);
         syncStation(settings_->isStationSourceEnabled(StationSourceIds::kWolfxSeis), wolfxSeisSource_);
-        scheduleStationIntensityRefresh();
+        // 启用/停用会改变合并后测站表的构成：悬停元数据必须整表重建一次。
+        noteStationTablesChanged();
         sound_->setEnabled(settings_->enableSoundAlert());
         sound_->setVolume(settings_->alertVolume());
         clock_->setCustomServer(settings_->customNtpServer());
@@ -426,37 +434,38 @@ void AppController::wire() {
             source->start();
     }
     if (startServices_) {
-        // NIED 测站显示源：随应用启停（不参与 EEW 源门控）。台站表/震度两帧都转发给 QML。
+        // NIED 测站显示源：随应用启停（不参与 EEW 源门控）。台站表变化会连带重建悬停
+        // 元数据（noteStationTablesChanged），震度帧只刷新数值。
         connect(stationSource_, &KmoniStationSource::stationsChanged, this,
-                [this]() { scheduleStationIntensityRefresh(); });
+                [this]() { noteStationTablesChanged(); });
         connect(stationSource_, &KmoniStationSource::intensityChanged, this,
                 [this]() { scheduleStationIntensityRefresh(); });
         if (settings_->isStationSourceEnabled(StationSourceIds::kKmoni))
             stationSource_->start();
         // S-Net 海底观测网测站显示源：同上，与 Kmoni 共用 JMA 震度色阶。
         connect(snetSource_, &SnetStationSource::stationsChanged, this,
-                [this]() { scheduleStationIntensityRefresh(); });
+                [this]() { noteStationTablesChanged(); });
         connect(snetSource_, &SnetStationSource::intensityChanged, this,
                 [this]() { scheduleStationIntensityRefresh(); });
         if (settings_->isStationSourceEnabled(StationSourceIds::kSnet))
             snetSource_->start();
         // KMA PEWS 测站显示源：同上，按韩国 MMI 整数烈度着色。
         connect(kmaSource_, &KmaStationSource::stationsChanged, this,
-                [this]() { scheduleStationIntensityRefresh(); });
+                [this]() { noteStationTablesChanged(); });
         connect(kmaSource_, &KmaStationSource::mmiChanged, this,
                 [this]() { scheduleStationIntensityRefresh(); });
         if (settings_->isStationSourceEnabled(StationSourceIds::kKma))
             kmaSource_->start();
         // PancakesSeis 测站显示源：同上，与 Kmoni 共用地图测站图层。
         connect(seisSource_, &PancakesSeisSource::stationsChanged, this,
-                [this]() { scheduleStationIntensityRefresh(); });
+                [this]() { noteStationTablesChanged(); });
         connect(seisSource_, &PancakesSeisSource::dataChanged, this,
                 [this]() { scheduleStationIntensityRefresh(); });
         if (settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis))
             seisSource_->start();
         // Wolfx SeisJS 测站显示源：同上，共用地图测站图层。
         connect(wolfxSeisSource_, &WolfxSeisSource::stationsChanged, this,
-                [this]() { scheduleStationIntensityRefresh(); });
+                [this]() { noteStationTablesChanged(); });
         connect(wolfxSeisSource_, &WolfxSeisSource::dataChanged, this,
                 [this]() { scheduleStationIntensityRefresh(); });
         if (settings_->isStationSourceEnabled(StationSourceIds::kWolfxSeis))
@@ -714,20 +723,51 @@ QVariantMap AppController::waveRadii() const {
 void AppController::refreshStationSnapshot() {
     if (!stationSnapshot_) return;
     std::vector<StationSnapshot::Entry> entries;
+    // 悬停浮层的元数据只在台站表变化时重建一次（stationMetaDirty_）：五路台站表合计
+    // 约 2500 条，逐帧重建会产生上万次 QString 拷贝。条目与元数据同序生成，故
+    // `Entry::meta` 恒等于条目下标。
+    const bool withMeta = stationMetaDirty_;
+    std::vector<StationSnapshot::StationMeta> metas;
+    if (withMeta) {
+        const qsizetype estimate = (stationSource_ ? stationSource_->stations().size() : 0) +
+                                   (snetSource_ ? snetSource_->stations().size() : 0) +
+                                   (kmaSource_ ? kmaSource_->stations().size() : 0) +
+                                   (seisSource_ ? seisSource_->stations().size() : 0) +
+                                   (wolfxSeisSource_ ? wolfxSeisSource_->stations().size() : 0);
+        metas.reserve(static_cast<std::size_t>(std::max<qsizetype>(0, estimate)));
+        entries.reserve(static_cast<std::size_t>(std::max<qsizetype>(0, estimate)));
+    }
+
+    // 只在重建元数据时构造 StationMeta（QString 拷贝虽为引用计数，但逐帧对约 2500 条
+    // 做一次也不该发生）；平时只填 Entry::meta 下标。
+    auto push = [&](StationSnapshot::Entry e, auto&& fillMeta) {
+        e.meta = static_cast<int>(entries.size());
+        entries.push_back(e);
+        if (withMeta) {
+            StationSnapshot::StationMeta m;
+            fillMeta(m);
+            metas.push_back(std::move(m));
+        }
+    };
 
     // NIED Kmoni：raw 为 JMA 計測震度（缺测哨兵 -3）。
     if (stationSource_ && stationSource_->hasData()
         && settings_->isStationSourceEnabled(StationSourceIds::kKmoni)) {
         const auto& stations = stationSource_->stations();
         const auto& intensity = stationSource_->intensity();
-        entries.reserve(entries.size() + stations.size());
         for (int i = 0; i < stations.size(); ++i) {
             StationSnapshot::Entry e;
             e.lat = stations[i].latitude;
             e.lon = stations[i].longitude;
             e.raw = i < intensity.size() ? intensity[i] : KmoniStationProtocol::kMissing;
             e.csis = false;
-            entries.push_back(e);
+            push(e, [&](StationSnapshot::StationMeta& m) {
+                m.name = stations[i].name;
+                m.area = stations[i].region;
+                m.code = stations[i].code;
+                m.type = stations[i].stationType;
+                m.source = QStringLiteral("NIED Kmoni");
+            });
         }
     }
     // S-Net 海底观测网：raw 为 JMA 計測震度（缺测 -3，饱和 99 原样保留）。
@@ -735,13 +775,17 @@ void AppController::refreshStationSnapshot() {
         && settings_->isStationSourceEnabled(StationSourceIds::kSnet)) {
         const auto& stations = snetSource_->stations();
         const auto& intensity = snetSource_->intensity();
-        entries.reserve(entries.size() + stations.size());
         for (int i = 0; i < stations.size(); ++i) {
             StationSnapshot::Entry e;
             e.lat = stations[i].latitude;
             e.lon = stations[i].longitude;
             e.raw = i < intensity.size() ? intensity[i] : SnetStationProtocol::kMissing;
-            entries.push_back(e);
+            push(e, [&](StationSnapshot::StationMeta& m) {
+                m.name = stations[i].name;
+                m.code = stations[i].code;
+                m.type = stations[i].stationType;
+                m.source = QStringLiteral("S-Net");
+            });
         }
     }
     // KMA PEWS：raw 为韩国 MMI 整数烈度（缺测 -3），走独立的 KMA 色阶。
@@ -749,14 +793,15 @@ void AppController::refreshStationSnapshot() {
         && settings_->isStationSourceEnabled(StationSourceIds::kKma)) {
         const auto& stations = kmaSource_->stations();
         const auto& mmi = kmaSource_->mmi();
-        entries.reserve(entries.size() + stations.size());
         for (int i = 0; i < stations.size(); ++i) {
             StationSnapshot::Entry e;
             e.lat = stations[i].latitude;
             e.lon = stations[i].longitude;
             e.raw = i < mmi.size() ? mmi[i] : KmaStationProtocol::kMissing;
             e.kma = true;
-            entries.push_back(e);
+            push(e, [&](StationSnapshot::StationMeta& m) {
+                m.source = QStringLiteral("KMA PEWS");
+            });
         }
     }
     // PancakesSeis：PGA（Gal）折算为中国地震烈度（CSIS）；缺测哨兵 -1。
@@ -764,7 +809,6 @@ void AppController::refreshStationSnapshot() {
         && settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis)) {
         const auto& stations = seisSource_->stations();
         const auto& pga = seisSource_->pga();
-        entries.reserve(entries.size() + stations.size());
         for (int i = 0; i < stations.size(); ++i) {
             StationSnapshot::Entry e;
             e.lat = stations[i].latitude;
@@ -772,24 +816,48 @@ void AppController::refreshStationSnapshot() {
             const double value = i < pga.size() ? pga[i] : PancakesSeisProtocol::kMissingPga;
             e.raw = value > 0.0 ? IntensityCalculator::csisFromPga(value) : kMissingCsis;
             e.csis = true;
-            entries.push_back(e);
+            push(e, [&](StationSnapshot::StationMeta& m) {
+                m.name = stations[i].name;
+                m.area = stations[i].region;
+                m.code = stations[i].sid >= 0 ? QString::number(stations[i].sid) : QString();
+                m.source = QStringLiteral("PancakesSeis");
+            });
         }
     }
     // Wolfx SeisJS：报文自带中国地震烈度 `Intensity`，直接进入 CSIS 域。
     if (wolfxSeisSource_ && wolfxSeisSource_->hasData()
         && settings_->isStationSourceEnabled(StationSourceIds::kWolfxSeis)) {
         const auto& stations = wolfxSeisSource_->stations();
-        entries.reserve(entries.size() + stations.size());
         for (const auto& station : stations) {
             StationSnapshot::Entry e;
             e.lat = station.latitude;
             e.lon = station.longitude;
             e.raw = station.csis >= 0 ? static_cast<double>(station.csis) : kMissingCsis;
             e.csis = true;
-            entries.push_back(e);
+            push(e, [&](StationSnapshot::StationMeta& m) {
+                m.name = station.location;
+                m.code = station.id;
+                m.source = QStringLiteral("Wolfx SeisJS");
+            });
         }
     }
 
+    if (withMeta) {
+        stationMetas_ = std::move(metas);
+        stationMetaDirty_ = false;
+        if (entries.size() != stationMetas_.size()) {
+            // 不该发生：条目与元数据同序生成。留一条日志便于定位，随后照样下发。
+            qWarning() << "[station] meta/entry size mismatch" << entries.size()
+                       << stationMetas_.size();
+        }
+        stationSnapshot_->setEntries(std::move(entries), stationMetas_);
+        return;
+    }
+    if (stationMetas_.size() != entries.size()) {
+        // 启用/停用了某个测站源却漏标脏：下一帧补一次完整重建（悬停先没有元数据）。
+        stationMetaDirty_ = true;
+        scheduleStationIntensityRefresh();
+    }
     stationSnapshot_->setEntries(std::move(entries));
 }
 

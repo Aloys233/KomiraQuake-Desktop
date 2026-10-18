@@ -16,6 +16,7 @@
 #include <cstring>
 
 #include "core/coordinate_transform.h"
+#include "source/kmoni_station_parser.h"
 
 namespace komira {
 namespace {
@@ -147,7 +148,9 @@ void StationMapItem::setSnapshot(QObject* object) {
     if (!snapshot_) {
         stations_.clear();
         positions_.clear();
+        projYRef_.clear();
         update();
+        emit stationsApplied();
         return;
     }
     connect(snapshot_, &StationSnapshot::changed, this, &StationMapItem::applySnapshot);
@@ -180,7 +183,9 @@ void StationMapItem::applySnapshot() {
 
     stations_ = std::move(next);
     positions_ = std::move(nextPos);
+    rebuildProjectedPositions();
     update();
+    emit stationsApplied();
 }
 
 void StationMapItem::setCenterLat(double v) {
@@ -255,6 +260,11 @@ void StationMapItem::rebuildProjectedPositions() {
             lon = shifted.second;
         }
         positions_[i] = QPointF(lon, lat);
+    }
+    const double refSize = worldSize(kRefZoom);
+    projYRef_.resize(positions_.size());
+    for (std::size_t i = 0; i < positions_.size(); ++i) {
+        projYRef_[i] = projY(positions_[i].y(), refSize);
     }
 }
 
@@ -354,7 +364,7 @@ QSGNode* StationMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
         const QPointF& pos = positions_[i];
         const double dx = wrapLonDelta(pos.x() - lon);
         const double x = w / 2.0 + dx / 360.0 * world;
-        const double y = h / 2.0 + (projY(pos.y(), refSize) - centerRefY) * scale;
+        const double y = h / 2.0 + (projYRef_[i] - centerRefY) * scale;
 
         if (s.kma) {
             if (s.raw >= 0.0) {
@@ -427,6 +437,100 @@ QPointF StationMapItem::screenPosForTest(double lat, double lon) const {
     const double y = height() / 2.0 +
                      (projY(lat, refSize) - projY(drawnCenterLat_, refSize)) * drawnScale_;
     return QPointF(x, y);
+}
+
+double StationMapItem::markerSize() const {
+    int csisPx = 0, dotPx = 0, idlePx = 0;
+    stationSizes(zoom_, &csisPx, &dotPx, &idlePx);
+    return std::max(csisPx, std::max(dotPx, idlePx));
+}
+
+QPointF StationMapItem::stationScreenPos(int index) const {
+    if (index < 0 || index >= static_cast<int>(positions_.size())
+        || index >= static_cast<int>(projYRef_.size())) {
+        return QPointF(-1e9, -1e9);
+    }
+    const double refSize = worldSize(kRefZoom);
+    const double scale = std::pow(2.0, zoom_ - kRefZoom);
+    const double world = refSize * scale;
+    const double dx = wrapLonDelta(positions_[static_cast<std::size_t>(index)].x() - centerLon_);
+    return QPointF(width() / 2.0 + dx / 360.0 * world,
+                   height() / 2.0 + (projYRef_[static_cast<std::size_t>(index)] -
+                                     projY(centerLat_, refSize)) * scale);
+}
+
+QVariantMap StationMapItem::stationAt(double sx, double sy) const {
+    QVariantMap out;
+    out[QStringLiteral("found")] = false;
+    if (positions_.empty() || projYRef_.size() != positions_.size()) return out;
+
+    // 命中半径 = 标记半径 + 3 px 余量：圆点很小（缩远时只有 3 px），不留余量就得
+    // 像素级瞄准；余量再大会让浮层出现在空地上。
+    const double radius = std::max(4.0, markerSize() * 0.5 + 3.0);
+    const double radius2 = radius * radius;
+
+    const double refSize = worldSize(kRefZoom);
+    const double scale = std::pow(2.0, zoom_ - kRefZoom);
+    const double world = refSize * scale;
+    const double centerRefY = projY(centerLat_, refSize);
+    const double lonToPx = world / 360.0;
+
+    // 纯算术 O(n)：不做投影、不分配、不碰场景图。视野内的站优先（同一像素附近有多个
+    // 站时取最近的；完全重合时后画的在上，故用 <= 让后者胜出）。
+    int best = -1;
+    double bestDist2 = radius2;
+    for (std::size_t i = 0; i < positions_.size(); ++i) {
+        const double x = width() / 2.0 + wrapLonDelta(positions_[i].x() - centerLon_) * lonToPx;
+        const double dx = x - sx;
+        // 纵向先粗筛：地图上层叠的站点很多，省掉大部分 y 投影。
+        if (dx > radius || dx < -radius) continue;
+        const double y = height() / 2.0 + (projYRef_[i] - centerRefY) * scale;
+        const double dy = y - sy;
+        if (dy > radius || dy < -radius) continue;
+        const double d2 = dx * dx + dy * dy;
+        if (d2 <= bestDist2) {
+            bestDist2 = d2;
+            best = static_cast<int>(i);
+        }
+    }
+    if (best < 0) return out;
+
+    const StationSnapshot::Entry& e = stations_[static_cast<std::size_t>(best)];
+    out[QStringLiteral("found")] = true;
+    out[QStringLiteral("index")] = best;
+    out[QStringLiteral("lat")] = e.lat;
+    out[QStringLiteral("lon")] = e.lon;
+    out[QStringLiteral("raw")] = e.raw;
+    out[QStringLiteral("csis")] = e.csis;
+    out[QStringLiteral("kma")] = e.kma;
+    // 显示文本在 C++ 侧一次算好，浮层不再做分档判断。
+    if (e.kma) {
+        out[QStringLiteral("standard")] = QStringLiteral("kma");
+        out[QStringLiteral("intensity")] =
+            e.raw < 0.0 ? QStringLiteral("--")
+                        : QString::number(std::max(0, std::min(11, static_cast<int>(std::lround(e.raw)))));
+    } else if (e.csis) {
+        out[QStringLiteral("standard")] = QStringLiteral("csis");
+        out[QStringLiteral("intensity")] =
+            e.raw < 0.0 ? QStringLiteral("--")
+                        : QString::number(std::max(0, static_cast<int>(std::lround(e.raw))));
+    } else {
+        out[QStringLiteral("standard")] = QStringLiteral("jma");
+        out[QStringLiteral("intensity")] =
+            e.raw >= 99.0 ? QStringLiteral("7") : jmaShindoText(e.raw);
+    }
+    // 元数据下标以 Entry::meta 为准（正常路径下就等于 best）；越界时退回 best。
+    int metaIndex = e.meta >= 0 ? e.meta : best;
+    if (snapshot_ && metaIndex < static_cast<int>(snapshot_->metas().size())) {
+        const StationSnapshot::StationMeta& m =
+            snapshot_->metas()[static_cast<std::size_t>(metaIndex)];
+        out[QStringLiteral("name")] = m.name;
+        out[QStringLiteral("area")] = m.area;
+        out[QStringLiteral("code")] = m.code;
+        out[QStringLiteral("type")] = m.type;
+        out[QStringLiteral("source")] = m.source;
+    }
+    return out;
 }
 
 QImage StationMapItem::markerTileForTest(int level, double zoom, double dpr) {
@@ -509,7 +613,7 @@ QSGNode* StationMapItem::updateSoftwareNode(QSGNode* oldNode, double lat, double
         const QPointF& pos = positions_[i];
         const double dx = wrapLonDelta(pos.x() - lon);
         const double x = w / 2.0 + dx / 360.0 * world;
-        const double y = h / 2.0 + (projY(pos.y(), refSize) - centerRefY) * scale;
+        const double y = h / 2.0 + (projYRef_[i] - centerRefY) * scale;
 
         if (s.kma) {
             if (s.raw >= 0.0) {

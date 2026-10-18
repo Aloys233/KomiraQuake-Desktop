@@ -136,6 +136,7 @@ set(KOMIRA_QML_FILES
     qml/EventListSidebar.qml
     qml/MapView.qml
     qml/StationIntensityCard.qml
+    qml/StationTooltip.qml
     qml/SettingsPage.qml
     qml/settings/AppearanceSection.qml
     qml/settings/MapSection.qml

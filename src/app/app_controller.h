@@ -230,6 +230,10 @@ private:
     void scheduleStationIntensityRefresh();
     /// 按各测站源的最新读数重建 StationSnapshot（纯 POD 拷贝，不发 QML 信号）。
     void refreshStationSnapshot();
+    /// 台站表（首包/名录/启用切换）变化：标脏元数据并安排一次刷新。
+    /// 震度帧只更新数值，不触发元数据重建 —— 否则每 100 ms 要重建约 2500 条
+    /// QString（五路台站表）。
+    void noteStationTablesChanged();
     /// 全部活动事件按发震时刻倒序（最新在前）的 identity 列表。
     std::vector<std::string> orderedActiveKeys() const;
     /// HUD 左右切换的公共实现：delta 为 ±1 时循环切换所选预警。
@@ -313,6 +317,10 @@ private:
     QTimer countdownTimer_;
     QTimer stationIntensityRefreshTimer_;
     StationSnapshot* stationSnapshot_ = nullptr;
+    /// 悬停浮层元数据（与 stationSnapshot_ 的 entries 下标对齐），按台站表变化重建。
+    std::vector<StationSnapshot::StationMeta> stationMetas_;
+    /// 台站表变化后置脏：下一次 refreshStationSnapshot 连元数据一起替换。
+    bool stationMetaDirty_ = true;
     /// 目录同步会把上百条事件一条条送进来；逐条写库 + 逐条 prune 会在启动/复显时
     /// 阻塞 GUI 线程一秒以上（实测 200 条约 400 ms，慢盘更久）。合并成一次事务。
     QTimer historyFlushTimer_;

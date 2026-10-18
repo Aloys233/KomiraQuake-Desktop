@@ -6,6 +6,7 @@
 #include <QPointer>
 #include <QQuickItem>
 #include <QSGGeometry>
+#include <QVariantMap>
 #include <QVector>
 #include <QVariantList>
 #include <QtQml/qqmlregistration.h>
@@ -84,8 +85,25 @@ public:
     /// 断言「数字墨迹居中」。会改写图集缓存，仅供测试调用。
     Q_INVOKABLE QImage markerTileForTest(int level, double zoom, double dpr);
 
+    /// 屏幕上 (x, y) 命中的测站，返回
+    /// `{ found, index, name, area, code, type, source, lat, lon, raw, csis, kma, intensity }`；
+    /// 未命中时 `found == false`。
+    ///
+    /// 悬停浮层每帧都可能问一次「指针下是哪个站」，所以这里**不重建任何东西**：
+    /// 直接扫 positions_ 的缓存投影（`projYRef_`）并按当前相机换算屏幕坐标，O(n) 纯算术，
+    /// 上千站在微秒级。命中半径按测站标记的实际尺寸给（缩放后仍按视觉大小判定）。
+    Q_INVOKABLE QVariantMap stationAt(double x, double y) const;
+    /// 指定测站下标在**当前相机**下的屏幕坐标（`stationAt` 未命中时用于浮层定位）。
+    Q_INVOKABLE QPointF stationScreenPos(int index) const;
+    /// 测站标记在当前缩放下的绘制直径（逻辑像素），供命中半径与浮层对齐使用。
+    Q_INVOKABLE double markerSize() const;
+
 signals:
     void snapshotChanged();
+    /// 快照内容已应用（positions_/projYRef_ 更新完毕）。悬停浮层据此刷新读数：
+    /// 不能直接听 StationSnapshot::changed() —— QML Connections 的绑定时机可能早于
+    /// 本类在 setSnapshot() 里建立的连接，从而读到上一帧数据。
+    void stationsApplied();
     void cameraChanged();
     void gcjShiftChanged();
     void colorsChanged();
@@ -131,6 +149,9 @@ private:
     std::vector<StationSnapshot::Entry> stations_;
     /// 纠偏后的坐标（lon, lat），与 stations_ 下标一一对应。
     std::vector<QPointF> positions_;
+    /// 与 positions_ 一一对应的墨卡托投影 Y（固定参考层级 kRefZoom 下的世界像素）。
+    /// 绘制每帧要对全部测站求一次投影，悬停命中也要；缓存在这里，两者都退化成一次乘法。
+    std::vector<double> projYRef_;
     QVariantList niedColors_;
     QVariantList csisColors_;
     QVariantList kmaColors_;
