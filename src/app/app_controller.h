@@ -40,6 +40,7 @@ class HistoryStore;
 class AlertSoundService;
 class AlertAnnouncer;
 class NtpClock;
+class SourceEstimationService;
 
 /// 面向 QML 的应用控制器：汇聚数据源、去重、历史、告警与 1Hz 倒计时。
 class AppController : public QObject {
@@ -95,6 +96,12 @@ class AppController : public QObject {
     Q_PROPERTY(QObject* stationSnapshot READ stationSnapshot CONSTANT)
     /// 逐测站源的实时最大值卡片数据：`[{ id, name, caption, hasData, raw, text, stationCount, frameTime }]`。
     Q_PROPERTY(QVariantList stationSources READ stationSources NOTIFY stationIntensityChanged)
+    /// 本地震源推算（Beta）：只吃实时测站强度场，不产事件、不参与告警。
+    /// `{ state, enabled, visible, latitude, longitude, depthKm, magnitude, family,
+    ///    stationCount, quietStations, uncertaintyKm, confidence, grade, ... }`
+    Q_PROPERTY(QVariantMap sourceEstimateInfo READ sourceEstimateInfo NOTIFY sourceEstimateChanged)
+    /// 地图叠加层载荷；`{ visible, latitude, longitude, uncertaintyKm, family, magnitude, ... }`
+    Q_PROPERTY(QVariantMap sourceEstimateMarker READ sourceEstimateMarker NOTIFY sourceEstimateChanged)
 
 public:
     explicit AppController(QObject* parent = nullptr, bool startServices = true);
@@ -143,6 +150,8 @@ public:
     QVariantMap districtIntensity() const { return districtIntensity_; }
     QObject* stationSnapshot() const { return stationSnapshot_; }
     QVariantList stationSources() const;
+    QVariantMap sourceEstimateInfo() const;
+    QVariantMap sourceEstimateMarker() const;
 
     /// HUD 左右切换：在全部活动事件间循环（按发震时刻倒序，0 为最新）。
     Q_INVOKABLE void hudPrev();
@@ -193,6 +202,7 @@ signals:
     void waveRadiiChanged();
     void districtIntensityChanged();
     void stationIntensityChanged();
+    void sourceEstimateChanged();
     /// 实时 EEW 到达：请求把地图移到该震中。
     void centerMapRequested(double latitude, double longitude);
     /// 取消焦点（再次点击同一事件）：请求把镜头还原到默认视野。
@@ -294,6 +304,8 @@ private:
     PancakesSeisSource* seisSource_ = nullptr;
     /// Wolfx SeisJS 实时测站显示源（非 EEW，不入 sources_ 事件注册表）。
     WolfxSeisSource* wolfxSeisSource_ = nullptr;
+    /// 本地震源推算（Beta）：消费上面五路测站强度，不产事件、不参与告警。
+    SourceEstimationService* sourceEstimation_ = nullptr;
     AlertSoundService* sound_ = nullptr;
     AlertAnnouncer* announcer_ = nullptr;
     /// 网络授时：所有地震时间语义的唯一时间基准。《NATIVE_PORT_SPEC》 §13。

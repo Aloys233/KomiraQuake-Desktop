@@ -66,9 +66,81 @@ class SettingsStore : public QObject {
     /// 关闭主窗口时收进托盘（默认）；关闭时直接退出应用。
     Q_PROPERTY(bool closeToTray READ closeToTray WRITE setCloseToTray NOTIFY changed)
     Q_PROPERTY(bool autoCheckUpdates READ autoCheckUpdates WRITE setAutoCheckUpdates NOTIFY changed)
+    /// 本地震源推算（Beta）：只吃实时测站强度场，不产事件、不参与告警。
+    Q_PROPERTY(bool sourceEstimationEnabled READ sourceEstimationEnabled WRITE setSourceEstimationEnabled NOTIFY changed)
+    /// 触发阈值（同制式强度）：达到它的测站进入正证据，低于它的邻近站作为删失观测。
+    /// 兼容旧键：只有中国区沿用旧 `sourceEstimationTrigger`，其余区域各有独立键。
+    Q_PROPERTY(double sourceEstimationTrigger READ sourceEstimationTrigger WRITE setSourceEstimationTrigger NOTIFY changed)
+    /// 发布门槛：触发测站数低于它时只显示「收集中」，不给震源。最小可设 1 站
+    /// （1–2 站靠未触发站的删失约束定位，见 SourceEstimator::estimate 的说明）。
+    Q_PROPERTY(int sourceEstimationMinStations READ sourceEstimationMinStations WRITE setSourceEstimationMinStations NOTIFY changed)
+    /// 是否用未触发站做负证据（删失观测）。
+    Q_PROPERTY(bool sourceEstimationQuietEvidence READ sourceEstimationQuietEvidence WRITE setSourceEstimationQuietEvidence NOTIFY changed)
+    /// 证据消散后结果在地图上保留的秒数（全局：与区域无关）。
+    Q_PROPERTY(int sourceEstimationHoldSeconds READ sourceEstimationHoldSeconds WRITE setSourceEstimationHoldSeconds NOTIFY changed)
+    /// 触发区合并半径（km）：相距超过它的两片触发区**不会**被拟合成同一个震源。
+    Q_PROPERTY(int sourceEstimationClusterRadius READ sourceEstimationClusterRadius WRITE setSourceEstimationClusterRadius NOTIFY changed)
+    /// 在地图上画出推定震中（十字 + 不确定度圈）。
+    Q_PROPERTY(bool showEstimatedEpicenter READ showEstimatedEpicenter WRITE setShowEstimatedEpicenter NOTIFY changed)
 
 public:
     explicit SettingsStore(QObject* parent = nullptr);
+
+    /// 区域标签（`china` / `japan` / `korea` / `taiwan`）；未知 id 返回 false。
+    Q_INVOKABLE bool hasSourceEstimationRegion(const QString& region) const;
+    /// 区域展示名；未知 id 回退为空串。
+    Q_INVOKABLE QString sourceEstimationRegionLabel(const QString& region) const;
+
+    // 区域参数读写。`region` 为上面的 id；未知 id 时读取返回该字段的全局默认值、
+    // 写入被忽略（避免拼错键悄悄落一条谁都不读的记录）。
+    //
+    // 读取接口在 QML 里必须与同名 Q_PROPERTY 区分开：Qt 不允许一个属性 getter 同时
+    // 作为可调用方法暴露，所以这里用 `...For(region)` 后缀；写入接口没有这个限制。
+
+    /// 该区域的震源推算是否启用。
+    ///
+    /// **默认全部关闭**：未在集合里 = 不参与推算。这与全局总开关的取向一致
+    /// （Beta 能力默认关闭，由用户显式打开），也保证「只开某一片台网」是显式选择：
+    /// 想只看日本 NIED，就只打开 `japan`，其余三区既不记账也不算。
+    ///
+    /// 用「启用集合」而不是「禁用集合」正是因为默认必须是关闭 ——
+    /// 禁用集合会隐含「未列出的默认开启」，与这里要的语义相反。
+    Q_INVOKABLE bool isSourceEstimationRegionEnabled(const QString& region) const;
+    Q_INVOKABLE void setSourceEstimationRegionEnabled(const QString& region, bool enabled);
+    Q_PROPERTY(QStringList enabledSourceEstimationRegions READ enabledSourceEstimationRegions
+                   WRITE setEnabledSourceEstimationRegions NOTIFY changed)
+    /// 与 `enabledSourceEstimationRegions` 同源，但拼成逗号串并带 `sourceEstimationRegions`
+    /// 前缀：QML 里列表属性变化不一定触发所有绑定重算，字符串拼接是可靠的依赖来源。
+    Q_PROPERTY(QString sourceEstimationRegionSignature READ sourceEstimationRegionSignature
+                   NOTIFY changed)
+
+    Q_INVOKABLE double sourceEstimationTriggerFor(const QString& region) const;
+    Q_INVOKABLE void setSourceEstimationTrigger(const QString& region, double v);
+    Q_INVOKABLE int sourceEstimationMinStationsFor(const QString& region) const;
+    Q_INVOKABLE void setSourceEstimationMinStations(const QString& region, int v);
+    Q_INVOKABLE bool sourceEstimationQuietEvidenceFor(const QString& region) const;
+    Q_INVOKABLE void setSourceEstimationQuietEvidence(const QString& region, bool v);
+    Q_INVOKABLE int sourceEstimationClusterRadiusFor(const QString& region) const;
+    Q_INVOKABLE void setSourceEstimationClusterRadius(const QString& region, int v);
+    /// 某区恢复出厂参数（只动该区开关外的参数，不影响其余区域与全局开关）。
+    Q_INVOKABLE void resetSourceEstimationRegion(const QString& region);
+
+    QStringList enabledSourceEstimationRegions() const {
+        return s_.value("enabledSourceEstimationRegions").toStringList();
+    }
+    void setEnabledSourceEstimationRegions(const QStringList& v) {
+        set("enabledSourceEstimationRegions", v);
+    }
+    /// 启用集合的稳定签名（排序后逗号拼接）。QML 用它做依赖，避免直接依赖列表属性。
+    QString sourceEstimationRegionSignature() const {
+        QStringList list = enabledSourceEstimationRegions();
+        list.sort();
+        return list.join(QLatin1Char(','));
+    }
+    /// 是否有任何区域被启用（UI 用它决定是否提示「总开关开了但没选区域」）。
+    Q_INVOKABLE bool hasAnySourceEstimationRegion() const {
+        return !enabledSourceEstimationRegions().isEmpty();
+    }
 
     QString basemapId() const { return s_.value("basemapId", "petal").toString(); }
     void setBasemapId(const QString& v) { set("basemapId", v); }
@@ -251,6 +323,58 @@ public:
     /// 启动时后台自动检查一次新版本。
     bool autoCheckUpdates() const { return s_.value("autoCheckUpdates", true).toBool(); }
     void setAutoCheckUpdates(bool v) { set("autoCheckUpdates", v); }
+
+    /// 本地震源推算（Beta）。**默认关闭**：它是 Beta 能力，解尚未在真实地震上校验过，
+    /// 默认打开会让一张可能不准的推定震中出现在所有人的地图上；由用户显式开启。
+    bool sourceEstimationEnabled() const {
+        return s_.value("sourceEstimationEnabled", false).toBool();
+    }
+    void setSourceEstimationEnabled(bool v) { set("sourceEstimationEnabled", v); }
+
+    /// 触发阈值。默认 3.0：与「有感」量级一致，既不会被常态噪声触发，也能在地震波
+    /// 扫过几站后迅速起算。范围由设置页滑块限制在 1–6。
+    ///
+    /// **按区域取值**：无参版本返回中国区（兼容旧调用），设置页与服务层都走带区域的重载。
+    /// 旧版本只有一组全局键 `sourceEstimation{Trigger,MinStations,QuietEvidence,ClusterRadius}`；
+    /// 迁移规则见 `.cpp` 里的 `migrateLegacyGlobal`（一次性把旧值抄进中国区，然后删旧键）。
+    double sourceEstimationTrigger() const { return sourceEstimationTriggerFor(QStringLiteral("china")); }
+    void setSourceEstimationTrigger(double v) { setSourceEstimationTrigger(QStringLiteral("china"), v); }
+
+    /// 发布门槛（触发站数）。默认 6（中国区）：少于这个数时解的空间自由度太大，宁可等待。
+    int sourceEstimationMinStations() const {
+        return sourceEstimationMinStationsFor(QStringLiteral("china"));
+    }
+    void setSourceEstimationMinStations(int v) {
+        setSourceEstimationMinStations(QStringLiteral("china"), v);
+    }
+
+    /// 未触发站负证据。默认开启：没有它，触发的测站只覆盖震中一侧时解会系统性偏移。
+    bool sourceEstimationQuietEvidence() const {
+        return sourceEstimationQuietEvidenceFor(QStringLiteral("china"));
+    }
+    void setSourceEstimationQuietEvidence(bool v) {
+        setSourceEstimationQuietEvidence(QStringLiteral("china"), v);
+    }
+
+    /// 结果保持时长（秒）。默认 60：证据消散后留一段时间供用户查看。**全局**。
+    int sourceEstimationHoldSeconds() const {
+        return s_.value("sourceEstimationHoldSeconds", 60).toInt();
+    }
+    void setSourceEstimationHoldSeconds(int v) { set("sourceEstimationHoldSeconds", v); }
+
+    /// 触发区合并半径（km）。默认随区域：中国 250 / 日本 200 / 韩国 200 / 台湾 250。
+    int sourceEstimationClusterRadius() const {
+        return sourceEstimationClusterRadiusFor(QStringLiteral("china"));
+    }
+    void setSourceEstimationClusterRadius(int v) {
+        setSourceEstimationClusterRadius(QStringLiteral("china"), v);
+    }
+
+    /// 地图上画推定震中。默认开启（与推算总开关联动，总开关关闭时一并隐藏）。
+    bool showEstimatedEpicenter() const {
+        return s_.value("showEstimatedEpicenter", true).toBool();
+    }
+    void setShowEstimatedEpicenter(bool v) { set("showEstimatedEpicenter", v); }
 
     Q_INVOKABLE void resetToDefaults();
 

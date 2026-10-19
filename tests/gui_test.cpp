@@ -13,6 +13,8 @@
 #include <functional>
 #include <cmath>
 #include "core/intensity_calculator.h"
+#include "core/quake_calculator.h"
+#include "core/source_estimator.h"
 #include "core/warning_session.h"
 #include "prefs/settings_store.h"
 #include "theme/native_ui.h"
@@ -26,6 +28,7 @@
 #include "store/history_store.h"
 #define private public
 #include "app/app_controller.h"
+#include "service/source_estimation_service.h"
 #include "service/alert_announcer.h"
 #include "service/tray_controller.h"
 #undef private
@@ -45,6 +48,18 @@ static QQuickItem* findVisualItem(QQuickWindow* window, const QString& name) {
     for (auto* item : visualItems(window->contentItem()))
         if (item->objectName() == name) return item;
     return nullptr;
+}
+
+// 按 objectName 点击可见控件（命中判定与用户视角一致：滚动裁剪之外的点不点）。
+static bool clickByName(QQuickWindow* window, const QString& name) {
+    auto* item = findVisualItem(window, name);
+    if (!item || !item->isVisible() || !item->isEnabled()) return false;
+    if (item->metaObject()->indexOfSignal("clicked()") < 0) return false;
+    const QPointF point = item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
+    const QRectF bounds(0, 0, window->width(), window->height());
+    if (!bounds.contains(point)) return false;
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, point.toPoint());
+    return true;
 }
 
 // 发震时刻必须写全：Text 被 elide 时 contentWidth 会小于 implicitWidth。
@@ -216,8 +231,10 @@ private slots:
         // 预警卡按钮：悬停、焦点与禁用态的前景/底色都必须可区分。
         // 必须筛出真正的控件，Text 子项同样有 text 但没有 hovered。
         QQuickItem* alertButton = nullptr;
+        // 卡片收窄后按钮文字压成「停止」，完整措辞放在 accessibleName（同 clickText 的匹配口径）。
         for (auto* item : warningHud->findChildren<QQuickItem*>())
-            if (item->property("text").toString() == "停止本次提醒" && item->property("hovered").isValid()) alertButton = item;
+            if (item->property("accessibleName").toString() == "停止本次提醒"
+                && item->property("hovered").isValid()) alertButton = item;
         QVERIFY(alertButton);
         window->requestActivate();
         for (bool dark : {false, true}) {
@@ -412,7 +429,7 @@ private slots:
         QVERIFY(screenshot("10-settings-narrow"));
         auto* settingsPage = window->findChild<QQuickItem*>("settingsPage");
         QVERIFY(settingsPage);
-        for (int section = 0; section < 8; ++section) {
+        for (int section = 0; section < 9; ++section) {
             settingsPage->setProperty("currentSection", section);
             QTest::qWait(30);
             for (auto* item : visualItems(settingsPage)) {
@@ -1472,6 +1489,356 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!tooltip->isVisible(), 500);
     }
 
+    /// 本地震源推算（Beta）的可见性契约：
+    /// - 卡片独占一张、挂在左列 HUD 之下（不与预警卡/测站卡共用）；
+    /// - 倒计时卡在主 HUD **右侧**，且比主 HUD 窄（用户明确要求「弄小点」）；
+    /// - 地图上的推定震中只在有解且开关打开时出现；
+    /// - 关闭总开关后卡片与标记一起消失。
+    void sourceEstimateCardLayoutAndMarker() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("SourceEstimateLayoutTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+        // 震源推算默认关闭（Beta），本用例专门验证它，显式打开。
+        // 逐区域开关同样默认关闭：本用例要验证「中国 + 日本同屏」，两个区都打开。
+        controller.settings()->setSourceEstimationEnabled(true);
+        controller.settings()->setSourceEstimationRegionEnabled("china", true);
+        controller.settings()->setSourceEstimationRegionEnabled("japan", true);
+        controller.setManualLocation(35.0, 139.0, "测试定位");
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        const QString evidence = evidenceDirectory(window);
+        auto screenshot = [&](const QString& name) {
+            QTest::qWait(150);
+            return window->grabWindow().save(evidence + "/" + name + ".png");
+        };
+
+        // 1. 无解时卡片完全不占位（否则地图上会凭空多一块空白玻璃）。
+        auto* card = window->findChild<QQuickItem*>("sourceEstimateCard");
+        auto* hud = window->findChild<QQuickItem*>("hudCard");
+        auto* warningHud = window->findChild<QQuickItem*>("warningHud");
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(card && hud && warningHud && map);
+        // 1b. 默认关闭：设置项默认 false，关闭时即使有解也不显示。
+        QVERIFY(controller.settings()->sourceEstimationEnabled());
+
+        // 2. 注入一条达到门槛的预警：倒计时卡必须出现在主 HUD 右侧且更窄。
+        EarthquakeEvent alert;
+        alert.id = alert.eventId = "EST-LAYOUT";
+        alert.sourceProvider = "Wolfx"; alert.sourceAgency = "CENC"; alert.source = "四川地震预警";
+        alert.timestamp = now; alert.latitude = 35.6; alert.longitude = 139.4;
+        alert.depth = 10.0; alert.magnitude = 6.0; alert.location = "测试震中";
+        alert.rawIntensity = 4.0;
+        controller.handleEvent(alert, false, false);
+        QTRY_VERIFY(hud->isVisible());
+        QTRY_VERIFY(warningHud->isVisible());
+        QVERIFY2(warningHud->x() >= hud->x() + hud->width() - 0.5,
+                 qPrintable(QStringLiteral("倒计时卡应在主 HUD 右侧: hud 右缘 %1, 倒计时左缘 %2")
+                                .arg(hud->x() + hud->width()).arg(warningHud->x())));
+        QVERIFY2(warningHud->width() < hud->width(),
+                 qPrintable(QStringLiteral("倒计时卡应比主 HUD 窄: %1 vs %2")
+                                .arg(warningHud->width()).arg(hud->width())));
+        QVERIFY(std::abs(warningHud->y() - hud->y()) < 1.0);   // 与 HUD 顶对齐
+        QVERIFY(screenshot("40-countdown-beside-hud"));
+
+        // 2b. 窄窗口放不下右侧位时退回 HUD 下方，且不得超出窗口右缘（宁可换位也不裁切）。
+        window->resize(520, 760);
+        QTest::qWait(200);
+        QTRY_VERIFY2(!window->property("countdownBesideHud").toBool(), "窄窗口应退回左列");
+        QTRY_VERIFY(std::abs(warningHud->x() - hud->x()) < 1.0);
+        QVERIFY(warningHud->y() >= hud->y() + hud->height() - 0.5);
+        QVERIFY(warningHud->x() + warningHud->width() <= window->width() - 8);
+        QVERIFY(screenshot("44-countdown-narrow-fallback"));
+        window->resize(1280, 800);
+        QTest::qWait(200);
+        QTRY_VERIFY(window->property("countdownBesideHud").toBool());
+
+        // 3. 投喂一帧合成强度场：卡片出现在左列 HUD 之下，地图出现推定震中。
+        std::vector<StationSnapshot::Entry> frame;
+        std::vector<StationSnapshot::StationMeta> metas;
+        for (double lat = 28.4; lat <= 31.6 + 1e-9; lat += 0.2) {
+            for (double lon = 102.4; lon <= 105.6 + 1e-9; lon += 0.2) {
+                StationSnapshot::Entry e;
+                e.lat = lat;
+                e.lon = lon;
+                e.csis = true;
+                e.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Csis, 5.8,
+                    QuakeCalculator::haversineDistance(30.0, 104.0, lat, lon), 10.0);
+                e.meta = static_cast<int>(frame.size());
+                frame.push_back(e);
+                StationSnapshot::StationMeta m;
+                m.source = QStringLiteral("PancakesSeis");
+                metas.push_back(m);
+            }
+        }
+        controller.stationSnapshot_->setEntries(frame, metas);
+        controller.sourceEstimation_->ingestObservations(frame);
+        controller.sourceEstimation_->runEstimation();
+        QTRY_VERIFY_WITH_TIMEOUT(controller.sourceEstimation_->regionState(SourceRegion::China).estimate.valid, 5000);
+        if (controller.sourceEstimation_->watcher_.isRunning())
+            controller.sourceEstimation_->watcher_.waitForFinished();
+        QCoreApplication::processEvents();
+        QTRY_VERIFY(card->isVisible());
+        QVERIFY2(card->y() >= hud->y() + hud->height() - 0.5,
+                 "震源推算卡必须挂在主 HUD 之下");
+        QVERIFY2(std::abs(card->x() - hud->x()) < 1.0, "震源推算卡与 HUD 左对齐");
+        QVERIFY2(std::abs(card->width() - hud->width()) < 1.0, "震源推算卡与 HUD 同宽");
+        // 与倒计时卡不得重叠。倒计时卡贴在主 HUD 右侧、通常比 HUD 高，所以它不会压到
+        // 下方的推算卡；两个方向都判一次，将来换布局也不会漏。
+        {
+            const QRectF cardRect(card->x(), card->y(), card->width(), card->height());
+            const QRectF countdownRect(warningHud->x(), warningHud->y(),
+                                       warningHud->width(), warningHud->height());
+            QVERIFY2(!cardRect.intersects(countdownRect),
+                     qPrintable(QStringLiteral("震源推算卡与倒计时卡重叠: 卡 %1,%2 %3x%4 / 倒计时 %5,%6 %7x%8")
+                                    .arg(cardRect.x()).arg(cardRect.y())
+                                    .arg(cardRect.width()).arg(cardRect.height())
+                                    .arg(countdownRect.x()).arg(countdownRect.y())
+                                    .arg(countdownRect.width()).arg(countdownRect.height())));
+        }
+        auto* marker = window->findChild<QQuickItem*>("sourceEstimateMarker");
+        QVERIFY(marker);
+        QVERIFY(marker->isVisible());
+        // 卡片内容契约（改版后与普通地震 HUD 同构）：
+        //   · 大号标题是震源区名（参考实现 getFEName 的 1° 网格：四川 → 「中国四川附近」）；
+        //   · 顶行右侧是「第 N 报」，首报为 1；
+        //   · 右下角写「精度 S/A/B/C/D」（取代普通 HUD 的数据源标注）；
+        //   · 原来的收集提示、置信度百分比、±km、脚注一律不再出现。
+        QTest::qWait(120);
+        auto textOf = [&](const QString& name) -> QString {
+            auto* item = window->findChild<QQuickItem*>(name);
+            return item ? item->property("text").toString() : QString();
+        };
+        QCOMPARE(textOf("sourceEstimateLocation"), QStringLiteral("中国四川附近"));
+        QCOMPARE(textOf("sourceEstimateReportNum"), QStringLiteral("第 1 报"));
+        QVERIFY2(textOf("sourceEstimatePrecision").startsWith(QStringLiteral("精度 ")),
+                 qPrintable(QStringLiteral("右下角精度文案异常: %1")
+                                .arg(textOf("sourceEstimatePrecision"))));
+        QVERIFY2(textOf("sourceEstimateMagnitude").startsWith(QStringLiteral("M ")),
+                 qPrintable(QStringLiteral("震级/深度行异常: %1")
+                                .arg(textOf("sourceEstimateMagnitude"))));
+        // 反推的发震时刻必须写成完整时刻（与普通 HUD 同格式），不能只有 HH:mm:ss。
+        QVERIFY2(textOf("sourceEstimateOrigin").contains(QStringLiteral("UTC+8"))
+                     && textOf("sourceEstimateOrigin").length() >= 19,
+                 qPrintable(QStringLiteral("推算卡发震时刻不完整: %1")
+                                .arg(textOf("sourceEstimateOrigin"))));
+        {
+            QString offender;
+            QVERIFY2(timesFullyShown(card, &offender),
+                     qPrintable("推算卡发震时刻被截断: " + offender));
+        }
+        // 原有提示必须全部消失：遍历卡片下所有文本，不允许出现这些措辞。
+        {
+            const QStringList banned = {
+                QStringLiteral("站已触发"), QStringLiteral("正在反推震源"),
+                QStringLiteral("负证据"), QStringLiteral("合并半径"),
+                QStringLiteral("单站粗解"), QStringLiteral("置信度"),
+                QStringLiteral("另有"), QStringLiteral("s 前更新"),
+            };
+            for (auto* item : visualItems(card)) {
+                const QString text = item->property("text").toString();
+                if (text.isEmpty()) continue;
+                for (const QString& word : banned) {
+                    QVERIFY2(!text.contains(word),
+                             qPrintable(QStringLiteral("推算卡仍残留旧提示「%1」: %2")
+                                            .arg(word, text)));
+                }
+                QVERIFY2(!text.contains(QChar(0x00B1)),   // ±
+                         qPrintable(QStringLiteral("推算卡仍显示不确定度: ") + text));
+                QVERIFY2(!text.contains(QLatin1Char('%')),
+                         qPrintable(QStringLiteral("推算卡仍显示置信度百分比: ") + text));
+            }
+        }
+        // 只有中国区出解时没有分页器（分页是为多区域准备的）。
+        {
+            auto* pager = findVisualItem(window, "sourceEstimatePager");
+            QVERIFY2(pager, "缺少推算卡分页器（多区域时用它翻页）");
+            QVERIFY2(!pager->isVisible(), "只有一区出解时不应显示分页器");
+        }
+        // 另外三个区域的标记必须存在、但此刻没有解 → 不显示（逐区一个标记，互不覆盖）。
+        for (const QString& regionId :
+             {QStringLiteral("japan"), QStringLiteral("korea"), QStringLiteral("taiwan")}) {
+            auto* other = window->findChild<QQuickItem*>("sourceEstimateMarker-" + regionId);
+            QVERIFY2(other, qPrintable(QStringLiteral("缺少区域标记: ") + regionId));
+            QVERIFY(!other->isVisible());
+        }
+        // 再投喂一片日本台网（JMA）：中国区的解必须保留，日本区另外多出一个标记。
+        {
+            std::vector<StationSnapshot::Entry> japanFrame;
+            for (double lat = 34.9; lat <= 36.5 + 1e-9; lat += 0.2) {
+                for (double lon = 138.9; lon <= 140.5 + 1e-9; lon += 0.2) {
+                    StationSnapshot::Entry e;
+                    e.lat = lat;
+                    e.lon = lon;
+                    e.raw = SourceEstimator::predictedIntensity(
+                        IntensityFamily::Jma, 6.6,
+                        QuakeCalculator::haversineDistance(35.7, 139.7, lat, lon), 10.0);
+                    japanFrame.push_back(e);
+                }
+            }
+            std::vector<StationSnapshot::Entry> merged = frame;
+            merged.insert(merged.end(), japanFrame.begin(), japanFrame.end());
+            // 起算有 1.2 s 的最小间隔：时钟是注入的常量，必须手动往前拨，否则会被节流掉。
+            now += 3000;
+            controller.sourceEstimation_->ingestObservations(merged);
+            controller.sourceEstimation_->runEstimation();
+            QTRY_VERIFY_WITH_TIMEOUT(
+                controller.sourceEstimation_->regionState(SourceRegion::Japan).estimate.valid,
+                5000);
+            if (controller.sourceEstimation_->watcher_.isRunning())
+                controller.sourceEstimation_->watcher_.waitForFinished();
+            QCoreApplication::processEvents();
+        }
+        auto* japanMarker = window->findChild<QQuickItem*>("sourceEstimateMarker-japan");
+        QVERIFY(japanMarker);
+        QTRY_VERIFY(japanMarker->isVisible());
+        // 日本区走到时反演：载荷必须带出 P/S 相位数与到时残差（卡片不再显示它们，
+        // 但服务契约保留，供将来诊断面板使用）。
+        {
+            const QVariantList regions =
+                controller.sourceEstimateInfo().value("regions").toList();
+            QCOMPARE(regions.size(), 4);
+            const QVariantMap japanRow = regions[1].toMap();
+            QCOMPARE(japanRow.value("id").toString(), QStringLiteral("japan"));
+            QCOMPARE(japanRow.value("usesArrivalTimes").toBool(), true);
+            QVERIFY(!japanRow.value("originUtc8").toString().isEmpty());
+            QVERIFY(japanRow.value("pPhases").toInt() > 0);
+            QVERIFY(std::abs(japanRow.value("arrivalRmsSeconds").toDouble()) < 6.0);
+            // 两区同时有解后卡片出现分页器，一区一页。
+            QCOMPARE(japanRow.value("location").toString(),
+                     QStringLiteral("日本本州南岸近海附近"));
+        }
+        {
+            auto* pager = findVisualItem(window, "sourceEstimatePager");
+            QVERIFY(pager);
+            QTRY_VERIFY(pager->isVisible());
+            auto* pagerText = findVisualItem(window, "sourceEstimatePagerText");
+            QVERIFY(pagerText);
+            QCOMPARE(pagerText->property("text").toString(), QStringLiteral("1 / 2"));
+            // 翻页：按钮点击后页码与卡片内容一起换（一区一页，不堆叠）。
+            QVERIFY(clickByName(window, "sourceEstimateNextPage"));
+            QTRY_COMPARE(pagerText->property("text").toString(), QStringLiteral("2 / 2"));
+            QTRY_COMPARE(textOf("sourceEstimateLocation"),
+                         QStringLiteral("日本本州南岸近海附近"));
+            QVERIFY(screenshot("41b-source-estimate-japan-page"));
+            QVERIFY(clickByName(window, "sourceEstimatePrevPage"));
+            QTRY_COMPARE(pagerText->property("text").toString(), QStringLiteral("1 / 2"));
+            QTRY_COMPARE(textOf("sourceEstimateLocation"), QStringLiteral("中国四川附近"));
+            // 载荷每秒刷新（tick → publish）时**不能把用户翻到的页顶回去**：
+            // 区域集合没变就不该重排分页，否则刚翻到的日本区下一秒就跳回第 1 页。
+            QVERIFY(clickByName(window, "sourceEstimateNextPage"));
+            QTRY_COMPARE(pagerText->property("text").toString(), QStringLiteral("2 / 2"));
+            now += 2000;
+            controller.sourceEstimation_->tick();
+            QCoreApplication::processEvents();
+            QTest::qWait(120);
+            QCOMPARE(pagerText->property("text").toString(), QStringLiteral("2 / 2"));
+            QCOMPARE(textOf("sourceEstimateLocation"),
+                     QStringLiteral("日本本州南岸近海附近"));
+            QVERIFY(clickByName(window, "sourceEstimatePrevPage"));
+            QTRY_COMPARE(pagerText->property("text").toString(), QStringLiteral("1 / 2"));
+        }
+        QVERIFY2(marker->isVisible(), "中国区的标记不能因为日本区出解而消失");
+        QVERIFY(!window->findChild<QQuickItem*>("sourceEstimateMarker-korea")->isVisible());
+        QVERIFY(screenshot("41-source-estimate"));
+        // 深色主题下的对比度自查（浅色取证已覆盖默认态）。
+        controller.settings()->setThemeMode("dark");
+        QTest::qWait(120);
+        QVERIFY(screenshot("45-source-estimate-dark"));
+        controller.settings()->setThemeMode("system");
+        QTest::qWait(80);
+
+        // 4. 地图标记受独立显示开关控制；推算卡本身不受影响（两个区域的标记一起藏）。
+        controller.settings()->setShowEstimatedEpicenter(false);
+        QTRY_VERIFY(!marker->isVisible());
+        QTRY_VERIFY(!japanMarker->isVisible());
+        QVERIFY(card->isVisible());
+        controller.settings()->setShowEstimatedEpicenter(true);
+        QTRY_VERIFY(marker->isVisible());
+        QTRY_VERIFY(japanMarker->isVisible());
+
+        // 5. 关闭总开关：卡片与所有区域的标记一起消失（服务清空 + 卡片收进估算门控）。
+        controller.settings()->setSourceEstimationEnabled(false);
+        QTRY_VERIFY(!card->isVisible());
+        QTRY_VERIFY(!marker->isVisible());
+        QTRY_VERIFY(!japanMarker->isVisible());
+        QVERIFY(screenshot("42-source-estimate-disabled"));
+
+        // 5b. 默认关闭是产品契约：恢复默认后总开关必须回到 false。
+        controller.settings()->resetToDefaults();
+        QVERIFY(!controller.settings()->sourceEstimationEnabled());
+
+        // 6. 设置页新增的「震源推算」分区可导航、控件可点击并即时落盘。
+        //    此时总开关是默认的「关」，正好从关到开点一次。
+        window->setProperty("showSettings", true);
+        QTRY_VERIFY(window->findChild<QQuickItem*>("settingsPage"));
+        QVERIFY(clickByName(window, "settingsNav-sourceEstimation"));
+        auto* page = window->findChild<QQuickItem*>("settingsPage");
+        QTRY_COMPARE(page->property("currentSection").toInt(), 5);
+        auto* panel = window->findChild<QQuickItem*>("settingsPanel-sourceEstimation");
+        QVERIFY(panel && panel->isVisible());
+        auto* toggle = window->findChild<QQuickItem*>("sourceEstimationSwitch");
+        QVERIFY(toggle);
+        QVERIFY(clickByName(window, "sourceEstimationSwitch"));
+        QTRY_VERIFY(controller.settings()->sourceEstimationEnabled());
+        QVERIFY(clickByName(window, "showEstimatedEpicenterSwitch"));
+        QTRY_VERIFY(!controller.settings()->showEstimatedEpicenter());
+
+        // 逐区域开关：默认全关。中国区卡在视口内，用真实鼠标点击验证一次
+        // 「点开关 → 只开该区，不连带其他三区」；日本区在视口外，只验证反向绑定
+        // （设置变化 → 开关 checked 跟着变），避免在测试里模拟滚动到屏幕外的控件。
+        QVERIFY(!controller.settings()->isSourceEstimationRegionEnabled("china"));
+        QVERIFY(clickByName(window, "chinaRegionSwitch"));
+        QTRY_VERIFY(controller.settings()->isSourceEstimationRegionEnabled("china"));
+        QVERIFY(!controller.settings()->isSourceEstimationRegionEnabled("japan"));
+        QVERIFY(!controller.settings()->isSourceEstimationRegionEnabled("korea"));
+        QVERIFY(!controller.settings()->isSourceEstimationRegionEnabled("taiwan"));
+        QCOMPARE(controller.settings()->enabledSourceEstimationRegions(),
+                 QStringList{"china"});
+        {
+            // 反向绑定：设置变化必须让开关跟着动（这正是之前 `checked:` 字面绑定的 bug：
+            // 点过一次后绑定被断开，UI 与真实状态脱节）。
+            auto* chinaSwitch = findVisualItem(window, "chinaRegionSwitch");
+            QVERIFY(chinaSwitch);
+            QVERIFY(chinaSwitch->property("checked").toBool());
+            controller.settings()->setSourceEstimationRegionEnabled("china", false);
+            QTRY_VERIFY(!chinaSwitch->property("checked").toBool());
+            controller.settings()->setSourceEstimationRegionEnabled("china", true);
+            QTRY_VERIFY(chinaSwitch->property("checked").toBool());
+            controller.settings()->setSourceEstimationRegionEnabled("china", false);
+            QTRY_VERIFY(!chinaSwitch->property("checked").toBool());
+        }
+        QVERIFY(screenshot("43-settings-source-estimation"));
+        // 「触发区合并距离」在分区下半部：滚到它再取一张图，确认控件本身渲染正常。
+        {
+            auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
+            QVERIFY(scroll);
+            scroll->setProperty("contentY", 420);
+            QTest::qWait(120);
+            QVERIFY(screenshot("43b-settings-cluster-radius"));
+            scroll->setProperty("contentY", 0);
+        }
+        controller.settings()->resetToDefaults();
+        QVERIFY(!controller.settings()->sourceEstimationEnabled());
+        QVERIFY(controller.settings()->showEstimatedEpicenter());
+    }
+
     /// 回归：CSIS/KMA 方标里的烈度数字必须画在**视觉中心**。
     ///
     /// 旧实现用 `drawText(rect, Qt::AlignCenter)`，居中的是字体行盒（ascent + descent）；
@@ -1807,7 +2174,8 @@ private slots:
         QCOMPARE(background->property("color").value<QColor>(), lightBackground);
         QVERIFY(capture("settings-selected-light"));
 
-        const QStringList categories = {"warning", "audio", "map", "appearance", "location", "source", "clock", "about"};
+        const QStringList categories = {"warning", "audio", "map", "appearance", "location",
+                                       "sourceEstimation", "source", "clock", "about"};
         for (int index = 0; index < categories.size(); ++index) {
             QVERIFY(click("settingsNav-" + categories[index]));
             QTRY_COMPARE(page->property("currentSection").toInt(), index);
@@ -2037,8 +2405,8 @@ private slots:
         QVERIFY(click("announceCountdownSwitch"));
         QTRY_VERIFY(!controller.settings()->announceCountdown());
 
-        // 关闭到托盘
-        page->setProperty("currentSection", 7);
+        // 关闭到托盘（「启动与更新」分区，索引 8）
+        page->setProperty("currentSection", 8);
         QTest::qWait(60);
         QVERIFY(click("closeToTraySwitch"));
         QTRY_VERIFY(!controller.settings()->closeToTray());

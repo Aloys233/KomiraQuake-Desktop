@@ -44,12 +44,16 @@
 #include "source/whews_parser.h"
 #include "source/whews_protocol.h"
 #include "source/wolfx_seis_parser.h"
+#include "core/quake_calculator.h"
+#include "core/region_names.h"
+#include "core/source_estimator.h"
 #include "store/history_store.h"
 
 // No production clock/network seam exists for message injection. Restrict access
 // widening to these headers; all of their Qt/STL dependencies are included above.
 // 合成一段而非多段：moc 处理本文件时也会看到这些宏，分段会让 vtable 声明失配。
 #define private public
+#include "service/source_estimation_service.h"
 #include "source/wolfx_source.h"
 #include "source/pancakes_seis_source.h"
 #include "source/whews_source.h"
@@ -105,6 +109,11 @@ private slots:
         QVERIFY2(!asset.isEmpty(), "The real travel asset must be available; do not silently use fallback speeds");
         QVERIFY(TravelTimeService::instance().loadFromFile(asset));
         QVERIFY(TravelTimeService::instance().isLoaded());
+        // 震中地名表：卡片的大号标题走它（参考实现 `getFEName` 的 1° 网格）。
+        // 缺失不是致命错误（卡片会退回坐标文本），但测试必须跑在真实资产上。
+        const QString regionNames = QFINDTESTDATA("../assets/region_names.bin");
+        QVERIFY2(!regionNames.isEmpty(), "The real region-name asset must be available");
+        QVERIFY(RegionNameTable::instance().loadFromFile(regionNames.toStdString()));
     }
 
     // NIED Kmoni 测站通道：首包台站表 + 增量震度数组解析，及连续震度->JMA 震度阶文本。
@@ -763,6 +772,493 @@ private slots:
         QCOMPARE(session.tick(origin + 1800000).size(), size_t(1));
     }
 
+    // 本地震源推算服务：投喂一帧合成强度场，必须产出可展示的解，并在关闭开关后清空。
+    // 这里检验的是"服务层的簿记与门控"，算法本身的精度由 core_engine_test 覆盖。
+    void sourceEstimationServicePublishesAndClears() {
+        QSettings().clear();
+        SettingsStore settings;
+        settings.setSourceEstimationEnabled(true);
+        // 逐区开关默认关闭：本用例只验中国区，显式打开它。
+        settings.setSourceEstimationRegionEnabled("china", true);
+        settings.setSourceEstimationMinStations(6);
+        settings.setSourceEstimationTrigger(3.0);
+
+        SourceEstimationService service(&settings);
+        long long now = origin;
+        service.setNowProvider([&] { return now; });
+        // 关掉自动 tick，让测试手动驱动，避免定时器与断言竞争。
+        service.ticker_.stop();
+
+        // 合成一场 M5.8 / 深度 10 km 的 CSIS 强度场（中国区）：0.2° 网格覆盖 ±1.6°。
+        // 位置用四川而不是东京：CSIS 台网在中国，区域归派按制式 + 坐标判定，
+        // 把 CSIS 场画在东京会被判成区域外的坏坐标（见 core 的 sourceRegionForStation）。
+        std::vector<StationSnapshot::Entry> frame;
+        for (double lat = 28.4; lat <= 31.6 + 1e-9; lat += 0.2) {
+            for (double lon = 102.4; lon <= 105.6 + 1e-9; lon += 0.2) {
+                StationSnapshot::Entry e;
+                e.lat = lat;
+                e.lon = lon;
+                e.csis = true;
+                e.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Csis, 5.8,
+                    QuakeCalculator::haversineDistance(30.0, 104.0, lat, lon), 10.0);
+                frame.push_back(e);
+            }
+        }
+        service.ingestObservations(frame);
+        QVERIFY(service.regionState(SourceRegion::China).triggeredCount >= 6);
+        QCOMPARE(service.marker().value("visible").toBool(), false);   // 还没算
+        service.runEstimation();
+        QVERIFY(service.watcher_.isRunning() || service.regionState(SourceRegion::China).estimate.valid);
+        QTRY_VERIFY_WITH_TIMEOUT(service.regionState(SourceRegion::China).estimate.valid, 5000);
+        if (service.watcher_.isRunning()) service.watcher_.waitForFinished();
+        // waitForFinished 已触发 finished，但需要让直连槽跑完。
+        QCoreApplication::processEvents();
+
+        const QVariantMap info = service.info();
+        QCOMPARE(info.value("state").toString(), QStringLiteral("ready"));
+        QCOMPARE(info.value("visible").toBool(), true);
+        QVERIFY(std::abs(info.value("latitude").toDouble() - 30.0) < 0.3);
+        QVERIFY(std::abs(info.value("longitude").toDouble() - 104.0) < 0.3);
+        QCOMPARE(info.value("id").toString(), QStringLiteral("china"));
+        QVERIFY(std::abs(info.value("magnitude").toDouble() - 5.8) < 0.6);
+        QVERIFY(info.value("stationCount").toInt() > 20);
+        QVERIFY(!info.value("grade").toString().isEmpty());
+        QVERIFY(info.value("confidence").toDouble() > 0.5);
+        QCOMPARE(info.value("family").toString(), QStringLiteral("csis"));
+        QVERIFY(service.marker().value("visible").toBool());
+
+        // 卡片改版（对齐普通地震 HUD）所需的三个量必须在载荷里：
+        // ① 地名走参考实现 `getFEName` 的 1° 网格（四川 → 「中国四川附近」）；
+        // ② 第几报：首报必须是 1；
+        // ③ 发震时刻：强度路径没有到时解，用「首触发 − P 走时」反推，必须落在发震时刻
+        //    之前一点点（阈值爬升 + 最近站 P 走时），且不能晚于注入的 `origin`。
+        QCOMPARE(info.value("location").toString(), QStringLiteral("中国四川附近"));
+        QCOMPARE(info.value("reportNum").toInt(), 1);
+        QCOMPARE(info.value("precision").toString(), info.value("grade").toString());
+        QCOMPARE(info.value("precisionText").toString(),
+                 QStringLiteral("精度 ") + info.value("grade").toString());
+        const long long derivedOrigin = info.value("originEpochMs").toLongLong();
+        QVERIFY2(derivedOrigin > 0, "强度路径也必须给出反推的发震时刻");
+        QVERIFY2(derivedOrigin <= origin,
+                 qPrintable(QStringLiteral("反推发震时刻不能晚于首次越阈时刻: %1 > %2")
+                                .arg(derivedOrigin).arg(origin)));
+        QVERIFY2(origin - derivedOrigin < 60'000,
+                 qPrintable(QStringLiteral("反推发震时刻偏差过大: %1 ms").arg(origin - derivedOrigin)));
+        QVERIFY(info.value("originText").toString().contains("UTC") == false);
+        QCOMPARE(info.value("originText").toString().size(), 19);   // yyyy-MM-dd HH:mm:ss
+
+        // 解没变时重算不得把报次顶上去（1 Hz 重算的常态，必须仍是第 1 报）。
+        service.runEstimation();
+        if (service.watcher_.isRunning()) service.watcher_.waitForFinished();
+        QCoreApplication::processEvents();
+        QCOMPARE(service.info().value("reportNum").toInt(), 1);
+        // 报次跟着「解变了」走：时钟推进让触发簿记重算不出新解时仍为 1，
+        // 换一帧更强/更弱的场（震级变 0.3）后必须变成第 2 报。
+        {
+            std::vector<StationSnapshot::Entry> shifted = frame;
+            for (StationSnapshot::Entry& e : shifted) {
+                e.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Csis, 6.2,
+                    QuakeCalculator::haversineDistance(30.0, 104.0, e.lat, e.lon), 10.0);
+            }
+            now += 5000;
+            service.ingestObservations(shifted);
+            service.runEstimation();
+            QTRY_VERIFY_WITH_TIMEOUT(service.regionState(SourceRegion::China).estimate.valid, 5000);
+            if (service.watcher_.isRunning()) service.watcher_.waitForFinished();
+            QCoreApplication::processEvents();
+            QVERIFY2(service.info().value("reportNum").toInt() >= 2,
+                     qPrintable(QStringLiteral("解显著变化后报次未增加: %1")
+                                    .arg(service.info().value("reportNum").toInt())));
+        }
+
+        // 地图标记的显示开关在 Controller 层裁决（服务只给几何），这里只校验服务侧开关联动。
+
+        // 保持窗口到期后必须清空：证据没了还挂着旧震中是最坏的一种"看起来还行"。
+        now += 1000LL * (settings.sourceEstimationHoldSeconds() + 30);
+        service.tick();
+        QVERIFY(!service.regionState(SourceRegion::China).estimate.valid);
+        QCOMPARE(service.info().value("state").toString(), QStringLiteral("expired"));
+        QCOMPARE(service.marker().value("visible").toBool(), false);
+
+        // 关闭总开关：立即清空，且不再消耗新的观测。
+        service.ingestObservations(frame);
+        service.runEstimation();
+        QTRY_VERIFY_WITH_TIMEOUT(service.regionState(SourceRegion::China).estimate.valid, 5000);
+        if (service.watcher_.isRunning()) service.watcher_.waitForFinished();
+        QCoreApplication::processEvents();
+        settings.setSourceEstimationEnabled(false);
+        service.reloadSettings();
+        QVERIFY(!service.regionState(SourceRegion::China).estimate.valid);
+        QCOMPARE(service.info().value("state").toString(), QStringLiteral("disabled"));
+        QCOMPARE(service.info().value("visible").toBool(), false);
+
+        // 阈值升高后同一帧不再触发足够多的站。
+        settings.setSourceEstimationEnabled(true);
+        settings.setSourceEstimationTrigger(6.5);
+        settings.setSourceEstimationMinStations(30);
+        service.reloadSettings();
+        service.ingestObservations(frame);
+        QVERIFY(service.regionState(SourceRegion::China).triggeredCount < 30);
+        service.tick();
+        QVERIFY(!service.regionState(SourceRegion::China).estimate.valid);
+    }
+
+    /// 区域拆分：四个区域各自一套参数、各自出解，互不覆盖。
+    /// 这里检验的是服务层的分桶与发布，算法精度仍由 core_engine_test 覆盖。
+    /// 日本区走**到时反演**：首次越阈时刻当作 P 波到时，用 JMA2001 走时表反解发震时刻。
+    ///
+    /// 这条用例覆盖三件强度场做不到的事：① 给出**发震时刻**；② 把深度从「不可辨识」
+    /// 变成可辨识（离散候选里唯一可选的档位）；③ 时钟整体平移时发震时刻跟着平移、
+    /// 震中不动。合成场用解析走时（vP=6 km/s），与 core 的用例同一套物理。
+    void sourceEstimationJapanUsesArrivalTimes() {
+        QSettings().clear();
+        SettingsStore settings;
+        settings.setSourceEstimationEnabled(true);
+        // 只开日本区：正是「只开 NIED」的场景。
+        settings.setSourceEstimationRegionEnabled("japan", true);
+        settings.setSourceEstimationMinStations("japan", 5);
+        settings.setSourceEstimationTrigger("japan", 2.0);
+        settings.setSourceEstimationClusterRadius("japan", 200);
+
+        SourceEstimationService service(&settings);
+        long long now = origin;
+        service.setNowProvider([&] { return now; });
+        service.ticker_.stop();
+
+        // 在一帧里按「解析 P 走时」错开各站的首次越阈时刻：这正是 NIED 真实数据的样子
+        // （波前扫过时邻站依次越过阈值）。必须先逐帧投喂，才能让 service 记录 onset。
+        const double eqLat = 35.0;
+        const double eqLon = 139.0;
+        const double depthKm = 10.0;
+        const long long eqOrigin = origin;
+        std::vector<StationSnapshot::Entry> frame;
+        for (double lat = 34.0; lat <= 36.0 + 1e-9; lat += 0.25) {
+            for (double lon = 138.0; lon <= 140.0 + 1e-9; lon += 0.25) {
+                StationSnapshot::Entry e;
+                e.lat = lat;
+                e.lon = lon;
+                e.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Jma, 6.2,
+                    QuakeCalculator::haversineDistance(eqLat, eqLon, lat, lon), depthKm);
+                frame.push_back(e);
+            }
+        }
+
+        // 逐帧推进：每帧只让「到时已到」的站显示高值，其余站保持在阈值以下。
+        // 这样 service 记录的 firstTriggerMs 就是各站的 P 到时。
+        for (int second = 0; second <= 40; ++second) {
+            now = eqOrigin + static_cast<long long>(second) * 1000;
+            std::vector<StationSnapshot::Entry> tick = frame;
+            for (StationSnapshot::Entry& e : tick) {
+                const double distance =
+                    QuakeCalculator::haversineDistance(eqLat, eqLon, e.lat, e.lon);
+                const double travel = std::sqrt(depthKm * depthKm + distance * distance) / 6.0;
+                if (travel > static_cast<double>(second) + 0.5) {
+                    e.raw = 0.0;   // 波前还没到
+                }
+            }
+            service.ingestObservations(tick);
+        }
+        now = eqOrigin + 42'000;
+        service.ingestObservations(frame);
+
+        QVERIFY(service.regionState(SourceRegion::Japan).triggeredCount >= 5);
+        service.runEstimation();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            service.regionState(SourceRegion::Japan).estimate.valid, 5000);
+        if (service.watcher_.isRunning()) service.watcher_.waitForFinished();
+        QCoreApplication::processEvents();
+
+        const SourceEstimate japan = service.regionState(SourceRegion::Japan).estimate;
+        QVERIFY(japan.valid);
+        QCOMPARE(japan.region, SourceRegion::Japan);
+        QVERIFY2(japan.method.rfind("arrival_time", 0) == 0,
+                 qPrintable(QStringLiteral("日本区应走到时反演，实际 method=%1")
+                                .arg(QString::fromStdString(japan.method))));
+        QVERIFY2(QuakeCalculator::haversineDistance(japan.latitude, japan.longitude, eqLat, eqLon)
+                     < 60.0,
+                 qPrintable(QStringLiteral("到时解偏离真值过远: %1,%2")
+                                .arg(japan.latitude).arg(japan.longitude)));
+        QVERIFY2(std::llabs(japan.originEpochMs - eqOrigin) < 5000,
+                 qPrintable(QStringLiteral("发震时刻偏差 %1 ms")
+                                .arg(japan.originEpochMs - eqOrigin)));
+        QVERIFY(japan.pPhaseCount > 0);
+
+        // 载荷里必须带出可展示的发震时刻（HH:mm:ss）与相位计数，卡片据此换脚注。
+        const QVariantMap info = service.info();
+        const QVariantList regions = info.value("regions").toList();
+        QCOMPARE(regions.size(), 4);
+        const QVariantMap japanRow = regions[1].toMap();
+        QCOMPARE(japanRow.value("id").toString(), QStringLiteral("japan"));
+        QCOMPARE(japanRow.value("usesArrivalTimes").toBool(), true);
+        QVERIFY(!japanRow.value("originUtc8").toString().isEmpty());
+        QVERIFY(japanRow.value("pPhases").toInt() > 0);
+
+        // 中国区没有到时证据：同一帧里没有 CSIS 站，必须保持无解（不能被日本区的解污染）。
+        QVERIFY(!service.regionState(SourceRegion::China).estimate.valid);
+        QCOMPARE(regions[0].toMap().value("visible").toBool(), false);
+    }
+
+    void sourceEstimationRegionsAreIndependent() {
+        QSettings().clear();
+        SettingsStore settings;
+        settings.setSourceEstimationEnabled(true);
+        // 四个区都显式打开（逐区开关默认关闭）。
+        for (const char* region : {"china", "japan", "korea", "taiwan"}) {
+            settings.setSourceEstimationRegionEnabled(region, true);
+        }
+        // 三片台网各给一套可区分的参数：中国 6 站、日本 2 站（好让日本更快满足）、
+        // 台湾 1 站（单站粗解）、韩国 5 站。
+        settings.setSourceEstimationMinStations("china", 6);
+        settings.setSourceEstimationMinStations("japan", 2);
+        settings.setSourceEstimationMinStations("korea", 2);
+        settings.setSourceEstimationMinStations("taiwan", 1);
+        settings.setSourceEstimationTrigger("china", 3.0);
+        settings.setSourceEstimationTrigger("japan", 2.0);
+        settings.setSourceEstimationTrigger("korea", 3.5);
+        settings.setSourceEstimationTrigger("taiwan", 3.0);
+
+        SourceEstimationService service(&settings);
+        long long now = origin;
+        service.setNowProvider([&] { return now; });
+        service.ticker_.stop();
+
+        // 一帧里同时放三片台网：四川 CSIS、东京 JMA、首尔 MMI、台南 CSIS。
+        std::vector<StationSnapshot::Entry> frame;
+        const auto addGrid = [&](double centerLat, double centerLon, double magnitude,
+                                 IntensityFamily family, double radiusDeg) {
+            for (double lat = centerLat - radiusDeg; lat <= centerLat + radiusDeg + 1e-9;
+                 lat += 0.2) {
+                for (double lon = centerLon - radiusDeg; lon <= centerLon + radiusDeg + 1e-9;
+                     lon += 0.2) {
+                    StationSnapshot::Entry e;
+                    e.lat = lat;
+                    e.lon = lon;
+                    const double distance = QuakeCalculator::haversineDistance(centerLat, centerLon,
+                                                                               lat, lon);
+                    if (family == IntensityFamily::Jma) {
+                        e.raw = SourceEstimator::predictedIntensity(family, magnitude, distance,
+                                                                    10.0);
+                    } else if (family == IntensityFamily::Kma) {
+                        e.kma = true;
+                        e.raw = SourceEstimator::predictedIntensity(family, magnitude, distance,
+                                                                    10.0);
+                    } else {
+                        e.csis = true;
+                        e.raw = SourceEstimator::predictedIntensity(family, magnitude, distance,
+                                                                    10.0);
+                    }
+                    frame.push_back(e);
+                }
+            }
+        };
+        addGrid(30.0, 104.0, 5.8, IntensityFamily::Csis, 1.2);   // 中国
+        addGrid(35.7, 139.7, 5.2, IntensityFamily::Jma, 0.8);    // 日本
+        addGrid(37.5, 127.0, 4.6, IntensityFamily::Kma, 0.6);    // 韩国
+        // 台湾：只放一个站 —— 正是「CWA 未接入、只有个别 Wolfx 站」的现状。
+        {
+            StationSnapshot::Entry e;
+            e.lat = 23.0;
+            e.lon = 120.3;
+            e.csis = true;
+            e.raw = 5.4;
+            frame.push_back(e);
+        }
+
+        service.ingestObservations(frame);
+        QVERIFY(service.regionState(SourceRegion::China).triggeredCount >= 6);
+        QVERIFY(service.regionState(SourceRegion::Japan).triggeredCount >= 2);
+        QVERIFY(service.regionState(SourceRegion::Korea).triggeredCount >= 2);
+        QCOMPARE(service.regionState(SourceRegion::Taiwan).triggeredCount, 1);
+
+        service.runEstimation();
+        QTRY_VERIFY_WITH_TIMEOUT(service.regionState(SourceRegion::China).estimate.valid, 5000);
+        if (service.watcher_.isRunning()) service.watcher_.waitForFinished();
+        QCoreApplication::processEvents();
+
+        // 四区各自出解，位置互不串。
+        const SourceEstimate china = service.regionState(SourceRegion::China).estimate;
+        const SourceEstimate japan = service.regionState(SourceRegion::Japan).estimate;
+        const SourceEstimate korea = service.regionState(SourceRegion::Korea).estimate;
+        const SourceEstimate taiwan = service.regionState(SourceRegion::Taiwan).estimate;
+        QVERIFY(china.valid);
+        QVERIFY(japan.valid);
+        QVERIFY(korea.valid);
+        QVERIFY(taiwan.valid);
+        QCOMPARE(china.region, SourceRegion::China);
+        QCOMPARE(japan.region, SourceRegion::Japan);
+        QCOMPARE(korea.region, SourceRegion::Korea);
+        QCOMPARE(taiwan.region, SourceRegion::Taiwan);
+        QVERIFY(QuakeCalculator::haversineDistance(china.latitude, china.longitude, 30.0, 104.0)
+                < 60.0);
+        QVERIFY(QuakeCalculator::haversineDistance(japan.latitude, japan.longitude, 35.7, 139.7)
+                < 60.0);
+        QVERIFY(QuakeCalculator::haversineDistance(korea.latitude, korea.longitude, 37.5, 127.0)
+                < 80.0);
+        // 台湾只有一个站：只能是 provisional 粗解，且必须落在那站附近。
+        QVERIFY(taiwan.provisional);
+        QVERIFY(QuakeCalculator::haversineDistance(taiwan.latitude, taiwan.longitude, 23.0, 120.3)
+                < 40.0);
+
+        // 载荷：regions 固定四行、每行 id 可读；markers 每个有解的区域一个。
+        const QVariantMap info = service.info();
+        const QVariantList regions = info.value("regions").toList();
+        QCOMPARE(regions.size(), 4);
+        QCOMPARE(regions[0].toMap().value("id").toString(), QStringLiteral("china"));
+        QCOMPARE(regions[1].toMap().value("id").toString(), QStringLiteral("japan"));
+        QCOMPARE(regions[2].toMap().value("id").toString(), QStringLiteral("korea"));
+        QCOMPARE(regions[3].toMap().value("id").toString(), QStringLiteral("taiwan"));
+        for (const QVariant& row : regions) {
+            QVERIFY(row.toMap().value("visible").toBool());
+        }
+        QCOMPARE(regions[3].toMap().value("provisional").toBool(), true);
+        const QVariantList markers = service.marker().value("markers").toList();
+        QCOMPARE(markers.size(), 4);
+        QCOMPARE(markers[3].toMap().value("id").toString(), QStringLiteral("taiwan"));
+        QVERIFY(service.marker().value("visible").toBool());
+        // 顶层字段与最强的一区一致（兼容只读单值的调用方）。
+        QVERIFY(!info.value("id").toString().isEmpty());
+        QCOMPARE(info.value("visible").toBool(), true);
+        QCOMPARE(info.value("markers").toList().size(), 4);
+
+        // 只改日本区的门槛：中国区已有的解必须原样保留（区域互不作废）。
+        const SourceEstimate chinaBefore = china;
+        settings.setSourceEstimationMinStations("japan", 40);
+        service.reloadSettings();
+        QCoreApplication::processEvents();
+        QVERIFY(service.regionState(SourceRegion::China).estimate.valid);
+        QCOMPARE(service.regionState(SourceRegion::China).estimate.latitude,
+                 chinaBefore.latitude);
+        QVERIFY(!service.regionState(SourceRegion::Japan).estimate.valid);
+        // 阈值改动会清空该区的触发簿记，重新投喂后仍能再出解。
+        service.ingestObservations(frame);
+        QVERIFY(service.regionState(SourceRegion::China).triggeredCount >= 6);
+
+        // 关掉总开关：四区一起清空。
+        settings.setSourceEstimationEnabled(false);
+        service.reloadSettings();
+        for (const SourceRegion region : sourceRegions()) {
+            QVERIFY(!service.regionState(region).estimate.valid);
+        }
+        QCOMPARE(service.info().value("visible").toBool(), false);
+        QVERIFY(service.info().value("markers").toList().isEmpty());
+    }
+
+    /// 逐区域开关：可以只开某一片台网（例如只开日本 NIED）。
+    ///
+    /// 语义是「启用集合」且**默认全关**：总开关打开但一个区都没选时，任何区都不记账、
+    /// 不计算、不发布 —— 不能出现「打开总开关就自动全区开跑」。
+    void sourceEstimationRegionToggles() {
+        QSettings().clear();
+        SettingsStore settings;
+        QVERIFY(!settings.isSourceEstimationRegionEnabled("china"));
+        QVERIFY(!settings.isSourceEstimationRegionEnabled("japan"));
+        QVERIFY(!settings.hasAnySourceEstimationRegion());
+        QVERIFY(settings.enabledSourceEstimationRegions().isEmpty());
+
+        settings.setSourceEstimationEnabled(true);
+        settings.setSourceEstimationRegionEnabled("japan", true);
+        QVERIFY(settings.isSourceEstimationRegionEnabled("japan"));
+        QVERIFY(!settings.isSourceEstimationRegionEnabled("china"));
+        QVERIFY(settings.hasAnySourceEstimationRegion());
+        QCOMPARE(settings.enabledSourceEstimationRegions(), QStringList{"japan"});
+
+        // 幂等：重复设同一状态不发 changed。
+        {
+            QSignalSpy spy(&settings, &SettingsStore::changed);
+            settings.setSourceEstimationRegionEnabled("japan", true);
+            QCOMPARE(spy.count(), 0);
+            settings.setSourceEstimationRegionEnabled("japan", false);
+            QCOMPARE(spy.count(), 1);
+        }
+        settings.setSourceEstimationRegionEnabled("japan", true);
+
+        // 服务层：只开日本时，喂一帧中国 CSIS 场必须完全没有动静。
+        SourceEstimationService service(&settings);
+        long long now = origin;
+        service.setNowProvider([&] { return now; });
+        service.ticker_.stop();
+
+        std::vector<StationSnapshot::Entry> chinaFrame;
+        for (double lat = 28.4; lat <= 31.6 + 1e-9; lat += 0.2) {
+            for (double lon = 102.4; lon <= 105.6 + 1e-9; lon += 0.2) {
+                StationSnapshot::Entry e;
+                e.lat = lat;
+                e.lon = lon;
+                e.csis = true;
+                e.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Csis, 5.8,
+                    QuakeCalculator::haversineDistance(30.0, 104.0, lat, lon), 10.0);
+                chinaFrame.push_back(e);
+            }
+        }
+        service.ingestObservations(chinaFrame);
+        QCOMPARE(service.regionState(SourceRegion::China).triggeredCount, 0);
+        QVERIFY(!service.regionState(SourceRegion::China).estimate.valid);
+        service.runEstimation();
+        QCoreApplication::processEvents();
+        QVERIFY(!service.regionState(SourceRegion::China).estimate.valid);
+        // 载荷里中国行必须是 disabled，且不带解。
+        {
+            const QVariantList regions = service.info().value("regions").toList();
+            QCOMPARE(regions.size(), 4);
+            const QVariantMap china = regions[0].toMap();
+            QCOMPARE(china.value("id").toString(), QStringLiteral("china"));
+            QCOMPARE(china.value("regionEnabled").toBool(), false);
+            QCOMPARE(china.value("enabled").toBool(), false);
+            QCOMPARE(china.value("state").toString(), QStringLiteral("disabled"));
+            QCOMPARE(china.value("visible").toBool(), false);
+            const QVariantMap japan = regions[1].toMap();
+            QCOMPARE(japan.value("regionEnabled").toBool(), true);
+        }
+        QCOMPARE(service.info().value("anyRegionEnabled").toBool(), true);
+
+        // 日本区仍能正常出解（喂日本 JMA 场）。
+        std::vector<StationSnapshot::Entry> japanFrame;
+        for (double lat = 34.0; lat <= 36.0 + 1e-9; lat += 0.2) {
+            for (double lon = 138.0; lon <= 140.0 + 1e-9; lon += 0.2) {
+                StationSnapshot::Entry e;
+                e.lat = lat;
+                e.lon = lon;
+                e.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Jma, 6.4,
+                    QuakeCalculator::haversineDistance(35.0, 139.0, lat, lon), 10.0);
+                japanFrame.push_back(e);
+            }
+        }
+        now += 5000;
+        service.ingestObservations(japanFrame);
+        QVERIFY(service.regionState(SourceRegion::Japan).triggeredCount >= 5);
+        service.runEstimation();
+        QTRY_VERIFY_WITH_TIMEOUT(service.regionState(SourceRegion::Japan).estimate.valid, 5000);
+        if (service.watcher_.isRunning()) service.watcher_.waitForFinished();
+        QCoreApplication::processEvents();
+        QVERIFY(!service.regionState(SourceRegion::China).estimate.valid);
+
+        // 关掉日本区：该区的解必须立刻清空，且不再记账。
+        settings.setSourceEstimationRegionEnabled("japan", false);
+        service.reloadSettings();
+        QVERIFY(!service.regionState(SourceRegion::Japan).estimate.valid);
+        QCOMPARE(service.regionState(SourceRegion::Japan).triggeredCount, 0);
+        QCOMPARE(service.info().value("anyRegionEnabled").toBool(), false);
+        // 一个区都没有：载荷状态是 disabled，不是 collecting。
+        QCOMPARE(service.info().value("state").toString(), QStringLiteral("disabled"));
+
+        // 重新打开中国区：可以立刻工作。
+        settings.setSourceEstimationRegionEnabled("china", true);
+        service.reloadSettings();
+        now += 5000;
+        service.ingestObservations(chinaFrame);
+        QVERIFY(service.regionState(SourceRegion::China).triggeredCount >= 6);
+        service.runEstimation();
+        QTRY_VERIFY_WITH_TIMEOUT(service.regionState(SourceRegion::China).estimate.valid, 5000);
+        if (service.watcher_.isRunning()) service.watcher_.waitForFinished();
+        QCoreApplication::processEvents();
+        QVERIFY(service.regionState(SourceRegion::China).estimate.valid);
+    }
+
     void settingsChangedIsIdempotentAndPersistent() {
         QSettings().clear();
         SettingsStore settings;
@@ -817,6 +1313,43 @@ private slots:
             QVERIFY(settings.passesInfoMagnitudeFilter(QStringLiteral("wolfx"), 4.0));
             QVERIFY(settings.passesInfoMagnitudeFilter(QStringLiteral("wolfx"), 0.0));
 
+            // 本地震源推算（Beta）：**默认关闭**、保留 60 s、地图标记开。
+            QVERIFY(!settings.sourceEstimationEnabled());
+            QCOMPARE(settings.sourceEstimationHoldSeconds(), 60);
+            QVERIFY(settings.showEstimatedEpicenter());
+            // 区域默认值：中国 CSIS 3.0 / 6 站 / 250 km，日本 JMA 2.5 / 8 站 / 200 km，
+            // 韩国 MMI 4.0 / 5 站 / 200 km，台湾 3.0 / 1 站（台网未接入）。
+            QCOMPARE(settings.sourceEstimationTriggerFor("china"), 3.0);
+            QCOMPARE(settings.sourceEstimationMinStationsFor("china"), 6);
+            QCOMPARE(settings.sourceEstimationClusterRadiusFor("china"), 250);
+            QCOMPARE(settings.sourceEstimationTriggerFor("japan"), 2.5);
+            // 日本区门槛对齐 kanameishi 的 `minInferenceStationCount = 5`。
+            QCOMPARE(settings.sourceEstimationMinStationsFor("japan"), 5);
+            QCOMPARE(settings.sourceEstimationClusterRadiusFor("japan"), 200);
+            QCOMPARE(settings.sourceEstimationTriggerFor("korea"), 4.0);
+            QCOMPARE(settings.sourceEstimationMinStationsFor("korea"), 5);
+            QCOMPARE(settings.sourceEstimationMinStationsFor("taiwan"), 1);
+            QVERIFY(settings.hasSourceEstimationRegion("taiwan"));
+            QVERIFY(!settings.hasSourceEstimationRegion("mars"));
+            QCOMPARE(settings.sourceEstimationRegionLabel("korea"), QStringLiteral("韩国"));
+            // 无参重载 = 中国区（旧调用兼容）。
+            QCOMPARE(settings.sourceEstimationTrigger(), 3.0);
+            QCOMPARE(settings.sourceEstimationMinStations(), 6);
+            QVERIFY(settings.sourceEstimationQuietEvidence());
+
+            settings.setSourceEstimationEnabled(true);
+            settings.setSourceEstimationTrigger(4.5);
+            settings.setSourceEstimationMinStations(9);
+            settings.setSourceEstimationQuietEvidence(false);
+            settings.setSourceEstimationHoldSeconds(150);
+            settings.setSourceEstimationClusterRadius(600);
+            // 日本区单独调一套，验证「一个区的改动不会溢出到另一个区」。
+            settings.setSourceEstimationTrigger("japan", 1.5);
+            settings.setSourceEstimationMinStations("japan", 12);
+            settings.setSourceEstimationClusterRadius("japan", 350);
+            settings.setSourceEstimationQuietEvidence("japan", false);
+            settings.setShowEstimatedEpicenter(false);
+
             settings.setStationSourceEnabled(QStringLiteral("kmoni"), false);
             QVERIFY(!settings.isStationSourceEnabled(QStringLiteral("kmoni")));
             settings.setNotifyEew(true);
@@ -825,8 +1358,58 @@ private slots:
         SettingsStore reloaded;
         QVERIFY(reloaded.notifyEew());
         QVERIFY(!reloaded.announceCountdown());
+        QVERIFY(reloaded.sourceEstimationEnabled());
+        QCOMPARE(reloaded.sourceEstimationTrigger(), 4.5);
+        QCOMPARE(reloaded.sourceEstimationMinStations(), 9);
+        QVERIFY(!reloaded.sourceEstimationQuietEvidence());
+        QCOMPARE(reloaded.sourceEstimationHoldSeconds(), 150);
+        QCOMPARE(reloaded.sourceEstimationClusterRadius(), 600);
+        QCOMPARE(reloaded.sourceEstimationTriggerFor("japan"), 1.5);
+        QCOMPARE(reloaded.sourceEstimationMinStationsFor("japan"), 12);
+        QCOMPARE(reloaded.sourceEstimationClusterRadiusFor("japan"), 350);
+        QVERIFY(!reloaded.sourceEstimationQuietEvidenceFor("japan"));
+        // 韩国/台湾没被碰过，仍是各自的默认值。
+        QCOMPARE(reloaded.sourceEstimationTriggerFor("korea"), 4.0);
+        QCOMPARE(reloaded.sourceEstimationMinStationsFor("taiwan"), 1);
+        QVERIFY(!reloaded.showEstimatedEpicenter());
         QVERIFY(!reloaded.isStationSourceEnabled(QStringLiteral("kmoni")));
         QCOMPARE(reloaded.infoMagnitudeFilter(QStringLiteral("wolfx")), 4.0);
+        // 恢复默认必须把震源推算一并还原（否则「恢复默认」会留下一个关不掉的旧阈值）。
+        reloaded.resetToDefaults();
+        QVERIFY(!reloaded.sourceEstimationEnabled());
+        QCOMPARE(reloaded.sourceEstimationTrigger(), 3.0);
+        QCOMPARE(reloaded.sourceEstimationMinStations(), 6);
+        QVERIFY(reloaded.sourceEstimationQuietEvidence());
+        QCOMPARE(reloaded.sourceEstimationHoldSeconds(), 60);
+        QCOMPARE(reloaded.sourceEstimationClusterRadius(), 250);
+        QCOMPARE(reloaded.sourceEstimationTriggerFor("japan"), 2.5);
+        QCOMPARE(reloaded.sourceEstimationMinStationsFor("japan"), 5);
+        QVERIFY(reloaded.showEstimatedEpicenter());
+        // 单区恢复默认：只清该区，其余区域与总开关不受影响。
+        reloaded.setSourceEstimationMinStations("japan", 20);
+        reloaded.setSourceEstimationMinStations("korea", 11);
+        reloaded.resetSourceEstimationRegion("japan");
+        QCOMPARE(reloaded.sourceEstimationMinStationsFor("japan"), 5);
+        QCOMPARE(reloaded.sourceEstimationMinStationsFor("korea"), 11);
+        // 恢复默认同样清空测站源禁用集与逐源过滤（resetToDefaults 的既有语义）。
+        QVERIFY(reloaded.isStationSourceEnabled(QStringLiteral("kmoni")));
+        QCOMPARE(reloaded.infoMagnitudeFilter(QStringLiteral("wolfx")), 0.0);
+
+        // 区域拆分前的全局键必须迁移进中国区（否则老用户调好的阈值会静默失效）。
+        QSettings().clear();
+        QSettings().setValue("sourceEstimationTrigger", 5.0);
+        QSettings().setValue("sourceEstimationMinStations", 11);
+        QSettings().setValue("sourceEstimationClusterRadius", 400);
+        QSettings().setValue("sourceEstimationQuietEvidence", false);
+        SettingsStore migratedRegion;
+        QCOMPARE(migratedRegion.sourceEstimationTriggerFor("china"), 5.0);
+        QCOMPARE(migratedRegion.sourceEstimationMinStationsFor("china"), 11);
+        QCOMPARE(migratedRegion.sourceEstimationClusterRadiusFor("china"), 400);
+        QVERIFY(!migratedRegion.sourceEstimationQuietEvidenceFor("china"));
+        // 旧键迁移只写中国区，别的区域保持各自默认。
+        QCOMPARE(migratedRegion.sourceEstimationTriggerFor("japan"), 2.5);
+        // 迁移后旧键不再残留（否则下次启动会再抄一遍，覆盖用户后来的修改）。
+        QVERIFY(!QSettings().contains("sourceEstimationTrigger"));
 
         // 旧键迁移：新键缺失时沿用旧通知/置顶设置。
         QSettings().clear();

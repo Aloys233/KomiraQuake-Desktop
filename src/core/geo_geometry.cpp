@@ -4,8 +4,6 @@
 #include <cmath>
 #include <limits>
 
-#include <QtMath>
-
 #include "core/quake_calculator.h"
 
 namespace komira {
@@ -13,6 +11,9 @@ namespace {
 
 constexpr double kEarthRadiusKm = QuakeCalculator::kEarthRadiusKm;
 constexpr double kKmPerDegreeLat = 111.32;
+/// 圆周率本地常量。原先靠 `<QtMath>` 提供 M_PI：MSVC 的 `<cmath>` 不带它，但引入 Qt 头
+/// 又会让「纯 C++ 核心单测」（run_core_tests.sh 直接 g++）链接 `qt_version_tag` 失败。
+constexpr double kPi = 3.14159265358979323846;
 
 /// 以查询点为原点的局部平面近似（等距圆柱）。
 ///
@@ -28,7 +29,7 @@ struct LocalPlane {
         : lat0(lat),
           lon0(lon),
           // 与 pxPerKm 一致地夹住 cosLat，避免极点附近除零。
-          kmPerDegLon(kKmPerDegreeLat * std::max(0.01, std::cos(lat * M_PI / 180.0))) {}
+          kmPerDegLon(kKmPerDegreeLat * std::max(0.01, std::cos(lat * kPi / 180.0))) {}
 
     double x(double lon) const { return (lon - lon0) * kmPerDegLon; }
     double y(double lat) const { return (lat - lat0) * kKmPerDegreeLat; }

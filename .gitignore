@@ -33,3 +33,6 @@ result-*
 # OS junk
 .DS_Store
 Thumbs.db
+
+# 本地基准/冒烟运行留下的隔离数据目录（.bench/）
+.bench/

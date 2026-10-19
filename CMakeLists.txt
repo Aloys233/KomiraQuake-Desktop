@@ -51,6 +51,8 @@ qt_add_executable(komiraquake WIN32
     src/core/geo_geometry.cpp
     src/core/time_sync.cpp
     src/core/vector_map_data.cpp
+    src/core/source_estimator.cpp
+    src/core/region_names.cpp
 
     # source
     src/source/earthquake_source.h
@@ -91,6 +93,8 @@ qt_add_executable(komiraquake WIN32
     src/service/autostart.cpp
     src/service/update_service.cpp
     src/service/sentry_service.cpp
+    src/service/source_estimation_service.cpp
+        src/service/travel_time_arrivals.h
 
     # app
     src/app/app_controller.cpp
@@ -136,6 +140,8 @@ set(KOMIRA_QML_FILES
     qml/EventListSidebar.qml
     qml/MapView.qml
     qml/StationIntensityCard.qml
+    qml/SourceEstimateCard.qml
+    qml/EstimateMarker.qml
     qml/StationTooltip.qml
     qml/SettingsPage.qml
     qml/settings/AppearanceSection.qml
@@ -146,6 +152,7 @@ set(KOMIRA_QML_FILES
     qml/settings/SourceSection.qml
     qml/settings/ClockSection.qml
     qml/settings/AboutSection.qml
+    qml/settings/SourceEstimationSection.qml
     qml/SettingSlider.qml
     qml/GlassCard.qml
     qml/GlassButton.qml
@@ -245,7 +252,8 @@ if(BUILD_TESTING)
         src/core/coordinate_transform.cpp src/core/event_gate.cpp
         src/core/geo_geometry.cpp src/core/vector_map_data.cpp
         src/core/intensity_calculator.cpp src/core/quake_calculator.cpp
-        src/core/time_sync.cpp src/core/travel_table.cpp)
+        src/core/time_sync.cpp src/core/travel_table.cpp
+        src/core/source_estimator.cpp src/core/region_names.cpp)
     target_include_directories(core_engine_test PRIVATE src)
     add_test(NAME core_engine COMMAND core_engine_test)
     qt_add_executable(qt_business_test tests/qt_business_test.cpp
@@ -268,6 +276,9 @@ if(BUILD_TESTING)
         src/source/simulated_protocol.cpp src/source/simulated_parser.cpp
         src/source/simulated_source.cpp
         src/service/sentry_service.cpp
+        src/service/source_estimation_service.cpp
+        src/service/travel_time_arrivals.h
+        src/core/source_estimator.cpp src/core/region_names.cpp
         src/store/history_store.cpp src/prefs/settings_store.cpp)
     target_include_directories(qt_business_test PRIVATE src)
     target_link_libraries(qt_business_test PRIVATE Qt6::Test Qt6::Network Qt6::WebSockets Qt6::Sql sentry)

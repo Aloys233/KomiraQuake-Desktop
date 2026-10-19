@@ -21,9 +21,11 @@
 #include "core/intensity_calculator.h"
 #include "core/ip_geo_lookup.h"
 #include "core/quake_calculator.h"
+#include "core/region_names.h"
 #include "core/travel_time_service.h"
 #include "model/station_snapshot.h"
 #include "prefs/settings_store.h"
+#include "service/source_estimation_service.h"
 #include "service/alert_announcer.h"
 #include "service/alert_sound_service.h"
 #include "service/autostart.h"
@@ -209,9 +211,13 @@ AppController::AppController(QObject* parent, bool startServices)
 
     TravelTimeService::instance().loadFromFile(assetRoot_ + "/travel_times.json");
     CityCoordTable::instance().loadFromFile(assetRoot_ + "/china_cities.json");
+    // 震中地名表（参考实现 `getFEName` 的 1° 网格）。缺失不是致命错误：
+    // 震源推算卡会退回坐标文本，其余功能不受影响。
+    RegionNameTable::instance().loadFromFile((assetRoot_ + "/region_names.bin").toStdString());
     qInfo() << "[app] asset root:" << assetRoot_
             << "| travel times:" << (TravelTimeService::instance().isLoaded() ? "loaded" : "MISSING")
-            << "| city coords:" << (CityCoordTable::instance().isLoaded() ? "loaded" : "MISSING");
+            << "| city coords:" << (CityCoordTable::instance().isLoaded() ? "loaded" : "MISSING")
+            << "| region names:" << (RegionNameTable::instance().loaded() ? "loaded" : "MISSING");
 
     settings_ = new SettingsStore(this);
     directoryRefreshEnabled_ = !startHidden();
@@ -263,6 +269,11 @@ AppController::AppController(QObject* parent, bool startServices)
     wolfxSeisSource_ = new WolfxSeisSource(this);
     // 测站快照：地图项直接读这个对象，避免每 100 ms 经历 QVariantList/JS 数组的往返转换。
     stationSnapshot_ = new StationSnapshot(this);
+    // 本地震源推算（Beta）：消费上面五路测站强度，1 Hz 起算；不产事件、不参与告警。
+    sourceEstimation_ = new SourceEstimationService(settings_, this);
+    sourceEstimation_->setNowProvider([this]() { return nowMs(); });
+    connect(sourceEstimation_, &SourceEstimationService::changed, this,
+            &AppController::sourceEstimateChanged);
     clock_ = new NtpClock(this);
     autoStart_ = new AutoStartService(this);
     updater_ = new UpdateService(this);
@@ -399,6 +410,11 @@ void AppController::wire() {
         syncStation(settings_->isStationSourceEnabled(StationSourceIds::kWolfxSeis), wolfxSeisSource_);
         // 启用/停用会改变合并后测站表的构成：悬停元数据必须整表重建一次。
         noteStationTablesChanged();
+        // 震源推算的门槛/负证据/开关变化：作废旧解，按新判据重新起算。
+        sourceEstimation_->reloadSettings();
+        // 地图标记的显示开关只影响呈现，但该属性没有别的通知源：不发这一下，
+        // QML 会一直停在关闭时那份 `{ visible: false }` 上，重新打开也不恢复。
+        emit sourceEstimateChanged();
         sound_->setEnabled(settings_->enableSoundAlert());
         sound_->setVolume(settings_->alertVolume());
         clock_->setCustomServer(settings_->customNtpServer());
@@ -852,6 +868,7 @@ void AppController::refreshStationSnapshot() {
             qWarning() << "[station] meta/entry size mismatch" << entries.size()
                        << stationMetas_.size();
         }
+        if (sourceEstimation_) sourceEstimation_->ingestObservations(entries);
         stationSnapshot_->setEntries(std::move(entries), stationMetas_);
         return;
     }
@@ -860,7 +877,21 @@ void AppController::refreshStationSnapshot() {
         stationMetaDirty_ = true;
         scheduleStationIntensityRefresh();
     }
+    if (sourceEstimation_) sourceEstimation_->ingestObservations(entries);
     stationSnapshot_->setEntries(std::move(entries));
+}
+
+QVariantMap AppController::sourceEstimateInfo() const {
+    return sourceEstimation_ ? sourceEstimation_->info() : QVariantMap();
+}
+
+QVariantMap AppController::sourceEstimateMarker() const {
+    if (!settings_ || !settings_->showEstimatedEpicenter()) {
+        QVariantMap hidden;
+        hidden["visible"] = false;
+        return hidden;
+    }
+    return sourceEstimation_ ? sourceEstimation_->marker() : QVariantMap();
 }
 
 QVariantList AppController::stationSources() const {

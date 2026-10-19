@@ -13,6 +13,8 @@ g++ -std=c++17 -Wall -Wextra -I src \
   src/core/travel_table.cpp \
   src/core/event_gate.cpp \
   src/core/time_sync.cpp \
+  src/core/source_estimator.cpp \
+  src/core/region_names.cpp \
   -o "$OUT"
 # .kvb 矢量数据：可选，存在才校验（core 层不依赖 Qt，故路径由脚本传入而非运行时推导）。
 # 注意 set -e：不能用 `[ -f x ] && ...` 形式，测试为假时会让整个脚本提前退出。

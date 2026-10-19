@@ -1103,6 +1103,76 @@ Item {
         kmaDotColors: root.theme.kmaDotColorBand
     }
 
+    // ---- 本地震源推算（Beta）：推定震中 ------------------------------------
+    // 与官方震中的红叉刻意区分：官方用「X 十字」，这里用「菱形 + 中心点 + 不确定度圈」，
+    // 形状不同就不会被误读成已发布震中。
+    // 放在测站层**之后**：测站方标是 C++ 一次性批量绘制的兄弟项，z 跨子树不生效，
+    // 画在 mapRenderLayer 里会被上千个测站盖住（官方震中的红叉就有这个毛病）。
+    //
+    // **逐区一个标记**：四个区域各自出解，不能只画置信度最高的那一个 —— 否则中国区
+    // 出解时日本区的推定震中会凭空消失。用四个固定实例而不是 Repeater：Repeater 的
+    // delegate 没有 QObject 父对象，objectName / findChild 定位不到，GUI 回归与可访问性
+    // 都依赖名字稳定；区域本来就是固定集合。
+    readonly property var estimateMarkers: {
+        const marker = app.sourceEstimateMarker;
+        return marker && marker.markers && marker.markers.length ? marker.markers : [];
+    }
+    function estimateMarker(regionId) {
+        const list = estimateMarkers;
+        for (let i = 0; i < list.length; ++i) {
+            if (list[i] && list[i].id === regionId) return list[i];
+        }
+        return ({ visible: false });
+    }
+    function estimateMarkerPrimary(regionId) {
+        const top = app.sourceEstimateMarker;
+        return !!top && top.id === regionId;
+    }
+    EstimateMarker {
+        info: root.estimateMarker("china")
+        regionId: "china"
+        primary: root.estimateMarkerPrimary("china")
+        theme: root.theme
+        kmPerPixel: root.pxPerKmValue
+        visible: active && !!app.settings.showEstimatedEpicenter
+        z: 4
+        x: root.screenX(root.shiftCoord(lat, lon).lon) - width / 2
+        y: root.screenY(root.shiftCoord(lat, lon).lat) - height / 2
+    }
+    EstimateMarker {
+        info: root.estimateMarker("japan")
+        regionId: "japan"
+        primary: root.estimateMarkerPrimary("japan")
+        theme: root.theme
+        kmPerPixel: root.pxPerKmValue
+        visible: active && !!app.settings.showEstimatedEpicenter
+        z: 4
+        x: root.screenX(root.shiftCoord(lat, lon).lon) - width / 2
+        y: root.screenY(root.shiftCoord(lat, lon).lat) - height / 2
+    }
+    EstimateMarker {
+        info: root.estimateMarker("korea")
+        regionId: "korea"
+        primary: root.estimateMarkerPrimary("korea")
+        theme: root.theme
+        kmPerPixel: root.pxPerKmValue
+        visible: active && !!app.settings.showEstimatedEpicenter
+        z: 4
+        x: root.screenX(root.shiftCoord(lat, lon).lon) - width / 2
+        y: root.screenY(root.shiftCoord(lat, lon).lat) - height / 2
+    }
+    EstimateMarker {
+        info: root.estimateMarker("taiwan")
+        regionId: "taiwan"
+        primary: root.estimateMarkerPrimary("taiwan")
+        theme: root.theme
+        kmPerPixel: root.pxPerKmValue
+        visible: active && !!app.settings.showEstimatedEpicenter
+        z: 4
+        x: root.screenX(root.shiftCoord(lat, lon).lon) - width / 2
+        y: root.screenY(root.shiftCoord(lat, lon).lat) - height / 2
+    }
+
     // ---- 测站悬停浮层 ----------------------------------------------------
     // 只有一个实例，命中靠 stationLayer.stationAt()（O(n) 纯算术，见 C++ 注释）。
     // 指针扫过时不逐像素查询：停下 90 ms 才查一次；地图在动、正在拖拽、选点模式或

@@ -54,8 +54,9 @@ ApplicationWindow {
             hasFocus: app.hasMapFocus
             warningActive: !!app.activeWarning
             hudWidth: hud.visible ? hud.width : 0
-            // 取景用的顶部/底部遮挡：HUD 实际高度（含余量）与左下徽章合计高度。
-            hudHeight: hud.visible ? hud.height + 32 : 0
+            // 取景用的顶部/底部遮挡：左列（HUD + 震源推算卡）实际占用的最低点，
+            // 以及左下角徽章合计高度。必须跟着卡片实际位置走，否则新卡片会压住震中。
+            hudHeight: window.leftColumnBottom > 0 ? window.leftColumnBottom + 16 : 0
             zoom: 6
             listExpanded: window.showList && !window.showSettings
             onWavesFinished: if (window.hudEvent) window.wavesDoneId = window.hudEvent.id
@@ -225,14 +226,34 @@ ApplicationWindow {
             onPickLocationRequested: { window.showSettings = false; if (map) map.pickingLocation = true; globalToast.show("点击地图设置基准位置"); }
         }
     }
-    // 桌面端不使用全屏预警：主 HUD 下方再放一张预警卡承载本地到时与操作。
+    // 左列的最下沿（窗口坐标）：取景要让开这一整列，否则地图会把震中藏到卡片底下。
+    // 三个卡片的可见性各自裁决，这里只做几何汇总，不参与任何显示判断。
+    readonly property real leftColumnBottom: {
+        let bottom = 0
+        if (hud.visible) bottom = Math.max(bottom, hud.y + hud.height)
+        if (warningHud.visible) bottom = Math.max(bottom, warningHud.y + warningHud.height)
+        if (sourceEstimate.visible) bottom = Math.max(bottom, sourceEstimate.y + sourceEstimate.height)
+        return bottom
+    }
+    // 倒计时卡默认贴在 HUD 右侧；窄窗口放不下时退回 HUD 下方 —— 宁可换位，
+    // 也不要一张被窗口右缘裁掉的倒计时。
+    readonly property real mapAreaWidth: map ? map.width : window.width
+    readonly property bool countdownBesideHud: hud.visible
+        && (mapAreaWidth - hud.x - hud.width - 24) >= 220
+    // 本地倒计时：主 HUD 右侧的紧凑卡。它比 HUD 窄、数字更小，不再另起一列纵向堆叠，
+    // 从而把左列纵向空间让给下方的震源推算卡。
     WarningHud {
         id: warningHud
-        anchors.left: hud.visible ? hud.left : parent.left
-        anchors.leftMargin: hud.visible ? 0 : 16
-        anchors.top: hud.visible ? hud.bottom : parent.top
-        anchors.topMargin: hud.visible ? 8 : 16
-        width: hud.visible ? hud.width : Math.min(352, (map ? map.width : window.width) - 88)
+        anchors.left: window.countdownBesideHud ? hud.right : (hud.visible ? hud.left : parent.left)
+        anchors.leftMargin: window.countdownBesideHud ? 8 : (hud.visible ? 0 : 16)
+        // 贴右侧时与 HUD 顶对齐；退回左列时仍挂在 HUD 之下（不能压在同一处）。
+        anchors.top: hud.visible
+            ? (window.countdownBesideHud ? hud.top : hud.bottom)
+            : parent.top
+        anchors.topMargin: hud.visible && !window.countdownBesideHud ? 8 : (hud.visible ? 0 : 16)
+        width: window.countdownBesideHud
+            ? Math.min(264, window.mapAreaWidth - hud.x - hud.width - 24)
+            : (hud.visible ? hud.width : Math.min(352, window.mapAreaWidth - 88))
         visible: !!app.activeWarning && app.alertEligible && (hud.visible || window.hasProtectedWarning)
         theme: appTheme
         backdropSource: map ? map.renderLayer : null
@@ -241,6 +262,29 @@ ApplicationWindow {
         countdown: app.countdown
         onMuted: app.muteWarning()
         onStopped: app.stopWarning()
+    }
+    // 本地震源推算（Beta）：独占一张卡，位于左列 HUD 之下（与预警卡、测站卡都不共用）。
+    // 收到解才开始占位；只显示、不产事件、不参与告警与去重。
+    // 卡内自带 n/N 分页（一区一页），翻页状态留在卡内，不需要上层联动。
+    SourceEstimateCard {
+        id: sourceEstimate
+        objectName: "sourceEstimateCard"
+        // 设置页是全屏面板；推算卡不是保护性元素，留在上面只会压住设置正文。
+        visible: !window.showSettings && hasSignal
+        anchors.left: hud.visible ? hud.left : parent.left
+        anchors.leftMargin: hud.visible ? 0 : 16
+        // 起点取左列所有已显示卡片的下沿：倒计时卡贴右侧时不影响本卡，退回左列时则以它为准。
+        anchors.top: hud.visible || warningHud.visible
+            ? (warningHud.visible && !window.countdownBesideHud
+                ? warningHud.bottom
+                : (hud.visible ? hud.bottom : warningHud.bottom))
+            : parent.top
+        anchors.topMargin: hud.visible || warningHud.visible ? 8 : 16
+        width: hud.visible ? hud.width : Math.min(352, window.mapAreaWidth - 88)
+        theme: appTheme
+        backdropSource: map ? map.renderLayer : null
+        backdropLive: !!map && map.cameraMoving
+        info: app.sourceEstimateInfo
     }
     Toast { id: globalToast; theme: appTheme }
 }

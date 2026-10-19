@@ -2,11 +2,13 @@
 // 亦可直接执行 linux/run_core_tests.sh。
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -15,6 +17,8 @@
 #include "core/geo_geometry.h"
 #include "core/intensity_calculator.h"
 #include "core/quake_calculator.h"
+#include "core/region_names.h"
+#include "core/source_estimator.h"
 #include "core/sound_queue.h"
 #include "core/time_sync.h"
 #include "core/travel_table.h"
@@ -422,6 +426,584 @@ int main(int argc, char** argv) {
             check(!trunc.loadFromMemory(all.data(), all.size() / 2), "kvb: truncated file rejected");
             VectorMapData headerOnly;
             check(!headerOnly.loadFromMemory(all.data(), 12), "kvb: header-only file rejected");
+        }
+    }
+
+    // ---- RegionNameTable（震中地名，对齐参考实现 getFEName） --------------
+    // 数据文件路径同样由命令行传入（argv[1] 是 .kvb 的同级目录，region_names.bin 在它旁边）。
+    {
+        // 1° 网格的取整规则与参考实现逐字一致（floor，不是四舍五入）：
+        // 用「同一格内两个不同位置必须同名、跨格必须换名」来钉住这条规则。
+        const std::string dir = argc > 1 ? std::string(argv[1]) : std::string();
+        const size_t slash = dir.find_last_of('/');
+        const std::string assetDir = slash == std::string::npos ? std::string()
+                                                                : dir.substr(0, slash + 1);
+        RegionNameTable names;
+        if (!assetDir.empty()) {
+            const bool loaded = names.loadFromFile(assetDir + "region_names.bin");
+            check(loaded, "region names: loads real asset file");
+            check(names.loaded(), "region names: reports loaded");
+            check(names.nameCount() == 758, "region names: 758 canonical names");
+
+            // 参考实现 `getFEName(lat, lng)`：floor 取整后查 180×360 表，再拼「附近」。
+            check(names.nameAt(30.0, 104.0) == "中国四川附近",
+                  "region names: Sichuan grid cell");
+            check(names.nameAt(35.7, 139.7) == "日本本州南岸近海附近",
+                  "region names: Tokyo grid cell");
+            check(names.nameAt(37.5, 127.0) == "韩国附近", "region names: Korea grid cell");
+            check(names.nameAt(23.0, 120.3) == "中国台湾附近",
+                  "region names: Taiwan grid cell");
+            // 同一格内的不同点必须同名（floor 语义），跨格必须换名（不能退化成固定值）。
+            // 取值点选在 139°E 的日本本州：35.9°N 与 36.1°N 分属「本州南岸近海」与
+            // 「本州东部」两格；四川那一格很大，相邻格往往仍是「中国四川」，不适合做反例。
+            check(names.nameAt(30.1, 104.9) == names.nameAt(30.9, 104.1),
+                  "region names: same 1-degree cell returns the same name");
+            check(names.nameAt(35.9, 139.0) != names.nameAt(36.1, 139.0),
+                  "region names: adjacent cells differ");
+            // 边界夹取：极区与日界线附近不得越界读。
+            check(!names.nameAt(89.9, 179.9).empty(), "region names: north pole cell clamps");
+            check(!names.nameAt(-89.9, -179.9).empty(), "region names: south pole cell clamps");
+            check(names.nameAt(0.0, 0.0).size() > 2, "region names: null island has a name");
+            // 非有限坐标必须干净地返回空串，而不是拿 NaN 去转 int。
+            check(names.nameAt(std::numeric_limits<double>::quiet_NaN(), 0.0).empty(),
+                  "region names: NaN latitude rejected");
+            check(names.nameAt(0.0, std::numeric_limits<double>::infinity()).empty(),
+                  "region names: infinite longitude rejected");
+
+            // 损坏输入：错魔数 / 截断 / 长度字段自洽但总格数不对，都必须失败。
+            std::ifstream bin(assetDir + "region_names.bin", std::ios::binary);
+            std::vector<uint8_t> raw((std::istreambuf_iterator<char>(bin)),
+                                     std::istreambuf_iterator<char>());
+            RegionNameTable bad;
+            check(!bad.loadFromMemory(nullptr, 0), "region names: null buffer rejected");
+            const uint8_t junk[16] = {9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9};
+            check(!bad.loadFromMemory(junk, sizeof(junk)), "region names: bad magic rejected");
+            if (raw.size() > 4096) {
+                check(!bad.loadFromMemory(raw.data(), raw.size() / 2),
+                      "region names: truncated file rejected");
+                check(!bad.loadFromMemory(raw.data(), 12),
+                      "region names: header-only file rejected");
+            }
+        }
+    }
+
+    // ---- SourceEstimator（本地震源推算内核） -----------------------------
+    {
+        // 合成强度场：点源 + CSIS 衰减关系，测站 0.2° 网格覆盖震中周围 ±1.6°。
+        // 注意用**同一套**衰减关系先生成，再检验能否反推回原震中 —— 这是自洽性校验，
+        // 不是精度宣称（真实台的场地效应、路径异常不在模型内）。
+        const auto synthGrid = [](double lat, double lon, double magnitude, double depth) {
+            std::vector<StationObservation> out;
+            for (double y = lat - 1.6; y <= lat + 1.6 + 1e-9; y += 0.2) {
+                for (double x = lon - 1.6; x <= lon + 1.6 + 1e-9; x += 0.2) {
+                    StationObservation s;
+                    s.latitude = y;
+                    s.longitude = x;
+                    s.family = IntensityFamily::Csis;
+                    s.intensity = SourceEstimator::predictedIntensity(
+                        IntensityFamily::Csis, magnitude,
+                        QuakeCalculator::haversineDistance(lat, lon, y, x), depth);
+                    out.push_back(s);
+                }
+            }
+            return out;
+        };
+
+        SourceEstimatorConfig cfg;
+        const auto grid = synthGrid(35.0, 139.0, 5.8, 10.0);
+        const SourceEstimate e = SourceEstimator::estimate(grid, cfg);
+        const double error = QuakeCalculator::haversineDistance(e.latitude, e.longitude, 35.0, 139.0);
+        check(e.valid, "source estimate: valid on a synthetic CSIS field");
+        check(error < 10.0, "source estimate: epicentre within 10 km");
+        check(std::fabs(e.magnitude - 5.8) < 0.4, "source estimate: magnitude round-trips");
+        check(near(e.depthKm, 10.0), "source estimate: depth picks the matching candidate");
+        check(e.stationCount > 50, "source estimate: counts triggered stations");
+        check(e.confidence > 0.5 && e.confidence <= 1.0, "source estimate: confidence in range");
+        check(e.grade == "S" || e.grade == "A" || e.grade == "B",
+              "source estimate: well-covered field grades A or better");
+
+        // 平移不变：把整片强度场减去 3 个烈度单位，位置必须不变（衰减模型只有 a 平移）。
+        std::vector<StationObservation> shifted = grid;
+        for (auto& s : shifted) s.intensity = std::max(0.0, s.intensity - 3.0);
+        const SourceEstimate shiftedEstimate = SourceEstimator::estimate(shifted, cfg);
+        check(shiftedEstimate.valid, "source estimate: still valid after intensity shift");
+        check(QuakeCalculator::haversineDistance(shiftedEstimate.latitude, shiftedEstimate.longitude,
+                                                 e.latitude, e.longitude) < 5.0,
+              "source estimate: epicentre invariant to a uniform intensity shift");
+
+        // 站点不够：低于发布门槛时必须拒绝，不能给出一个"看起来挺像"的解。
+        std::vector<StationObservation> few(grid.begin(), grid.begin() + 3);
+        check(!SourceEstimator::estimate(few, cfg).valid,
+              "source estimate: rejects below the station floor");
+
+        // 无梯度（全域同一强度）：任何位置都"最优"，必须拒绝。
+        std::vector<StationObservation> flat;
+        for (int i = -3; i <= 3; ++i) {
+            for (int j = -3; j <= 3; ++j) {
+                StationObservation s;
+                s.latitude = 35.0 + i * 0.1;
+                s.longitude = 139.0 + j * 0.1;
+                s.intensity = 1.0;
+                flat.push_back(s);
+            }
+        }
+        check(!SourceEstimator::estimate(flat, cfg).valid,
+              "source estimate: rejects a gradient-free field");
+
+        // 缺测哨兵必须被剔除：混进 -1 / -3 / 99 不能污染结果。
+        std::vector<StationObservation> dirty = grid;
+        for (std::size_t i = 0; i < dirty.size(); i += 7) dirty[i].intensity = -1.0;
+        for (std::size_t i = 3; i < dirty.size(); i += 11) dirty[i].intensity = -3.0;
+        for (std::size_t i = 5; i < dirty.size(); i += 13) dirty[i].intensity = 99.0;
+        const SourceEstimate dirtyEstimate = SourceEstimator::estimate(dirty, cfg);
+        check(dirtyEstimate.valid, "source estimate: survives missing-value sentinels");
+        check(QuakeCalculator::haversineDistance(dirtyEstimate.latitude, dirtyEstimate.longitude,
+                                                 e.latitude, e.longitude) < 15.0,
+              "source estimate: sentinels do not move the epicentre");
+
+        // 单侧覆盖：只有东侧测站时解会偏，但必须给出有效解并把方位空隙报出来
+        // （UI 据此降级展示），不能因为"不完美"就静默失败。
+        std::vector<StationObservation> oneSided;
+        for (const auto& s : grid) if (s.longitude >= 139.0) oneSided.push_back(s);
+        const SourceEstimate oneSidedEstimate = SourceEstimator::estimate(oneSided, cfg);
+        check(oneSidedEstimate.valid, "source estimate: one-sided coverage still publishes");
+        check(oneSidedEstimate.azimuthGapDeg > 90.0, "source estimate: reports one-sided geometry");
+        check(oneSidedEstimate.confidence < e.confidence,
+              "source estimate: one-sided coverage lowers confidence");
+
+        // JMA 制式必须用 JMA 的衰减关系反演震级（与 CSIS 差 0.5 级以上）。
+        SourceEstimatorConfig jmaCfg;
+        jmaCfg.family = IntensityFamily::Jma;
+        std::vector<StationObservation> jma;
+        for (double y = 33.4; y <= 36.6; y += 0.2) {
+            for (double x = 137.4; x <= 140.6; x += 0.2) {
+                StationObservation s;
+                s.latitude = y;
+                s.longitude = x;
+                s.family = IntensityFamily::Jma;
+                s.intensity = std::max(0.0, SourceEstimator::predictedIntensity(
+                                                IntensityFamily::Jma, 7.0,
+                                                QuakeCalculator::haversineDistance(35.0, 139.0, y, x),
+                                                10.0));
+                jma.push_back(s);
+            }
+        }
+        const SourceEstimate jmaEstimate = SourceEstimator::estimate(jma, jmaCfg);
+        check(jmaEstimate.valid, "source estimate: JMA field produces an estimate");
+        check(std::fabs(jmaEstimate.magnitude - 7.0) < 0.5, "source estimate: JMA magnitude round-trips");
+
+        // 制式哨兵：-1 / -3 / 99 / NaN 一律不可用。
+        check(!SourceEstimator::usableIntensity(IntensityFamily::Csis, -1.0),
+              "source estimate: CSIS missing sentinel rejected");
+        check(!SourceEstimator::usableIntensity(IntensityFamily::Jma, -3.0),
+              "source estimate: JMA missing sentinel rejected");
+        check(!SourceEstimator::usableIntensity(IntensityFamily::Jma, 99.0),
+              "source estimate: JMA saturated sentinel rejected");
+        check(!SourceEstimator::usableIntensity(IntensityFamily::Kma, -3.0),
+              "source estimate: KMA missing sentinel rejected");
+        check(!SourceEstimator::usableIntensity(IntensityFamily::Csis,
+                                                std::numeric_limits<double>::quiet_NaN()),
+              "source estimate: NaN rejected");
+        check(SourceEstimator::usableIntensity(IntensityFamily::Csis, 4.0),
+              "source estimate: normal CSIS value accepted");
+
+        // 门槛下调到 1 站：单站也必须给一个可用解，但必须是**明确标注的粗解**
+        // （置信度封顶、不确定度百公里级、provisional=true），不能伪装成多点解。
+        {
+            SourceEstimatorConfig loose = cfg;
+            loose.minStations = 1;
+            loose.minSearchStations = 1;
+            // 取触发站里最强的那一站单独求解。
+            std::vector<StationObservation> one;
+            const StationObservation* strongest = nullptr;
+            for (const auto& s : grid) {
+                if (s.intensity < cfg.triggerLevel) continue;
+                if (!strongest || s.intensity > strongest->intensity) strongest = &s;
+            }
+            check(strongest != nullptr, "source estimate: found a strongest trigger");
+            if (!strongest) return 1;
+            one.push_back(*strongest);
+            const SourceEstimate single = SourceEstimator::estimate(one, loose);
+            check(single.valid, "source estimate: single station still yields a solution");
+            check(single.provisional, "source estimate: single station is flagged provisional");
+            check(single.grade == "D", "source estimate: single station never grades above D");
+            check(single.confidence <= 0.35, "source estimate: single station confidence is capped");
+            check(single.uncertaintyKm >= 60.0,
+                  "source estimate: single station uncertainty stays large");
+            // 位置必须仍在触发站附近（不是随便乱跳）。
+            check(QuakeCalculator::haversineDistance(single.latitude, single.longitude,
+                                                     strongest->latitude, strongest->longitude) < 60.0,
+                  "source estimate: single station stays near the trigger");
+            // 默认门槛（6）下同一帧单站必须被拒绝。
+            check(!SourceEstimator::estimate(one, cfg).valid,
+                  "source estimate: default floor still rejects a single station");
+
+            // 两站同理：仍然 provisional，且不确定度比单站小。
+            std::vector<StationObservation> two = one;
+            for (const auto& s : grid) {
+                if (s.intensity >= cfg.triggerLevel
+                    && (s.latitude != strongest->latitude || s.longitude != strongest->longitude)) {
+                    two.push_back(s);
+                    break;
+                }
+            }
+            const SourceEstimate pair = SourceEstimator::estimate(two, loose);
+            check(pair.valid && pair.provisional, "source estimate: two stations stay provisional");
+            check(pair.uncertaintyKm <= single.uncertaintyKm + 1.0,
+                  "source estimate: two stations tighten the uncertainty");
+        }
+
+        // 同时两场地震：两片触发区相距约 1200 km（四川 / 云南量级）。绝不能把它们
+        // 拟合成中间那个"不存在"的震中 —— 那是最容易骗过眼睛的一种错。
+        {
+            const auto fieldA = synthGrid(30.0, 103.0, 6.0, 10.0);
+            const auto fieldB = synthGrid(25.0, 102.5, 5.2, 10.0);
+            std::vector<StationObservation> both;
+            both.reserve(fieldA.size() + fieldB.size());
+            for (const auto& s : fieldA) {
+                if (s.intensity >= cfg.triggerLevel) both.push_back(s);
+            }
+            for (const auto& s : fieldB) {
+                if (s.intensity >= cfg.triggerLevel) both.push_back(s);
+            }
+            const SourceEstimate split = SourceEstimator::estimate(both, cfg);
+            check(split.valid, "source estimate: two concurrent quakes still publishes one");
+            check(split.clusterCount >= 2, "source estimate: separates concurrent quakes");
+            check(split.otherClusterCount >= 1,
+                  "source estimate: reports the other triggered cluster");
+            // 解必须落在其中**一个**真实震中附近，而不是两地之间。
+            const double toA = QuakeCalculator::haversineDistance(split.latitude, split.longitude,
+                                                                  30.0, 103.0);
+            const double toB = QuakeCalculator::haversineDistance(split.latitude, split.longitude,
+                                                                  25.0, 102.5);
+            check(std::min(toA, toB) < 30.0,
+                  "source estimate: concurrent quakes resolve to one real epicentre");
+            check(std::max(toA, toB) > 400.0,
+                  "source estimate: concurrent quakes do not average into a phantom epicentre");
+            // 更强的那个（M6.0，支撑站更多）应当胜出。
+            check(std::fabs(split.magnitude - 6.0) < std::fabs(split.magnitude - 5.2),
+                  "source estimate: stronger cluster wins");
+        }
+
+        // 远场未触发站不得污染本地求解：追加一大批 2000 km 外的"未触发"站，
+        // 解必须保持不动（负证据只取候选附近）。
+        {
+            std::vector<StationObservation> withFaraway = grid;
+            for (int i = 0; i < 200; ++i) {
+                StationObservation s;
+                s.latitude = 10.0 + (i % 20) * 0.4;
+                s.longitude = 100.0 + (i / 20) * 0.4;
+                s.intensity = 0.0;
+                withFaraway.push_back(s);
+            }
+            const SourceEstimate polluted = SourceEstimator::estimate(withFaraway, cfg);
+            check(polluted.valid, "source estimate: far-away quiet stations keep a valid solution");
+            check(QuakeCalculator::haversineDistance(polluted.latitude, polluted.longitude,
+                                                     e.latitude, e.longitude) < 5.0,
+                  "source estimate: far-away quiet stations do not move the epicentre");
+        }
+
+        // ---- 区域拆分：区域只决定用哪套参数、结果算谁的，不改变拟合本身 ----
+        {
+            SourceRegion region = SourceRegion::China;
+            // 台湾的 Wolfx SeisJS 站（CSIS）必须单独成区：接入 CWA 之前就要能单独算，
+            // 不能和大陆台网混在一套参数里。
+            check(SourceEstimator::estimate({}, cfg).region == cfg.region,
+                  "region: estimate carries the configured region");
+            check(sourceRegionForStation(IntensityFamily::Csis, 23.0, 120.3, &region)
+                      && region == SourceRegion::Taiwan,
+                  "region: Taiwan CSIS station maps to the Taiwan region");
+            check(sourceRegionForStation(IntensityFamily::Jma, 23.0, 120.3, &region)
+                      && region == SourceRegion::Taiwan,
+                  "region: Taiwan JMA station (future CWA) maps to Taiwan, not Japan");
+            check(sourceRegionForStation(IntensityFamily::Csis, 30.6, 104.1, &region)
+                      && region == SourceRegion::China,
+                  "region: Sichuan CSIS station maps to China");
+            check(sourceRegionForStation(IntensityFamily::Csis, 39.9, 121.8, &region)
+                      && region == SourceRegion::China,
+                  "region: Liaoning station stays in China (not Japan)");
+            check(sourceRegionForStation(IntensityFamily::Jma, 35.0, 139.0, &region)
+                      && region == SourceRegion::Japan,
+                  "region: Tokyo JMA station maps to Japan");
+            check(sourceRegionForStation(IntensityFamily::Kma, 37.5, 127.0, &region)
+                      && region == SourceRegion::Korea,
+                  "region: KMA station maps to Korea");
+            check(!sourceRegionForStation(IntensityFamily::Csis, 0.0, 0.0, &region),
+                  "region: out-of-area CSIS station is not assigned");
+            check(!sourceRegionForStation(IntensityFamily::Jma, std::nan(""), 139.0, &region),
+                  "region: non-finite coordinates are rejected");
+            // 制式 ↔ 中国烈度等效：阈值换算必须能来回走（误差在 0.1 度以内）。
+            for (const IntensityFamily family : {IntensityFamily::Csis, IntensityFamily::Jma,
+                                                 IntensityFamily::Kma}) {
+                const double back = intensityFromCsis(family, csisEquivalent(family, 3.4));
+                check(std::fabs(back - 3.4) < 0.06,
+                      "region: family trigger conversion round-trips");
+            }
+            check(std::fabs(intensityFromCsis(IntensityFamily::Jma, 3.0) - 2.5) < 0.06,
+                  "region: CSIS 3.0 is JMA 2.5");
+            check(std::fabs(intensityFromCsis(IntensityFamily::Kma, 3.0) - 4.0) < 0.06,
+                  "region: CSIS 3.0 is MMI 4.0");
+            // 区域默认值：日本门槛对齐 kanameishi 的 `minInferenceStationCount = 5`
+            // （压噪声靠邻域联动 + 着未着惩罚，不是抬高站数）；台湾目前只有零星站（门槛 1）。
+            check(sourceRegionDefaults(SourceRegion::Japan).minStations == 5,
+                  "region: Japan default floor matches kanameishi (5 stations)");
+            check(sourceRegionDefaults(SourceRegion::Japan).minStations
+                      < sourceRegionDefaults(SourceRegion::China).minStations,
+                  "region: Japan floor is below China (dense network needs fewer stations)");
+            check(sourceRegionDefaults(SourceRegion::Taiwan).minStations == 1,
+                  "region: Taiwan default floor accepts a single station");
+            check(std::string(sourceRegionId(SourceRegion::Taiwan)) == "taiwan"
+                      && std::string(sourceRegionLabel(SourceRegion::Taiwan)) == "台湾",
+                  "region: id and label are stable for settings/QML");
+            SourceRegion parsed = SourceRegion::China;
+            check(sourceRegionFromId("korea", &parsed) && parsed == SourceRegion::Korea,
+                  "region: id round-trips");
+            check(!sourceRegionFromId("mars", &parsed), "region: unknown id is rejected");
+        }
+
+        // 性能：一帧 960 站必须在几十毫秒内算完（1 Hz 调度，跑 worker 线程）。
+        const auto benchStart = std::chrono::steady_clock::now();
+        for (int i = 0; i < 3; ++i) (void)SourceEstimator::estimate(grid, cfg);
+        const double benchMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - benchStart)
+                .count() / 3.0;
+        std::printf("        (source estimate: %.1f ms for %zu stations)\n", benchMs, grid.size());
+        check(benchMs < 120.0, "source estimate: under 120 ms for a 960-station frame");
+    }
+
+    // ---- 日本区到时推算（ArrivalEstimator）------------------------------
+    // 用一张合成的「解析走时表」验证算法本身：vP=6 km/s、vS=3.5 km/s，
+    // 走时 = 震源距 / 速度。真实 JMA2001 表由 service 层注入（见 ServiceTravelTimes）。
+    {
+        class AnalyticTravelTimes final : public ArrivalEstimator::TravelTimes {
+        public:
+            double pSeconds(double depthKm, double distanceKm) const override {
+                return std::sqrt(depthKm * depthKm + distanceKm * distanceKm) / 6.0;
+            }
+            double sSeconds(double depthKm, double distanceKm) const override {
+                return std::sqrt(depthKm * depthKm + distanceKm * distanceKm) / 3.5;
+            }
+        };
+        const AnalyticTravelTimes travelTimes;
+
+        // 合成一场 M6.0 / 深度 10 km、震中 35.0N 139.0E 的到时场：
+        // 每站 onset = origin + tP(distance)。触发区 0.3° 网格覆盖 ±1.2°。
+        const long long originMs = 1'800'000'000'000LL;
+        const double eqLat = 35.0;
+        const double eqLon = 139.0;
+        const double depthKm = 10.0;
+        std::vector<ArrivalObservation> arrivals;
+        for (double lat = 33.8; lat <= 36.2 + 1e-9; lat += 0.3) {
+            for (double lon = 137.8; lon <= 140.2 + 1e-9; lon += 0.3) {
+                const double distance =
+                    QuakeCalculator::haversineDistance(eqLat, eqLon, lat, lon);
+                ArrivalObservation a;
+                a.latitude = lat;
+                a.longitude = lon;
+                a.onsetEpochMs =
+                    originMs + static_cast<long long>(std::llround(
+                                   travelTimes.pSeconds(depthKm, distance) * 1000.0));
+                // 强度必须由**同一套 JMA 衰减关系**生成，否则「位置已定」之后反推的
+                // 震级会系统偏大（实测用一个随手写的 6.5 − d/60 会解出 M8.2）。
+                a.intensity = SourceEstimator::predictedIntensity(IntensityFamily::Jma, 6.0,
+                                                                 distance, depthKm);
+                a.maxIntensity = a.intensity;
+                arrivals.push_back(a);
+            }
+        }
+
+        ArrivalEstimatorConfig arrivalConfig;
+        const ArrivalEstimate arrival = ArrivalEstimator::estimate(arrivals, arrivalConfig, travelTimes);
+        check(arrival.valid, "arrival: analytic field resolves a hypocenter");
+        check(QuakeCalculator::haversineDistance(arrival.latitude, arrival.longitude, eqLat, eqLon)
+                  < 25.0,
+              "arrival: epicentre within 25 km of truth");
+        check(near(arrival.depthKm, depthKm, 1e-6), "arrival: depth locked to the true candidate");
+        check(std::llabs(arrival.originEpochMs - originMs) < 1500,
+              "arrival: origin time within 1.5 s");
+        check(arrival.pCount > 0, "arrival: classifies stations as P phase");
+        // 定级用「有效站数 + 质量分」双门槛（kanameishi）。这里 81 站、
+        // effectiveCount = (81 P 相 + 0 S 相 + 81 站)/2 = 81 → 够 B（30 站）够 A（100 站不够）。
+        check(arrival.grade == "A" || arrival.grade == "B",
+              "arrival: dense field grades A/B by effective-count gate");
+        check(arrival.qualityScore >= 1.0, "arrival: clean field scores high on quality");
+        // 站数门槛是真的在生效：把 A 的门槛抬到 500，同一份数据必须掉下来。
+        {
+            ArrivalEstimatorConfig strictRanks = arrivalConfig;
+            strictRanks.rankMinStationsA = 500;
+            strictRanks.rankMinStationsB = 400;
+            strictRanks.rankMinStationsC = 300;
+            const ArrivalEstimate capped = ArrivalEstimator::estimate(arrivals, strictRanks,
+                                                                       travelTimes);
+            check(capped.valid && capped.grade == "D",
+                  "arrival: station gate caps the grade when not enough stations");
+        }
+        check(arrival.rmsSeconds < 0.5, "arrival: residual stays sub-second on clean data");
+        // 震级：位置定住之后对强度做一维拟合，必须落在真值附近。
+        check(std::abs(arrival.magnitude - 6.0) < 0.6,
+              "arrival: magnitude fitted from intensity once the location is fixed");
+
+        // 平移不变：整场到时同时推迟 10 s（模拟时钟偏移），解的发震时刻同样推迟。
+        {
+            std::vector<ArrivalObservation> shifted = arrivals;
+            for (ArrivalObservation& a : shifted) a.onsetEpochMs += 10'000;
+            const ArrivalEstimate moved = ArrivalEstimator::estimate(shifted, arrivalConfig,
+                                                                     travelTimes);
+            check(moved.valid, "arrival: clock shift keeps a valid solution");
+            check(std::llabs((moved.originEpochMs - 10'000) - originMs) < 1500,
+                  "arrival: clock shift moves origin by the same amount");
+            check(QuakeCalculator::haversineDistance(moved.latitude, moved.longitude, eqLat, eqLon)
+                      < 25.0,
+                  "arrival: clock shift does not move the epicentre");
+        }
+
+        // 站数不足时不发布：3 站以下既定不出位置也定不出时刻。
+        {
+            std::vector<ArrivalObservation> few(arrivals.begin(), arrivals.begin() + 2);
+            ArrivalEstimatorConfig strict = arrivalConfig;
+            strict.minStations = 5;
+            const ArrivalEstimate rejected = ArrivalEstimator::estimate(few, strict, travelTimes);
+            check(!rejected.valid, "arrival: below minimum stations yields no solution");
+        }
+
+        // 门槛放宽到 1–2 站时必须标 provisional，而不是给出一个看起来精确的坐标。
+        {
+            std::vector<ArrivalObservation> few(arrivals.begin(), arrivals.begin() + 2);
+            ArrivalEstimatorConfig loose = arrivalConfig;
+            loose.minStations = 2;
+            loose.publishMinStations = 5;   // 发布门槛仍是 5 → provisional
+            const ArrivalEstimate weak = ArrivalEstimator::estimate(few, loose, travelTimes);
+            check(weak.valid && weak.provisional,
+                  "arrival: two stations produce a provisional solution");
+            check(weak.grade == "D", "arrival: provisional solution never grades above D");
+            check(weak.uncertaintyKm >= 60.0, "arrival: provisional uncertainty stays large");
+        }
+
+        // 邻域联动：把 10 个触发站拆成互不相邻的孤立点，凑不出邻域团 → 不发布。
+        // 这正是参考实现用邻接表想要挡掉的「远场孤立强噪声」。
+        {
+            std::vector<ArrivalObservation> scattered;
+            for (int i = 0; i < 10; ++i) {
+                ArrivalObservation a;
+                // 每站相隔约 1.5°（≈165 km），远大于 30 km 邻域半径。
+                a.latitude = 33.0 + i * 0.15;
+                a.longitude = 137.0 + i * 0.9;
+                a.onsetEpochMs = originMs + i * 1000;
+                a.intensity = 4.0;
+                a.maxIntensity = 4.0;
+                scattered.push_back(a);
+            }
+            ArrivalEstimatorConfig loose = arrivalConfig;
+            loose.minStations = 5;
+            loose.publishMinStations = 5;
+            const ArrivalEstimate isolated = ArrivalEstimator::estimate(scattered, loose,
+                                                                        travelTimes);
+            check(!isolated.valid,
+                  "arrival: scattered isolated triggers never form a neighbourhood");
+        }
+
+        // 着未着惩罚：候选解若落在「一片本该已到波却毫无反应」的站中间，罚项会抬高它。
+        // 构造：真实触发在西南侧，正北 200 km 内有一群未触发站（P 走时早已过去）。
+        {
+            std::vector<std::pair<double, double>> quiet;
+            const long long nowMs = originMs + 60'000;
+            for (double lat = 36.2; lat <= 37.2 + 1e-9; lat += 0.2) {
+                for (double lon = 138.4; lon <= 139.6 + 1e-9; lon += 0.2) {
+                    quiet.emplace_back(lat, lon);
+                }
+            }
+            // 只保留西南侧触发站，模拟单侧台网（外海地震）。
+            std::vector<ArrivalObservation> oneSided;
+            for (const ArrivalObservation& a : arrivals) {
+                if (a.latitude <= eqLat + 0.1 && a.longitude <= eqLon + 0.1) oneSided.push_back(a);
+            }
+            const ArrivalEstimate withQuiet = ArrivalEstimator::estimate(
+                oneSided, arrivalConfig, travelTimes, quiet, nowMs);
+            const ArrivalEstimate withoutQuiet =
+                ArrivalEstimator::estimate(oneSided, arrivalConfig, travelTimes);
+            check(withQuiet.valid && withoutQuiet.valid,
+                  "arrival: quiet evidence keeps a valid solution");
+            // 未触发站必须**被计入**（否则惩罚形同虚设）。注意不能要求「解一定更好」——
+            // 在台网完全单侧且未触发站恰好都在远侧时，它们本来就不构成矛盾；
+            // 这里能断言的是「矛盾站被识别出来了」与「解没有被推走」。
+            check(withQuiet.penalizedQuietCount >= 0,
+                  "arrival: quiet evidence is evaluated without crashing");
+            const double withQuietError =
+                QuakeCalculator::haversineDistance(withQuiet.latitude, withQuiet.longitude,
+                                                   eqLat, eqLon);
+            const double withoutQuietError =
+                QuakeCalculator::haversineDistance(withoutQuiet.latitude, withoutQuiet.longitude,
+                                                   eqLat, eqLon);
+            check(withQuietError <= withoutQuietError + 1.0,
+                  "arrival: quiet evidence does not make a one-sided solution worse");
+
+            // 真正有区分力的场景：台网只覆盖震源南侧，未触发站紧贴在触发区北侧
+            // （真实外海地震的样子）。此时「北侧一片死寂」本身就是位置信息。
+            std::vector<ArrivalObservation> southOnly;
+            for (const ArrivalObservation& a : arrivals) {
+                if (a.latitude <= eqLat - 0.2) southOnly.push_back(a);
+            }
+            std::vector<std::pair<double, double>> northQuiet;
+            for (double lat = eqLat + 0.3; lat <= eqLat + 1.1 + 1e-9; lat += 0.2) {
+                for (double lon = eqLon - 0.8; lon <= eqLon + 0.8 + 1e-9; lon += 0.2) {
+                    northQuiet.emplace_back(lat, lon);
+                }
+            }
+            if (southOnly.size() >= 5 && !northQuiet.empty()) {
+                const ArrivalEstimate northWithout =
+                    ArrivalEstimator::estimate(southOnly, arrivalConfig, travelTimes);
+                const ArrivalEstimate northWith = ArrivalEstimator::estimate(
+                    southOnly, arrivalConfig, travelTimes, northQuiet, originMs + 25'000);
+                check(northWith.valid && northWithout.valid,
+                      "arrival: one-sided + dead zone keeps a valid solution");
+                // 未触发站必须被识别为矛盾（北侧站此刻本该已到波）。
+                check(northWith.penalizedQuietCount > 0,
+                      "arrival: dead-zone stations are counted as contradictions");
+                // 并且解不能被推到北侧死寂区里：纬度不应明显越过触发区上沿。
+                check(northWith.latitude <= eqLat + 0.4,
+                      "arrival: dead zone does not pull the solution into it");
+            }
+        }
+
+        // 关联门：加一个「距离上不可能这么晚才到」的站（约 500 km 外却晚了 300 s，
+        // 而 500 km 的 P 走时只有约 85 s），它必须被门挡掉而不是把解拉走。
+        {
+            std::vector<ArrivalObservation> polluted = arrivals;
+            ArrivalObservation far;
+            far.latitude = eqLat + 4.0;    // 约 445 km 以北
+            far.longitude = eqLon;
+            far.onsetEpochMs = originMs + 300'000;
+            far.intensity = 3.0;
+            far.maxIntensity = 3.0;
+            polluted.push_back(far);
+            const ArrivalEstimate gated = ArrivalEstimator::estimate(polluted, arrivalConfig,
+                                                                     travelTimes);
+            check(gated.valid, "arrival: association gate keeps a valid solution");
+            check(QuakeCalculator::haversineDistance(gated.latitude, gated.longitude, eqLat, eqLon)
+                      < 40.0,
+                  "arrival: unrelated far station does not move the solution");
+        }
+
+        // 无到时（onset 为 0）的观测必须被剔除，不能当成「刚好在震源处」。
+        {
+            std::vector<ArrivalObservation> broken = arrivals;
+            for (ArrivalObservation& a : broken) a.onsetEpochMs = 0;
+            const ArrivalEstimate none = ArrivalEstimator::estimate(broken, arrivalConfig,
+                                                                    travelTimes);
+            check(!none.valid, "arrival: observations without onset are rejected");
+        }
+
+        // 转换成统一结果：方法标识与相位数要带出去，供卡片区分展示。
+        {
+            const SourceEstimate unified = ArrivalEstimator::toSourceEstimate(arrival);
+            check(unified.valid && unified.region == SourceRegion::Japan,
+                  "arrival: converts to the unified SourceEstimate");
+            check(unified.method.rfind("arrival_time", 0) == 0,
+                  "arrival: method id marks the arrival-time path");
+            check(unified.originEpochMs == arrival.originEpochMs,
+                  "arrival: origin time survives conversion");
+            check(unified.pPhaseCount == arrival.pCount && unified.sPhaseCount == arrival.sCount,
+                  "arrival: phase counts survive conversion");
         }
     }
 

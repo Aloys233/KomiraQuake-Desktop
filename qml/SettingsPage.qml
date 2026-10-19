@@ -17,6 +17,7 @@ Item {
         { key: "map", title: "地图与图层", icon: "map", description: "底图，以及地图上的矢量、测站与波前叠加层。" },
         { key: "appearance", title: "外观", icon: "sun", description: "主题、背景模糊与动态效果。" },
         { key: "location", title: "定位", icon: "map-pin", description: "设置用于估算本地烈度、距离与预计到时的位置。" },
+        { key: "sourceEstimation", title: "震源推算", icon: "locate-fixed", description: "只用实时测站强度反推震中、震级与深度（Beta）。" },
         { key: "source", title: "数据源", icon: "radio", description: "逐源启停、测站显示与信息事件震级过滤。" },
         { key: "clock", title: "时间校准", icon: "clock", description: "网络授时：开关、自定义 NTP 服务器与校准状态。" },
         { key: "about", title: "启动与更新", icon: "refresh-cw", description: "开机自启、静默启动、关闭行为与版本更新。" }
@@ -202,17 +203,21 @@ Item {
                         onPickLocationRequested: root.pickLocationRequested()
                         onNotify: (message, success) => toast.show(message, success)
                     }
-                    SourceSection {
+                    SourceEstimationSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 5; height: visible ? implicitHeight : 0
                     }
-                    ClockSection {
+                    SourceSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 6; height: visible ? implicitHeight : 0
                     }
-                    AboutSection {
+                    ClockSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 7; height: visible ? implicitHeight : 0
+                    }
+                    AboutSection {
+                        width: parent.width; theme: root.theme
+                        visible: root.currentSection === 8; height: visible ? implicitHeight : 0
                     }
                 }
             }
