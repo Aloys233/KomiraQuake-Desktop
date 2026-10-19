@@ -811,14 +811,15 @@ QSGNode* VectorMapItem::updateGpuNode(QSGNode* oldNode, const RenderState& state
 
     qint64 visibleSignature = 0;
     int visibleCount = 0;
-    for (const auto& tile : mesh->tiles) {
-        const bool visible =
-            tile.originX <= viewX1 && tile.originX + VectorMeshBuilder::kTileWorldPx >= viewX0 &&
-            tile.originY <= viewY1 && tile.originY + VectorMeshBuilder::kTileWorldPx >= viewY0;
-        if (!visible || tile.fillIndices.size() < 3) continue;
+    const double batchSpan =
+        VectorMeshBuilder::kTileWorldPx * VectorMeshBuilder::kMaxTilesPerBatch;
+    for (const auto& batch : mesh->batches) {
+        const bool visible = batch.originX <= viewX1 && batch.originX + batchSpan >= viewX0 &&
+                             batch.originY <= viewY1 && batch.originY + batchSpan >= viewY0;
+        if (!visible || batch.indices.size() < 3) continue;
         ++visibleCount;
-        visibleSignature = visibleSignature * 131 + static_cast<qint64>(tile.originX) * 31 +
-                           static_cast<qint64>(tile.originY);
+        visibleSignature = visibleSignature * 131 + static_cast<qint64>(batch.originX) * 31 +
+                           static_cast<qint64>(batch.originY);
     }
     visibleSignature = visibleSignature * 131 + visibleCount;
 
@@ -841,13 +842,8 @@ QSGNode* VectorMapItem::updateGpuNode(QSGNode* oldNode, const RenderState& state
     QSGNode* child = root->firstChild();
 
     for (const auto& batch : mesh->batches) {
-        const bool visible =
-            batch.originX <= viewX1 &&
-            batch.originX + VectorMeshBuilder::kTileWorldPx * VectorMeshBuilder::kMaxTilesPerBatch >=
-                viewX0 &&
-            batch.originY <= viewY1 &&
-            batch.originY + VectorMeshBuilder::kTileWorldPx * VectorMeshBuilder::kMaxTilesPerBatch >=
-                viewY0;
+        const bool visible = batch.originX <= viewX1 && batch.originX + batchSpan >= viewX0 &&
+                             batch.originY <= viewY1 && batch.originY + batchSpan >= viewY0;
         if (!visible || batch.indices.size() < 3) continue;
 
         QMatrix4x4 m;

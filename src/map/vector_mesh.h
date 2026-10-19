@@ -49,14 +49,20 @@ public:
     /// 阈值，同时世界层只膨胀 1.68 倍。
     static constexpr double kTileWorldPx = 8192.0;
 
-    /// 每个绘制段最多合并多少块（每边）。4 → 段内最多 16 个块、坐标上限 32768
-    /// 世界像素（z18 误差 ≈ 0.5 px）。
+    /// 每个绘制段最多合并多少块（每边）。**当前为 1，即不合批**（见下方实测）。
     ///
-    /// 为什么要分段：`QSGGeometryNode` 没有 setMatrix，块的位置只能靠
-    /// `QSGTransformNode` 表达；而**每个块一个 transform node** 会让场景图每帧把
-    /// N 个子树标脏、各提交一次 draw call，无法合批。实测（llvmpipe，40 帧拖动）
-    /// 每块一个 transform node 是 36 ms，全部共用一个降到 20 ms —— 节点数就是瓶颈。
-    /// 分段后段数从「块数」降到「块数/16」，且段内顶点位置已烘焙，无需逐帧改矩阵。
+    /// `Batch` 这套「段」的机制是为此前的一个假设建的：`QSGGeometryNode` 没有
+    /// setMatrix，块位置只能靠 `QSGTransformNode` 表达，于是怀疑「每块一个节点」
+    /// 的节点数/子树的每帧标脏是瓶颈，想把相邻块合成一段以合并 draw call。
+    ///
+    /// **实测否掉了这个假设**（llvmpipe，40 帧连续平移，GL 后端）：
+    ///
+    ///   kMaxTilesPerBatch   1     2     3     4     6     8
+    ///   平均帧时 (ms)       27    29    31    35    46    41
+    ///
+    /// 段越大越慢 —— 软件光栅化下**填充率**才是瓶颈，合并后的段包围盒更大，
+    /// 会把更多屏幕外像素也画一遍。所以保持「每块一个变换节点」，不做合批。
+    /// 保留 `Batch` 结构与这段注释，是为了让后来者不必重复这次试验。
     static constexpr int kMaxTilesPerBatch = 1;
 
     /// 一条环的**已投影**坐标（参考层级世界像素，交错 x,y）。
@@ -148,8 +154,11 @@ public:
         struct FeatureBounds {
             double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
         };
-        std::vector<Tile> tiles;
         /// 绘制段：每段一个 QSGGeometryNode + 共用的变换矩阵。
+        ///
+        /// **这是唯一的几何产物**。构建过程中的「块」（Tile）只是分块三角化的中间
+        /// 量，合并进 batches 后立即释放 —— 早期把两者都留在 Layer 里，同一份几何
+        /// 存了两遍（实测 world 层 26.5 MB 变 53 MB）。
         std::vector<Batch> batches;
         /// 各要素的包围盒（参考层级世界像素），供视口裁剪。与输入 features 下标对齐。
         std::vector<FeatureBounds> featureBounds;
@@ -159,11 +168,10 @@ public:
 
         std::size_t bytes() const {
             std::size_t total = 0;
-            for (const Tile& t : tiles) total += t.bytes();
             for (const Batch& b : batches) total += b.bytes();
             return total;
         }
-        bool empty() const { return tiles.empty(); }
+        bool empty() const { return batches.empty(); }
     };
     using LayerPtr = std::shared_ptr<const Layer>;
 

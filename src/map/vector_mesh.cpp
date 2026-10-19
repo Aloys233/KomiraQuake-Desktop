@@ -366,7 +366,8 @@ VectorMeshBuilder::LayerPtr VectorMeshBuilder::buildFromFeatures(const std::vect
         }
     }
 
-    result->tiles.reserve(tiles.size());
+    std::vector<Tile> mergedTiles;
+    mergedTiles.reserve(tiles.size());
     for (auto& entry : tiles) {
         Tile& t = entry.second;
         if (t.empty()) continue;
@@ -377,7 +378,7 @@ VectorMeshBuilder::LayerPtr VectorMeshBuilder::buildFromFeatures(const std::vect
         // draw call 画完（分开反而要多一个节点）。顶点缓冲本来就是共用的。
         t.fillIndices.insert(t.fillIndices.end(), t.strokeIndices.begin(), t.strokeIndices.end());
         t.strokeIndices.clear();
-        result->tiles.push_back(std::move(t));
+        mergedTiles.push_back(std::move(t));
     }
 
     // 生成绘制段：把相邻的块合并成一段，段内顶点位置烘焙成「相对段原点」。
@@ -391,7 +392,7 @@ VectorMeshBuilder::LayerPtr VectorMeshBuilder::buildFromFeatures(const std::vect
     {
         const int b = std::max(1, kMaxTilesPerBatch);
         std::map<std::pair<int, int>, Batch> batches;
-        for (const Tile& t : result->tiles) {
+        for (const Tile& t : mergedTiles) {
             if (t.empty()) continue;
             const int tx = static_cast<int>(std::lround(t.originX / tilePx));
             const int ty = static_cast<int>(std::lround(t.originY / tilePx));
