@@ -11,6 +11,13 @@ namespace {
 
 constexpr double kLatLimit = 85.05112878;
 constexpr int kRefZoom = 10;
+
+/// 描边 LOD 容差相对填充的倍数。
+///
+/// 1 px 宽的线只要几何精度到「线宽量级」就够，用填充的 0.5 设备像素预算会浪费
+/// 三倍三角形（省界层 z6：32748 -> 12676）。取 4：顶点最多偏离 2 设备像素，
+/// 仍在 1 px 描边带内，肉眼无差别。
+constexpr double kStrokeLodScale = 4.0;
 constexpr double kPi = 3.14159265358979323846;
 
 double worldSize(int z) { return 256.0 * std::pow(2.0, z); }
@@ -160,6 +167,13 @@ VectorMeshBuilder::LayerPtr VectorMeshBuilder::buildFromFeatures(const std::vect
         if (simplified.empty()) continue;
         result->featureBounds[fi] = Layer::FeatureBounds{fx0, fy0, fx1, fy1};
 
+        // 填充色完全透明时**跳过整个三角化**。
+        //
+        // 省界层（province）的 fill 就是 "transparent"：它只需要描边。早期实现对它
+        // 照样扫掠了一整层填充（实测 z6 视口内 12.4 万个完全透明的三角形），既浪费
+        // 构建时间也白白占用显存与填充率。
+        const bool wantFill = style.fillA > 0;
+
         // 2) 逐块三角化：每块只把**该块覆盖范围内**的环喂给三角化器，并用裁剪矩形
         //    把结果限制在块内。
         //
@@ -175,7 +189,7 @@ VectorMeshBuilder::LayerPtr VectorMeshBuilder::buildFromFeatures(const std::vect
         const int fy0t = static_cast<int>(std::floor(fy0 / tilePx));
         const int fy1t = static_cast<int>(std::floor(fy1 / tilePx));
 
-        for (int ty = fy0t; ty <= fy1t; ++ty) {
+        for (int ty = fy0t; wantFill && ty <= fy1t; ++ty) {
             for (int tx = fx0t; tx <= fx1t; ++tx) {
                 const double originX = tx * tilePx;
                 const double originY = ty * tilePx;
@@ -251,7 +265,18 @@ VectorMeshBuilder::LayerPtr VectorMeshBuilder::buildFromFeatures(const std::vect
         //    描边按**每一段的中点**归属分块（而不是整环归首点所在块）：一个环可能横跨
         //    很多块，整环归一块会让块内坐标溢出 float32 精度带。逐段归属后每段的两端
         //    都在同一块内（段长远小于块边长），坐标恒在 [0, tilePx] 附近。
-        for (const auto& ring : simplified) {
+        // 描边用**更粗**的 LOD 容差。
+        //
+        // 描边是 1 px 宽的细线，几何精度只需与线宽同量级；用填充那套 0.5 设备像素
+        // 的预算会在省界这种「上千段长折线」上白白堆出三倍三角形（实测 z6 可见
+        // 三角形 32748 -> 12676，降 61%），而这些三角形在 1 px 线宽下视觉上完全
+        // 不可分辨（顶点偏离 2 设备像素仍落在同一条 1 px 带内）。
+        const double strokeTol = lodToleranceRef * kStrokeLodScale;
+        const bool wantStroke = style.strokeA > 0 && style.strokeWidthPx > 0.0;
+        for (const auto& rawRing : feature.rings) {
+            if (!wantStroke) break;
+            std::vector<double> ring;
+            simplifyRing(rawRing, strokeTol, &ring);
             const int n = static_cast<int>(ring.size() / 2);
             if (n < 3) continue;
 
@@ -353,6 +378,47 @@ VectorMeshBuilder::LayerPtr VectorMeshBuilder::buildFromFeatures(const std::vect
         t.fillIndices.insert(t.fillIndices.end(), t.strokeIndices.begin(), t.strokeIndices.end());
         t.strokeIndices.clear();
         result->tiles.push_back(std::move(t));
+    }
+
+    // 生成绘制段：把相邻的块合并成一段，段内顶点位置烘焙成「相对段原点」。
+    //
+    // **必须在填充/描边合并之后**：省界层只有描边索引，若在合并前合批，读到的是
+    // 空的 fillIndices，整层会一笔都不画（早期版本正是这样，表现为「省界消失」）。
+    //
+    // 这样整层只需要「段数」个 QSGGeometryNode（而不是块数），且所有段共用同一个
+    // 变换矩阵，能合批。块坐标在 double 下减去段原点、再转 float，精度与单块一致
+    //（段内跨度上限 kMaxTilesPerBatch * kTileWorldPx）。
+    {
+        const int b = std::max(1, kMaxTilesPerBatch);
+        std::map<std::pair<int, int>, Batch> batches;
+        for (const Tile& t : result->tiles) {
+            if (t.empty()) continue;
+            const int tx = static_cast<int>(std::lround(t.originX / tilePx));
+            const int ty = static_cast<int>(std::lround(t.originY / tilePx));
+            const int btx = tx >= 0 ? tx / b : (tx - b + 1) / b;
+            const int bty = ty >= 0 ? ty / b : (ty - b + 1) / b;
+            auto it = batches.find({bty, btx});
+            if (it == batches.end()) {
+                Batch nb;
+                nb.originX = double(btx) * b * tilePx;
+                nb.originY = double(bty) * b * tilePx;
+                it = batches.emplace(std::make_pair(bty, btx), std::move(nb)).first;
+            }
+            Batch& batch = it->second;
+            const auto base = static_cast<uint32_t>(batch.vertices.size());
+            for (const Vertex& v : t.vertices) {
+                Vertex nv = v;
+                nv.x = static_cast<float>(double(v.x) + (t.originX - batch.originX));
+                nv.y = static_cast<float>(double(v.y) + (t.originY - batch.originY));
+                batch.vertices.push_back(nv);
+            }
+            for (uint32_t idx : t.fillIndices) batch.indices.push_back(base + idx);
+        }
+        result->batches.reserve(batches.size());
+        for (auto& e : batches) {
+            if (e.second.empty()) continue;
+            result->batches.push_back(std::move(e.second));
+        }
     }
     return result;
 }

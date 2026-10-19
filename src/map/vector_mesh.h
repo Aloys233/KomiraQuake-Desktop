@@ -49,6 +49,16 @@ public:
     /// 阈值，同时世界层只膨胀 1.68 倍。
     static constexpr double kTileWorldPx = 8192.0;
 
+    /// 每个绘制段最多合并多少块（每边）。4 → 段内最多 16 个块、坐标上限 32768
+    /// 世界像素（z18 误差 ≈ 0.5 px）。
+    ///
+    /// 为什么要分段：`QSGGeometryNode` 没有 setMatrix，块的位置只能靠
+    /// `QSGTransformNode` 表达；而**每个块一个 transform node** 会让场景图每帧把
+    /// N 个子树标脏、各提交一次 draw call，无法合批。实测（llvmpipe，40 帧拖动）
+    /// 每块一个 transform node 是 36 ms，全部共用一个降到 20 ms —— 节点数就是瓶颈。
+    /// 分段后段数从「块数」降到「块数/16」，且段内顶点位置已烘焙，无需逐帧改矩阵。
+    static constexpr int kMaxTilesPerBatch = 1;
+
     /// 一条环的**已投影**坐标（参考层级世界像素，交错 x,y）。
     using ProjectedRing = std::vector<double>;
 
@@ -78,6 +88,34 @@ public:
         uint8_t g = 0;
         uint8_t b = 0;
         uint8_t a = 0;
+    };
+
+    /// 一个「合批段」：若干块合并成一次 draw call。
+    ///
+    /// 分块是为了 float32 精度，但**每个块一个 QSGTransformNode** 会让场景图每帧
+    /// 标脏 N 个子树、各提交一次 draw call，无法合批。这里把块的相对偏移烘焙进
+    /// 顶点（`offsetX/offsetY` 是相对**段原点**的偏移，用 double 累加后再转 float），
+    /// 于是整段共用一个变换矩阵、一个 QSGGeometryNode。
+    ///
+    /// 段原点独立于块原点：段内块的原点差（可达几十个 blockSize）在 double 下精确，
+    /// 转 float 后仍然落在精度甜区之外 —— 所以**每段只允许覆盖相邻的少数块**，
+    /// 由 `maxBlocksPerBatch` 控制。
+    struct Batch {
+        /// 段原点（参考层级世界像素）。整段共用一个「世界 -> 屏幕」矩阵。
+        ///
+        /// 段**只覆盖相邻的少数块**（见 `kMaxTilesPerBatch`）：块偏移（可达若干个
+        /// tilePx）用 double 累加后再转 float，段内坐标上限约 `kMaxTilesPerBatch *
+        /// kTileWorldPx`。8×8 块即 65536 世界像素，z18 下 float32 误差约 1 px ——
+        /// 所以上限取更小的 4×4（32768 px，误差 0.5 px 以内），且**段内仍以段原点
+        /// 为基准**，不是以块原点。
+        double originX = 0.0;
+        double originY = 0.0;
+        std::vector<Vertex> vertices;     // 位置已减去段原点
+        std::vector<uint32_t> indices;
+        std::size_t bytes() const {
+            return vertices.size() * sizeof(Vertex) + indices.size() * sizeof(uint32_t);
+        }
+        bool empty() const { return indices.empty(); }
     };
 
     /// 一个分块的几何。
@@ -111,6 +149,8 @@ public:
             double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
         };
         std::vector<Tile> tiles;
+        /// 绘制段：每段一个 QSGGeometryNode + 共用的变换矩阵。
+        std::vector<Batch> batches;
         /// 各要素的包围盒（参考层级世界像素），供视口裁剪。与输入 features 下标对齐。
         std::vector<FeatureBounds> featureBounds;
         std::size_t vertexCount = 0;
@@ -120,6 +160,7 @@ public:
         std::size_t bytes() const {
             std::size_t total = 0;
             for (const Tile& t : tiles) total += t.bytes();
+            for (const Batch& b : batches) total += b.bytes();
             return total;
         }
         bool empty() const { return tiles.empty(); }

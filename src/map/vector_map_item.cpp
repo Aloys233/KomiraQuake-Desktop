@@ -806,13 +806,9 @@ QSGNode* VectorMapItem::updateGpuNode(QSGNode* oldNode, const RenderState& state
 
     // 节点结构：root -> [QSGTransformNode(每块) -> QSGGeometryNode]
     //
-    // **关键**：几何只在 mesh/样式真的变化时重建一次；相机变化时只更新每个块的
-    // 变换矩阵。早期实现每帧删掉全部节点、重建 QSGGeometry 并把顶点与索引重新
-    // memcpy —— 那等于每帧向 GPU 重新上传几 MB 缓冲，比原来的 CPU 光栅化还慢
-    //（用户实测「开省界就卡」正是这个原因）。
+    // 几何只在 mesh/样式真的变化时重建一次，相机变化只更新变换矩阵。
     QSGNode* root = oldNode ? oldNode : new QSGNode;
 
-    // 先算「本帧可见块」的签名：块集合变了才需要重建节点树。
     qint64 visibleSignature = 0;
     int visibleCount = 0;
     for (const auto& tile : mesh->tiles) {
@@ -821,7 +817,6 @@ QSGNode* VectorMapItem::updateGpuNode(QSGNode* oldNode, const RenderState& state
             tile.originY <= viewY1 && tile.originY + VectorMeshBuilder::kTileWorldPx >= viewY0;
         if (!visible || tile.fillIndices.size() < 3) continue;
         ++visibleCount;
-        // 混入块的序号与原点，改变「哪些块可见」时签名必然变化。
         visibleSignature = visibleSignature * 131 + static_cast<qint64>(tile.originX) * 31 +
                            static_cast<qint64>(tile.originY);
     }
@@ -844,20 +839,20 @@ QSGNode* VectorMapItem::updateGpuNode(QSGNode* oldNode, const RenderState& state
     int drawn = 0;
     qint64 tris = 0;
     QSGNode* child = root->firstChild();
-    std::size_t visibleIndex = 0;
 
-    for (const auto& tile : mesh->tiles) {
+    for (const auto& batch : mesh->batches) {
         const bool visible =
-            tile.originX <= viewX1 && tile.originX + VectorMeshBuilder::kTileWorldPx >= viewX0 &&
-            tile.originY <= viewY1 && tile.originY + VectorMeshBuilder::kTileWorldPx >= viewY0;
-        if (!visible) continue;
-        if (tile.fillIndices.size() < 3) continue;
-        ++visibleIndex;
+            batch.originX <= viewX1 &&
+            batch.originX + VectorMeshBuilder::kTileWorldPx * VectorMeshBuilder::kMaxTilesPerBatch >=
+                viewX0 &&
+            batch.originY <= viewY1 &&
+            batch.originY + VectorMeshBuilder::kTileWorldPx * VectorMeshBuilder::kMaxTilesPerBatch >=
+                viewY0;
+        if (!visible || batch.indices.size() < 3) continue;
 
-        // 该块的变换：世界像素 -> 屏幕。每帧都要算（相机在动）。
         QMatrix4x4 m;
-        m.translate(static_cast<float>(w / 2.0 + (tile.originX - centerWX) * scale),
-                    static_cast<float>(h / 2.0 + (tile.originY - centerWY) * scale));
+        m.translate(static_cast<float>(w / 2.0 + (batch.originX - centerWX) * scale),
+                    static_cast<float>(h / 2.0 + (batch.originY - centerWY) * scale));
         m.scale(static_cast<float>(scale), static_cast<float>(scale));
 
         QSGTransformNode* xform = nullptr;
@@ -867,44 +862,37 @@ QSGNode* VectorMapItem::updateGpuNode(QSGNode* oldNode, const RenderState& state
 
             auto* node = new QSGGeometryNode;
             auto* geometry = new QSGGeometry(QSGGeometry::defaultAttributes_ColoredPoint2D(),
-                                             static_cast<int>(tile.vertices.size()),
-                                             static_cast<int>(tile.fillIndices.size()),
+                                             static_cast<int>(batch.vertices.size()),
+                                             static_cast<int>(batch.indices.size()),
                                              QSGGeometry::UnsignedIntType);
             geometry->setDrawingMode(QSGGeometry::DrawTriangles);
             auto* v = geometry->vertexDataAsColoredPoint2D();
-            for (std::size_t i = 0; i < tile.vertices.size(); ++i) {
-                const auto& src = tile.vertices[i];
+            for (std::size_t i = 0; i < batch.vertices.size(); ++i) {
+                const auto& src = batch.vertices[i];
                 v[i].set(src.x, src.y, src.r, src.g, src.b, src.a);
             }
             auto* idx = geometry->indexDataAsUInt();
-            for (std::size_t i = 0; i < tile.fillIndices.size(); ++i) {
-                idx[i] = tile.fillIndices[i];
-            }
+            for (std::size_t i = 0; i < batch.indices.size(); ++i) idx[i] = batch.indices[i];
             geometry->setVertexDataPattern(QSGGeometry::StaticPattern);
             geometry->setIndexDataPattern(QSGGeometry::StaticPattern);
             node->setGeometry(geometry);
             node->setFlag(QSGNode::OwnsGeometry);
-            // 每个节点**独占**一个材质：OwnsMaterial 意味着析构时 delete，共享同一
-            // 指针会被重复 delete（SIGSEGV）。合批由 compare() 完成，与指针无关。
             auto* material = new QSGVertexColorMaterial;
             material->setFlag(QSGMaterial::Blending);
             node->setMaterial(material);
             node->setFlag(QSGNode::OwnsMaterial);
             xform->appendChildNode(node);
         } else {
-            // 几何复用：按顺序取已建好的变换节点，只改矩阵。
             while (child && child->type() != QSGNode::TransformNodeType) child = child->nextSibling();
             xform = static_cast<QSGTransformNode*>(child);
-            if (!xform) continue;   // 结构对不上（理论上不会发生），跳过本块
+            if (!xform) continue;
             child = xform->nextSibling();
         }
         xform->setMatrix(m);
 
         ++drawn;
-        tris += static_cast<qint64>(tile.fillIndices.size() / 3);
+        tris += static_cast<qint64>(batch.indices.size() / 3);
     }
-
-    Q_UNUSED(visibleIndex);
 
     drawnTiles_ = drawn;
     submittedTriangles_ = tris;
@@ -972,6 +960,23 @@ QSGNode* VectorMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) 
         style.strokeA = static_cast<uint8_t>(state.stroke.alpha());
         style.strokeWidthPx = state.strokeWidth * state.strokeScale;
         style.screenPerWorldPx = gpuScale * dprNow;
+        // 样式完全透明（既无填充也无描边）时**不建网格**。
+        //
+        // 栅格叠加模式下 world 层的 fill 与 stroke 都是 "transparent"：它一个像素
+        // 都不画。早期实现照样为它三角化了整层（实测 z6 重建 215 ms、77 个块），
+        // 于是每次缩放跨档都要白花 200 ms —— 这正是「开省界就卡」的主因之一。
+        if (style.fillA == 0 && (style.strokeA == 0 || style.strokeWidthPx <= 0.0)) {
+            {
+                QMutexLocker locker(&meshMutex_);
+                mesh_.reset();
+                meshKey_.clear();
+            }
+            uploadedGeometryValid_ = false;
+            drawnTiles_ = 0;
+            submittedTriangles_ = 0;
+            return nullptr;
+        }
+
         bool needFrame = false;
         resolveMesh(state.layer.toStdString(), state.gcjShift, tolRef, style, &needFrame);
         if (mesh_) {
