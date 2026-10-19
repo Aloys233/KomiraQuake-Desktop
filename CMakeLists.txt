@@ -13,8 +13,35 @@ include(CheckIPOSupported)
 check_ipo_supported(RESULT KOMIRA_IPO_SUPPORTED OUTPUT KOMIRA_IPO_ERROR LANGUAGES CXX)
 
 find_package(Qt6 6.5 REQUIRED COMPONENTS
-    Core Gui Widgets Quick QuickControls2 Qml Network WebSockets Sql Multimedia Svg Concurrent
+    Core Gui Widgets Quick QuickControls2 Qml Network WebSockets Sql Multimedia Svg Concurrent OpenGL
 )
+
+# 场景图的 QSG* 头会经 qsgtexture.h -> qsgtexture_platform.h 引入 <GL/gl.h>。
+# Nix 把 libglvnd 拆成多个 output，Qt6::OpenGL 只带库、不带开发头，于是编译期
+# 找不到 GL/gl.h（自建环境里 GL 头来自全局 include 路径，NixOS 上没有）。
+# 这里显式补一个 include 目录：优先用 pkg-config，退化到在 Nix store 里找。
+find_package(PkgConfig QUIET)
+set(KOMIRA_GL_INCLUDE_DIR "")
+if(PkgConfig_FOUND)
+    pkg_check_modules(KOMIRA_GL QUIET gl)
+    if(KOMIRA_GL_INCLUDE_DIRS)
+        set(KOMIRA_GL_INCLUDE_DIR ${KOMIRA_GL_INCLUDE_DIRS})
+    endif()
+endif()
+if(NOT KOMIRA_GL_INCLUDE_DIR)
+    file(GLOB _komira_glvnd_dirs "/nix/store/*-libglvnd-*-dev")
+    foreach(_dir ${_komira_glvnd_dirs})
+        if(EXISTS "${_dir}/include/GL/gl.h")
+            set(KOMIRA_GL_INCLUDE_DIR "${_dir}/include")
+            break()
+        endif()
+    endforeach()
+endif()
+if(KOMIRA_GL_INCLUDE_DIR)
+    message(STATUS "GL headers: ${KOMIRA_GL_INCLUDE_DIR}")
+else()
+    message(WARNING "找不到 GL/gl.h；场景图头文件可能编译失败（非 Nix 系统通常由 mesa/glvnd 提供）")
+endif()
 
 qt_standard_project_setup(REQUIRES 6.5)
 
@@ -115,6 +142,9 @@ qt_add_executable(komiraquake WIN32
 )
 
 target_include_directories(komiraquake PRIVATE src)
+if(KOMIRA_GL_INCLUDE_DIR)
+    target_include_directories(komiraquake PRIVATE ${KOMIRA_GL_INCLUDE_DIR})
+endif()
 # 生成的 qmltyperegistrations.cpp 以 `#include <vector_map_item.h>` 引入 SOURCES 里的头
 # （无路径），故 src/map 必须也在头文件搜索路径中，否则注册代码找不到类型。
 target_include_directories(komiraquake PRIVATE src/map)
@@ -350,6 +380,9 @@ if(BUILD_TESTING)
     qt_add_executable(gui_test tests/gui_test.cpp ${GUI_TEST_SOURCES} src/source/earthquake_source.h
         src/source/simulated_source.h src/model/event_list_model.h)
     target_include_directories(gui_test PRIVATE src)
+    if(KOMIRA_GL_INCLUDE_DIR)
+        target_include_directories(gui_test PRIVATE ${KOMIRA_GL_INCLUDE_DIR})
+    endif()
     # gui_test 用 qt_add_resources 打包 QML 而非 qt_add_qml_module，故拿不到 QML_ELEMENT
     # 自动生成的注册代码；这里显式注册 VectorMapItem，否则 MapView.qml 加载失败。
     target_include_directories(gui_test PRIVATE src/map)

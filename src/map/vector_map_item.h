@@ -146,6 +146,11 @@ public:
     Q_INVOKABLE int drawnTilesForTest() const { return drawnTiles_; }
     /// 当前缓存的 GPU 网格字节数（CPU 回退时为 0）。
     Q_INVOKABLE qint64 meshBytesForTest() const;
+    /// 几何（顶点/索引缓冲）被重新上传的次数。
+    ///
+    /// 相机平移/缩放**不应**增加它：GPU 路径的收益正是「几何传一次、之后只改变换」。
+    /// 早期实现每帧重建全部 QSGGeometry，拖动时每帧 +1（用户实测「开省界就卡」）。
+    Q_INVOKABLE qint64 geometryUploadsForTest() const { return geometryUploads_; }
     /// 同步构建指定容差档位并返回该档路径数（仅测试用；正常路径走异步）。
     Q_INVOKABLE int buildTierForTest(double tolRef);
 
@@ -369,6 +374,23 @@ private:
     static QMutex meshCacheMutex_;
     static std::unordered_map<std::string, VectorMeshBuilder::LayerPtr> meshCaches_;
     static std::unordered_map<std::string, char> meshInFlight_;
+    /// 已上传到场景图的几何是否与当前 mesh_ 对应。
+    ///
+    /// 场景图节点**只在几何真的变了**（换层/换档/换样式）时才重建，相机变化只更新
+    /// 变换矩阵。早期实现每帧重建全部 QSGGeometry 并把顶点索引重新 memcpy 一遍 ——
+    /// 那是逐帧上传几 MB 的 GPU 缓冲，比原来的 CPU 光栅化还慢（用户实测「开省界
+    /// 很卡」正是这个原因）。
+    std::string uploadedMeshKey_;
+    bool uploadedGeometryValid_ = false;
+    /// 几何上传次数（诊断/回归用）。
+    qint64 geometryUploads_ = 0;
+    /// 上一次建节点时**可见块集合**的特征（可见块数量 + 起止块索引）。
+    ///
+    /// 只在「可见块集合变化」时才重建节点树：相机平移一点点会跨过块边界，此时旧的
+    /// 节点集合不再匹配（少一块/多一块），必须补建或删掉；但绝大多数帧集合不变，
+    /// 只更新变换矩阵。
+    qint64 uploadedTileSignature_ = -1;
+
     /// 本 item 当前持有的网格（与 meshKey_ 对应）。
     ///
     /// GUI 线程写、渲染线程读，故**必须**经 meshMutex_ 访问：早期版本直接裸读，

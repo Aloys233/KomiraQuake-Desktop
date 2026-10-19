@@ -804,79 +804,107 @@ QSGNode* VectorMapItem::updateGpuNode(QSGNode* oldNode, const RenderState& state
     const QSizeF viewportDev(w * dpr, h * dpr);
     if (!(dpr > 0.0) || w <= 0 || h <= 0) return oldNode;
 
-    // 根节点持有全部子节点（每块两个 QSGGeometryNode）。
-    // 子节点由父节点自动拥有（QSGNode 没有 OwnsChildren 标志）。
+    // 节点结构：root -> [QSGTransformNode(每块) -> QSGGeometryNode]
+    //
+    // **关键**：几何只在 mesh/样式真的变化时重建一次；相机变化时只更新每个块的
+    // 变换矩阵。早期实现每帧删掉全部节点、重建 QSGGeometry 并把顶点与索引重新
+    // memcpy —— 那等于每帧向 GPU 重新上传几 MB 缓冲，比原来的 CPU 光栅化还慢
+    //（用户实测「开省界就卡」正是这个原因）。
     QSGNode* root = oldNode ? oldNode : new QSGNode;
 
-    // 顶点色由网格烘焙提供，材质用 Qt **内置**的 QSGVertexColorMaterial —
-    // 对齐各顶点 RGBA，按材质类型合批（QSG 对同一 material type 且无纹理的节点会
-    // 合并批次，所以整层通常只有一两个 draw call）。
-    //
-    // 不用自定义 QSGMaterialShader 的原因见 vector_mesh.h 里 Vertex 的注释：
-    // 在本项目实测环境中它始终不出像素，而内置材质立刻正常。
-    // 清空上一帧的子节点树。
-    //
-    // 必须显式删：QSGNode 只在**析构**时回收子节点，updatePaintNode 返回的旧节点会
-    // 被复用，若只 append 不 remove，节点会逐帧累积（内存暴涨 + 场景图越来越慢，
-    // 最终在遍历时崩溃 —— 这是真 GL 后端上实测到的 SIGSEGV 根因）。
-    while (QSGNode* c = root->firstChild()) {
-        root->removeChildNode(c);
-        delete c;
+    // 先算「本帧可见块」的签名：块集合变了才需要重建节点树。
+    qint64 visibleSignature = 0;
+    int visibleCount = 0;
+    for (const auto& tile : mesh->tiles) {
+        const bool visible =
+            tile.originX <= viewX1 && tile.originX + VectorMeshBuilder::kTileWorldPx >= viewX0 &&
+            tile.originY <= viewY1 && tile.originY + VectorMeshBuilder::kTileWorldPx >= viewY0;
+        if (!visible || tile.fillIndices.size() < 3) continue;
+        ++visibleCount;
+        // 混入块的序号与原点，改变「哪些块可见」时签名必然变化。
+        visibleSignature = visibleSignature * 131 + static_cast<qint64>(tile.originX) * 31 +
+                           static_cast<qint64>(tile.originY);
+    }
+    visibleSignature = visibleSignature * 131 + visibleCount;
+
+    const bool geometryStale = !uploadedGeometryValid_ || uploadedMeshKey_ != meshKey_ ||
+                               uploadedTileSignature_ != visibleSignature ||
+                               root->childCount() == 0;
+    if (geometryStale) {
+        while (QSGNode* c = root->firstChild()) {
+            root->removeChildNode(c);
+            delete c;
+        }
+        uploadedMeshKey_ = meshKey_;
+        uploadedTileSignature_ = visibleSignature;
+        uploadedGeometryValid_ = true;
+        ++geometryUploads_;
     }
 
-    // 每个可见块一个变换节点 + 一个几何节点（填充与描边已在网格里合并，颜色逐顶点）。
     int drawn = 0;
     qint64 tris = 0;
+    QSGNode* child = root->firstChild();
+    std::size_t visibleIndex = 0;
+
     for (const auto& tile : mesh->tiles) {
         const bool visible =
             tile.originX <= viewX1 && tile.originX + VectorMeshBuilder::kTileWorldPx >= viewX0 &&
             tile.originY <= viewY1 && tile.originY + VectorMeshBuilder::kTileWorldPx >= viewY0;
         if (!visible) continue;
+        if (tile.fillIndices.size() < 3) continue;
+        ++visibleIndex;
 
-        // 区县层：只画「有震度」的要素。它们的颜色已烘焙在顶点里（构建时逐区县着色），
-        // 所以这里按 shadedRuns 逐段提交；没有震度就整块跳过。
-        if (isDistrict && state.shadedIndices.empty()) continue;
-
-        // 填充与描边已在构建时合并进 fillIndices（颜色逐顶点烘焙）。
-        const std::vector<uint32_t>* indices = &tile.fillIndices;
-        if (indices->size() < 3) continue;
-
-        QSGTransformNode* xform = new QSGTransformNode;
+        // 该块的变换：世界像素 -> 屏幕。每帧都要算（相机在动）。
         QMatrix4x4 m;
         m.translate(static_cast<float>(w / 2.0 + (tile.originX - centerWX) * scale),
                     static_cast<float>(h / 2.0 + (tile.originY - centerWY) * scale));
         m.scale(static_cast<float>(scale), static_cast<float>(scale));
-        xform->setMatrix(m);
-        root->appendChildNode(xform);
 
-        auto* node = new QSGGeometryNode;
-        auto* geometry = new QSGGeometry(QSGGeometry::defaultAttributes_ColoredPoint2D(),
-                                         static_cast<int>(tile.vertices.size()),
-                                         static_cast<int>(indices->size()),
-                                         QSGGeometry::UnsignedIntType);
-        geometry->setDrawingMode(QSGGeometry::DrawTriangles);
-        auto* v = geometry->vertexDataAsColoredPoint2D();
-        for (std::size_t i = 0; i < tile.vertices.size(); ++i) {
-            const auto& src = tile.vertices[i];
-            v[i].set(src.x, src.y, src.r, src.g, src.b, src.a);
+        QSGTransformNode* xform = nullptr;
+        if (geometryStale) {
+            xform = new QSGTransformNode;
+            root->appendChildNode(xform);
+
+            auto* node = new QSGGeometryNode;
+            auto* geometry = new QSGGeometry(QSGGeometry::defaultAttributes_ColoredPoint2D(),
+                                             static_cast<int>(tile.vertices.size()),
+                                             static_cast<int>(tile.fillIndices.size()),
+                                             QSGGeometry::UnsignedIntType);
+            geometry->setDrawingMode(QSGGeometry::DrawTriangles);
+            auto* v = geometry->vertexDataAsColoredPoint2D();
+            for (std::size_t i = 0; i < tile.vertices.size(); ++i) {
+                const auto& src = tile.vertices[i];
+                v[i].set(src.x, src.y, src.r, src.g, src.b, src.a);
+            }
+            auto* idx = geometry->indexDataAsUInt();
+            for (std::size_t i = 0; i < tile.fillIndices.size(); ++i) {
+                idx[i] = tile.fillIndices[i];
+            }
+            geometry->setVertexDataPattern(QSGGeometry::StaticPattern);
+            geometry->setIndexDataPattern(QSGGeometry::StaticPattern);
+            node->setGeometry(geometry);
+            node->setFlag(QSGNode::OwnsGeometry);
+            // 每个节点**独占**一个材质：OwnsMaterial 意味着析构时 delete，共享同一
+            // 指针会被重复 delete（SIGSEGV）。合批由 compare() 完成，与指针无关。
+            auto* material = new QSGVertexColorMaterial;
+            material->setFlag(QSGMaterial::Blending);
+            node->setMaterial(material);
+            node->setFlag(QSGNode::OwnsMaterial);
+            xform->appendChildNode(node);
+        } else {
+            // 几何复用：按顺序取已建好的变换节点，只改矩阵。
+            while (child && child->type() != QSGNode::TransformNodeType) child = child->nextSibling();
+            xform = static_cast<QSGTransformNode*>(child);
+            if (!xform) continue;   // 结构对不上（理论上不会发生），跳过本块
+            child = xform->nextSibling();
         }
-        auto* idx = geometry->indexDataAsUInt();
-        for (std::size_t i = 0; i < indices->size(); ++i) idx[i] = (*indices)[i];
-        geometry->setVertexDataPattern(QSGGeometry::StaticPattern);
-        geometry->setIndexDataPattern(QSGGeometry::StaticPattern);
-        node->setGeometry(geometry);
-        node->setFlag(QSGNode::OwnsGeometry);
-        // 每个节点**独占**一个材质：OwnsMaterial 意味着析构时 delete，共享同一指针
-        // 会被重复 delete（SIGSEGV）。合批由 QSGMaterial::compare() 完成，
-        // 与指针是否相同无关。
-        auto* material = new QSGVertexColorMaterial;
-        material->setFlag(QSGMaterial::Blending);
-        node->setMaterial(material);
-        node->setFlag(QSGNode::OwnsMaterial);
-        xform->appendChildNode(node);
+        xform->setMatrix(m);
+
         ++drawn;
-        tris += static_cast<qint64>(indices->size() / 3);
+        tris += static_cast<qint64>(tile.fillIndices.size() / 3);
     }
+
+    Q_UNUSED(visibleIndex);
 
     drawnTiles_ = drawn;
     submittedTriangles_ = tris;

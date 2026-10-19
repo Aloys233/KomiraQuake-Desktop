@@ -1318,6 +1318,109 @@ private slots:
         qInfo() << "PROBE gpu-path: ink ratio" << inkRatio();
     }
 
+    /// 几何上传次数：相机移动**不应**重传顶点/索引缓冲。
+    ///
+    /// 回归点（2026-10-20 用户实测「开省界很卡」）：GPU 路径初版每帧都删掉全部
+    /// QSGGeometryNode、重建 QSGGeometry 并把顶点索引重新 memcpy —— 相当于每帧向
+    /// GPU 重新上传几 MB，比原来的 CPU 光栅化还慢。正确形态是「几何传一次，
+    /// 之后只改变换矩阵」。这里断言连续拖动 30 帧期间上传次数不增长。
+    void vectorGpuGeometryUploadsOncePerMesh() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("VectorUploadTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setShowProvinceBorders(true);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        auto* world = window->findChild<QQuickItem*>("vectorWorldLayer");
+        auto* province = window->findChild<QQuickItem*>("vectorProvinceLayer");
+        QVERIFY(mapView && world && province);
+
+        const bool software =
+            window->rendererInterface()->graphicsApi() == QSGRendererInterface::Software;
+        if (software) {
+            qInfo() << "PROBE uploads: 软件后端走 CPU 光栅化，跳过";
+            return;
+        }
+
+        auto uploads = [&](QQuickItem* layer) {
+            qint64 v = -1;
+            QMetaObject::invokeMethod(layer, "geometryUploadsForTest", Q_RETURN_ARG(qint64, v));
+            return v;
+        };
+        auto triangles = [&](QQuickItem* layer) {
+            qint64 v = -1;
+            QMetaObject::invokeMethod(layer, "submittedTrianglesForTest", Q_RETURN_ARG(qint64, v));
+            return v;
+        };
+
+        // 省界在 z >= 5 才可见 —— 用户报的场景正是这个缩放区间。
+        mapView->setProperty("centerLat", 35.0);
+        mapView->setProperty("centerLon", 116.4);
+        mapView->setProperty("zoom", 6.0);
+        QVERIFY2(QTest::qWaitFor([&] { window->grabWindow(); return triangles(province) > 0; },
+                                 30000),
+                 qPrintable(QStringLiteral("省界层未在超时内画出内容（world tris=%1 province "
+                                           "visible=%2 zoom=%3）")
+                                .arg(triangles(world))
+                                .arg(province->isVisible())
+                                .arg(mapView->property("zoom").toDouble())));
+
+        // world 层的网格比省界层大得多（块数多一个数量级），构建也更慢，单独等它。
+        QVERIFY2(QTest::qWaitFor([&] { window->grabWindow(); return triangles(world) > 0; }, 30000),
+                 "world 层未在超时内画出内容");
+        const qint64 worldBefore = uploads(world);
+        const qint64 provinceBefore = uploads(province);
+        QVERIFY2(worldBefore > 0 && provinceBefore > 0,
+                 qPrintable(QStringLiteral("首帧应至少上传过一次几何（world=%1 province=%2）")
+                                .arg(worldBefore).arg(provinceBefore)));
+
+        // 连续平移：块集合会跨过边界若干次（每次允许一次重建），但绝大多数帧
+        // 只应更新变换矩阵。
+        const int frames = 40;
+        for (int i = 0; i < frames; ++i) {
+            mapView->setProperty("centerLon", 116.4 - i * 0.15);
+            window->grabWindow();
+        }
+        const qint64 worldUploads = uploads(world) - worldBefore;
+        const qint64 provinceUploads = uploads(province) - provinceBefore;
+        qInfo() << "PROBE uploads:" << frames << "帧拖动后 world +" << worldUploads
+                << "province +" << provinceUploads;
+
+        // 块集合变化（跨块边界）时才重建，最多几次；绝不是每帧一次。
+        QVERIFY2(worldUploads <= 5,
+                 qPrintable(QStringLiteral("world 层 40 帧上传了 %1 次几何（应只在换块/换档时重建）")
+                                .arg(worldUploads)));
+        QVERIFY2(provinceUploads <= 5,
+                 qPrintable(QStringLiteral("省界层 40 帧上传了 %1 次几何（用户报卡顿的正是它）")
+                                .arg(provinceUploads)));
+
+        // 缩放跨 LOD 档时**允许**重建（描边宽度烘焙在顶点里），但也不能每帧一次。
+        const qint64 beforeZoom = uploads(province);
+        for (int i = 0; i < 20; ++i) {
+            mapView->setProperty("zoom", 6.0 + i * 0.1);
+            window->grabWindow();
+        }
+        const qint64 zoomUploads = uploads(province) - beforeZoom;
+        qInfo() << "PROBE uploads: 20 帧缩放后 province +" << zoomUploads;
+        QVERIFY2(zoomUploads <= 10,
+                 qPrintable(QStringLiteral("缩放 20 帧上传了 %1 次几何").arg(zoomUploads)));
+    }
+
     /// 拖动性能基准：模拟连续平移，测量每帧渲染耗时。
     /// 只记录不硬性断言（阈值随机器/后端差异大），用于定位卡顿来源。
     void vectorDragPerformance() {
