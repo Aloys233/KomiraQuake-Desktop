@@ -16,6 +16,7 @@
 #include "core/event_gate.h"
 #include "core/geo_geometry.h"
 #include "core/intensity_calculator.h"
+#include "core/polygon_tessellator.h"
 #include "core/quake_calculator.h"
 #include "core/region_names.h"
 #include "core/source_estimator.h"
@@ -1004,6 +1005,111 @@ int main(int argc, char** argv) {
                   "arrival: origin time survives conversion");
             check(unified.pPhaseCount == arrival.pCount && unified.sPhaseCount == arrival.sCount,
                   "arrival: phase counts survive conversion");
+        }
+    }
+
+
+    // ---- PolygonTessellator ----------------------------------------------
+    //
+    // 三角化是 GPU 矢量层的地基：它把 even-odd 的多环面变成三角形。
+    // 这里断言的是**语义**（面积守恒、洞镂空、绕向无关、裁剪正确），
+    // 不是具体三角形布局 —— 布局可以优化，面积语义不能变。
+    {
+        using Ring = PolygonTessellator::Ring;
+        using Mesh = PolygonTessellator::Mesh;
+        using FR = PolygonTessellator::FillRule;
+        const auto area = [](const Mesh& m) { return PolygonTessellator::meshArea(m); };
+
+        // 单位方形：面积 100，且梯形合并后只出 2 个三角形。
+        {
+            std::vector<double> sq = {0, 0, 10, 0, 10, 10, 0, 10};
+            std::vector<Ring> rings{Ring(sq)};
+            Mesh m;
+            PolygonTessellator::tessellate(rings, FR::EvenOdd, &m);
+            check(near(area(m), 100.0), "tess: square area 100");
+            check(m.triangleCount() == 2, "tess: square merges into 2 triangles");
+            check(m.vertexCount() == 4, "tess: square reuses 4 vertices");
+        }
+
+        // 洞：even-odd 下绕向无关（真实数据绕向不可信，必须两种都给对）。
+        {
+            const std::vector<double> outer = {0, 0, 10, 0, 10, 10, 0, 10};
+            for (const std::vector<double>& hole :
+                 {std::vector<double>{3, 3, 3, 7, 7, 7, 7, 3},
+                  std::vector<double>{3, 3, 7, 3, 7, 7, 3, 7}}) {
+                std::vector<Ring> rings{Ring(outer), Ring(hole)};
+                Mesh m;
+                PolygonTessellator::tessellate(rings, FR::EvenOdd, &m);
+                check(near(area(m), 84.0), "tess: hole punched out regardless of winding");
+            }
+        }
+
+        // 凹多边形（L 形）：面积 64。
+        {
+            std::vector<double> l = {0, 0, 10, 0, 10, 4, 4, 4, 4, 10, 0, 10};
+            std::vector<Ring> rings{Ring(l)};
+            Mesh m;
+            PolygonTessellator::tessellate(rings, FR::EvenOdd, &m);
+            check(near(area(m), 64.0), "tess: concave L shape area 64");
+        }
+
+        // 嵌套分组：一堆互不相交的岛（而不是「外环+洞」）必须与联合扫描等价。
+        // 真实数据里世界层的日本要素就是 352 个环的岛群，联合扫描会产生 2 倍三角形。
+        {
+            std::vector<double> a = {0, 0, 10, 0, 10, 10, 0, 10};
+            std::vector<double> b = {20, 0, 30, 0, 30, 10, 20, 10};
+            std::vector<Ring> rings{Ring(a), Ring(b)};
+            Mesh joint, nested;
+            PolygonTessellator::tessellate(rings, FR::EvenOdd, &joint);
+            PolygonTessellator::tessellateNested(rings, FR::EvenOdd, &nested);
+            check(near(area(joint), 200.0) && near(area(nested), 200.0),
+                  "tess: disjoint islands keep total area");
+            check(nested.triangleCount() <= joint.triangleCount(),
+                  "tess: nesting groups never produce more triangles");
+        }
+
+        // 裁剪：语义是「面积 ∩ 矩形」。这是分块建网格的正确性前提。
+        {
+            std::vector<double> sq = {0, 0, 100, 0, 100, 100, 0, 100};
+            std::vector<Ring> rings{Ring(sq)};
+            struct Case {
+                PolygonTessellator::ClipRect rect;
+                double expect;
+                const char* name;
+            };
+            const Case cases[] = {
+                {{0, 0, 50, 100}, 5000.0, "tess: clip left half"},
+                {{25, 25, 75, 75}, 2500.0, "tess: clip centre square"},
+                {{200, 200, 300, 300}, 0.0, "tess: clip outside yields nothing"},
+            };
+            for (const Case& c : cases) {
+                Mesh m;
+                PolygonTessellator::tessellate(rings, FR::EvenOdd, &m, &c.rect);
+                check(near(area(m), c.expect), c.name);
+            }
+            // 带洞 + 裁剪：左半 50*100 减去洞的左半 25*50 = 3750。
+            std::vector<double> hole = {25, 25, 25, 75, 75, 75, 75, 25};
+            std::vector<Ring> withHole{Ring(sq), Ring(hole)};
+            PolygonTessellator::ClipRect left{0, 0, 50, 100};
+            Mesh m;
+            PolygonTessellator::tessellate(withHole, FR::EvenOdd, &m, &left);
+            check(near(area(m), 3750.0), "tess: clipped hole area 3750");
+        }
+
+        // 退化输入一律不产出、不崩溃（坏数据/极小环/共线/NaN）。
+        {
+            Mesh m;
+            PolygonTessellator::tessellate({}, FR::EvenOdd, &m);
+            check(m.empty(), "tess: empty ring list yields nothing");
+            std::vector<double> two = {0, 0, 1, 1};
+            PolygonTessellator::tessellate({Ring(two)}, FR::EvenOdd, &m);
+            check(m.empty(), "tess: two-point ring yields nothing");
+            std::vector<double> collinear = {0, 0, 1, 1, 2, 2, 3, 3};
+            PolygonTessellator::tessellate({Ring(collinear)}, FR::EvenOdd, &m);
+            check(m.empty(), "tess: collinear ring yields nothing");
+            std::vector<double> nan = {0, 0, std::nan(""), 0, 10, 10};
+            PolygonTessellator::tessellate({Ring(nan)}, FR::EvenOdd, &m);
+            check(m.empty(), "tess: NaN coordinates reject the whole ring");
         }
     }
 

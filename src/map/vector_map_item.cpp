@@ -8,6 +8,11 @@
 #include <QPainter>
 #include <QPointer>
 #include <QQuickWindow>
+#include <QSGTransformNode>
+#include <QSGGeometry>
+#include <QSGVertexColorMaterial>
+
+#include <QSGGeometryNode>
 #include <QSGImageNode>
 #include <QSGTexture>
 #include <QThreadPool>
@@ -140,6 +145,9 @@ std::unordered_map<std::string, char> VectorMapItem::baseInFlight_;
 std::unordered_map<std::string, VectorMapItem::TierEntry> VectorMapItem::tierCaches_;
 std::unordered_map<std::string, char> VectorMapItem::tierInFlight_;
 std::vector<QPointer<VectorMapItem>> VectorMapItem::waiters_;
+QMutex VectorMapItem::meshCacheMutex_;
+std::unordered_map<std::string, VectorMeshBuilder::LayerPtr> VectorMapItem::meshCaches_;
+std::unordered_map<std::string, char> VectorMapItem::meshInFlight_;
 qint64 VectorMapItem::tierBytes_ = 0;
 quint64 VectorMapItem::useCounter_ = 0;
 
@@ -645,6 +653,242 @@ bool VectorMapItem::hasDrawableContent(const RenderState& state) {
     return state.fill.alpha() > 0 || wantsStroke;
 }
 
+
+
+// ---------------------------------------------------------------------------
+// GPU 路径
+// ---------------------------------------------------------------------------
+//
+// 与 CPU 路径（离屏位图）的分工：
+//   · 有 GPU：把三角化网格直接交给场景图，平移/缩放只改节点变换，**不重建几何**；
+//     按分块做视口裁剪，一帧只提交可见块的索引。
+//   · 软件后端：仍走 QPainter 光栅化（软件渲染器不支持自定义材质，且那条路径是给
+//     CI/远程桌面兜底的，性能不敏感）。
+//
+// 两条路径共用同一份 .kvb 数据与同一套 LOD 容差语义，因此画面一致。
+
+qint64 VectorMapItem::meshBytesForTest() const {
+    return mesh_ ? static_cast<qint64>(mesh_->bytes()) : 0;
+}
+
+void VectorMapItem::startMeshBuild(const std::string& key, const std::string& layer, bool gcj,
+                                   double tolRef, const VectorMeshBuilder::Style& style) {
+    const std::shared_ptr<VectorMapData> snapshot = data_;
+    if (!snapshot) return;
+    const QPointer<VectorMapItem> self(this);
+    // 三角化是纯计算（真实数据上 district 层约 150 ms），绝不能在渲染线程做。
+    QThreadPool::globalInstance()->start([self, snapshot, layer, gcj, tolRef, style, key]() {
+        auto built = VectorMeshBuilder::build(*snapshot, layer, gcj, tolRef, style);
+        QMetaObject::invokeMethod(
+            QCoreApplication::instance(),
+            [self, key, built]() {
+                if (!self) return;
+                self->onMeshBuilt(key, built);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void VectorMapItem::onMeshBuilt(const std::string& key, const VectorMeshBuilder::LayerPtr& built) {
+    {
+        QMutexLocker locker(&meshCacheMutex_);
+        meshCaches_[key] = built;
+        meshInFlight_.erase(key);
+    }
+    // 网格就绪后必须主动请求一帧。
+    //
+    // 不能只判 gpuPathActive_：**首次**构建时它还是 false（因为没有网格就走不到
+    // updateGpuNode），若在这里跳过 update()，就永远没有下一帧来取这份网格 ——
+    // 死锁，表现为 GPU 路径完全不生效。
+    update();
+}
+
+VectorMeshBuilder::LayerPtr VectorMapItem::resolveMesh(const std::string& layer, bool gcj,
+                                                       double tolRef,
+                                                       const VectorMeshBuilder::Style& style,
+                                                       bool* needAnotherFrame) {
+    // 容差量化到 2 的幂档：否则缩放动画里每一帧的 tolRef 都不同，等于每帧重建几何。
+    //
+    // 档位语义必须与 CPU 路径**逐字一致**（见 updatePaintNode 里的 wantedTier）：
+    // 算出的 tier 一旦 >= kMaxTier，说明 0.5 设备像素的误差预算已细于 1 参考层级
+    // 像素，此时直接用全精度（kFullTier），而不是夹到 kMaxTier —— 后者会用一个
+    // 比预算更粗的档，拉近后线条明显发钝。
+    int tier = kFullTier;
+    if (tolRef > 0.0) {
+        const int computed = static_cast<int>(std::lround(-std::log2(tolRef)));
+        if (computed < kMaxTier) tier = std::max(kMinTier, computed);
+    }
+    // key 必须包含样式：颜色与描边宽度都烘焙进了顶点，换主题/改线宽要重建网格。
+    const std::string styleKey = ":" + std::to_string(style.fillR) + "," +
+                                 std::to_string(style.fillG) + "," + std::to_string(style.fillB) +
+                                 "," + std::to_string(style.fillA) + ":" +
+                                 std::to_string(style.strokeR) + "," +
+                                 std::to_string(style.strokeG) + "," +
+                                 std::to_string(style.strokeB) + "," +
+                                 std::to_string(style.strokeA) + ":" +
+                                 std::to_string(int(style.strokeWidthPx * 100));
+    const std::string key = baseKey(layer, gcj) + ":gpu:" + std::to_string(tier) + styleKey;
+    if (needAnotherFrame) *needAnotherFrame = false;
+
+    {
+        QMutexLocker locker(&meshCacheMutex_);
+        const auto found = meshCaches_.find(key);
+        if (found != meshCaches_.end()) {
+            {
+                QMutexLocker meshLock(&meshMutex_);
+                mesh_ = found->second;
+                meshKey_ = key;
+                // kFullTier（不简化）记 0，与 CPU 路径 lodToleranceForTest 的语义一致；
+            // 否则测试无法区分「全精度」与「最细档」。
+            meshTolRef_ = (tier >= kFullTier) ? 0.0 : std::pow(2.0, -double(tier));
+            }
+            return found->second;
+        }
+        if (meshInFlight_.find(key) == meshInFlight_.end()) {
+            meshInFlight_.emplace(key, 1);
+            if (needAnotherFrame) *needAnotherFrame = true;
+            // 构建必须用**量化后**的容差：key 是由量化档位算出来的，若拿原始 tolRef
+            // 去建，下次按 key 查时内容与档位不符（早期版本因此永远命中不了缓存，
+            // 表现为 GPU 路径一直不生效）。
+            const double tierTol = tier >= kFullTier ? 0.0 : std::pow(2.0, -double(tier));
+            const QPointer<VectorMapItem> self(this);
+            QMetaObject::invokeMethod(
+                QCoreApplication::instance(),
+                [self, key, layer, gcj, tierTol, style]() {
+                    if (self) self->startMeshBuild(key, layer, gcj, tierTol, style);
+                },
+                Qt::QueuedConnection);
+        }
+    }
+    // 该档还没建好：继续用当前持有的网格（可能更粗），不要整层空白。
+    QMutexLocker meshLock(&meshMutex_);
+    return mesh_;
+}
+
+QSGNode* VectorMapItem::updateGpuNode(QSGNode* oldNode, const RenderState& state, double lat,
+                                      double lon, double zoom, double scale) {
+    // 锁内拷一份 shared_ptr：渲染线程遍历期间 GUI 线程可能正在换网格（换档/换层）。
+    // 拷出来后即使 GUI 线程把 mesh_ 换掉，本地这份仍保活，不会悬垂。
+    VectorMeshBuilder::LayerPtr mesh;
+    double tolRefSnapshot = 0.0;
+    {
+        QMutexLocker locker(&meshMutex_);
+        mesh = mesh_;
+        tolRefSnapshot = meshTolRef_;
+    }
+    if (!mesh) return nullptr;
+
+    const double refSize = worldSize(kRefZoom);
+    const double w = width();
+    const double h = height();
+    const double centerWX = projX(lon, refSize);
+    const double centerWY = projY(lat, refSize);
+    const double halfW = w / 2.0 / scale;
+    const double halfH = h / 2.0 / scale;
+    const double viewX0 = centerWX - halfW;
+    const double viewX1 = centerWX + halfW;
+    const double viewY0 = centerWY - halfH;
+    const double viewY1 = centerWY + halfH;
+
+    const bool isDistrict = state.layer == QStringLiteral("district");
+    const bool wantsStroke = state.strokeWidth > 0.0 && state.stroke.alpha() > 0;
+    // 区县层只在有震度时画（平时完全透明），与 CPU 路径的 hasDrawableContent 一致。
+    if (isDistrict && state.shadedIndices.empty()) {
+        drawnTiles_ = 0;
+        submittedTriangles_ = 0;
+        return oldNode;
+    }
+
+    if (!window()) return oldNode;
+    const qreal dpr = window()->effectiveDevicePixelRatio();
+    const QSizeF viewportDev(w * dpr, h * dpr);
+    if (!(dpr > 0.0) || w <= 0 || h <= 0) return oldNode;
+
+    // 根节点持有全部子节点（每块两个 QSGGeometryNode）。
+    // 子节点由父节点自动拥有（QSGNode 没有 OwnsChildren 标志）。
+    QSGNode* root = oldNode ? oldNode : new QSGNode;
+
+    // 顶点色由网格烘焙提供，材质用 Qt **内置**的 QSGVertexColorMaterial —
+    // 对齐各顶点 RGBA，按材质类型合批（QSG 对同一 material type 且无纹理的节点会
+    // 合并批次，所以整层通常只有一两个 draw call）。
+    //
+    // 不用自定义 QSGMaterialShader 的原因见 vector_mesh.h 里 Vertex 的注释：
+    // 在本项目实测环境中它始终不出像素，而内置材质立刻正常。
+    // 清空上一帧的子节点树。
+    //
+    // 必须显式删：QSGNode 只在**析构**时回收子节点，updatePaintNode 返回的旧节点会
+    // 被复用，若只 append 不 remove，节点会逐帧累积（内存暴涨 + 场景图越来越慢，
+    // 最终在遍历时崩溃 —— 这是真 GL 后端上实测到的 SIGSEGV 根因）。
+    while (QSGNode* c = root->firstChild()) {
+        root->removeChildNode(c);
+        delete c;
+    }
+
+    // 每个可见块一个变换节点 + 一个几何节点（填充与描边已在网格里合并，颜色逐顶点）。
+    int drawn = 0;
+    qint64 tris = 0;
+    for (const auto& tile : mesh->tiles) {
+        const bool visible =
+            tile.originX <= viewX1 && tile.originX + VectorMeshBuilder::kTileWorldPx >= viewX0 &&
+            tile.originY <= viewY1 && tile.originY + VectorMeshBuilder::kTileWorldPx >= viewY0;
+        if (!visible) continue;
+
+        // 区县层：只画「有震度」的要素。它们的颜色已烘焙在顶点里（构建时逐区县着色），
+        // 所以这里按 shadedRuns 逐段提交；没有震度就整块跳过。
+        if (isDistrict && state.shadedIndices.empty()) continue;
+
+        // 填充与描边已在构建时合并进 fillIndices（颜色逐顶点烘焙）。
+        const std::vector<uint32_t>* indices = &tile.fillIndices;
+        if (indices->size() < 3) continue;
+
+        QSGTransformNode* xform = new QSGTransformNode;
+        QMatrix4x4 m;
+        m.translate(static_cast<float>(w / 2.0 + (tile.originX - centerWX) * scale),
+                    static_cast<float>(h / 2.0 + (tile.originY - centerWY) * scale));
+        m.scale(static_cast<float>(scale), static_cast<float>(scale));
+        xform->setMatrix(m);
+        root->appendChildNode(xform);
+
+        auto* node = new QSGGeometryNode;
+        auto* geometry = new QSGGeometry(QSGGeometry::defaultAttributes_ColoredPoint2D(),
+                                         static_cast<int>(tile.vertices.size()),
+                                         static_cast<int>(indices->size()),
+                                         QSGGeometry::UnsignedIntType);
+        geometry->setDrawingMode(QSGGeometry::DrawTriangles);
+        auto* v = geometry->vertexDataAsColoredPoint2D();
+        for (std::size_t i = 0; i < tile.vertices.size(); ++i) {
+            const auto& src = tile.vertices[i];
+            v[i].set(src.x, src.y, src.r, src.g, src.b, src.a);
+        }
+        auto* idx = geometry->indexDataAsUInt();
+        for (std::size_t i = 0; i < indices->size(); ++i) idx[i] = (*indices)[i];
+        geometry->setVertexDataPattern(QSGGeometry::StaticPattern);
+        geometry->setIndexDataPattern(QSGGeometry::StaticPattern);
+        node->setGeometry(geometry);
+        node->setFlag(QSGNode::OwnsGeometry);
+        // 每个节点**独占**一个材质：OwnsMaterial 意味着析构时 delete，共享同一指针
+        // 会被重复 delete（SIGSEGV）。合批由 QSGMaterial::compare() 完成，
+        // 与指针是否相同无关。
+        auto* material = new QSGVertexColorMaterial;
+        material->setFlag(QSGMaterial::Blending);
+        node->setMaterial(material);
+        node->setFlag(QSGNode::OwnsMaterial);
+        xform->appendChildNode(node);
+        ++drawn;
+        tris += static_cast<qint64>(indices->size() / 3);
+    }
+
+    drawnTiles_ = drawn;
+    submittedTriangles_ = tris;
+
+    // 记录本帧真实使用的变换，供回归测试断言「与震中/定位标记同源」。
+    drawnScale_ = scale;
+    drawnCenterX_ = centerWX;
+    drawnCenterY_ = centerWY;
+    drawnTolRef_ = tolRefSnapshot > 0.0 ? tolRefSnapshot : 0.0;
+    return root;
+}
+
 QSGNode* VectorMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) {
     ++paintNodeCalls_;
 
@@ -676,6 +920,42 @@ QSGNode* VectorMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) 
         dropCache();
         return nullptr;
     }
+
+    // GPU 路径：不建离屏位图，直接把三角化网格交给场景图。软件后端仍走下面的
+    // QPainter 光栅化（软件渲染器不支持自定义材质）。
+    const bool softwareBackend =
+        !window() || window()->rendererInterface()->graphicsApi() == QSGRendererInterface::Software;
+    if (!softwareBackend) {
+        const double gpuScale = std::pow(2.0, zoom - kRefZoom);
+        const qreal dprNow = window() ? window()->effectiveDevicePixelRatio() : 1.0;
+        double tolRef = 0.0;
+        if (lodEnabled) {
+            tolRef = kLodScreenTolerancePx / (gpuScale * dprNow);
+        }
+        // 样式烘焙进顶点：颜色与描边宽度都算进去，换主题/改线宽会重建网格。
+        VectorMeshBuilder::Style style;
+        style.fillR = static_cast<uint8_t>(state.fill.red());
+        style.fillG = static_cast<uint8_t>(state.fill.green());
+        style.fillB = static_cast<uint8_t>(state.fill.blue());
+        style.fillA = static_cast<uint8_t>(state.fill.alpha());
+        style.strokeR = static_cast<uint8_t>(state.stroke.red());
+        style.strokeG = static_cast<uint8_t>(state.stroke.green());
+        style.strokeB = static_cast<uint8_t>(state.stroke.blue());
+        style.strokeA = static_cast<uint8_t>(state.stroke.alpha());
+        style.strokeWidthPx = state.strokeWidth * state.strokeScale;
+        style.screenPerWorldPx = gpuScale * dprNow;
+        bool needFrame = false;
+        resolveMesh(state.layer.toStdString(), state.gcjShift, tolRef, style, &needFrame);
+        if (mesh_) {
+            gpuPathActive_ = true;
+            cacheValid_ = false;   // GPU 路径不使用离屏位图
+            if (!cache_.isNull()) cache_ = QImage();
+            return updateGpuNode(oldNode, state, lat, lon, zoom, gpuScale);
+        }
+        // 网格还在建：本帧留空（下一帧就好）。
+        return nullptr;
+    }
+    gpuPathActive_ = false;
 
     const double w = width();
     const double h = height();

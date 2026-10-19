@@ -17,6 +17,7 @@
 
 #include "core/geo_geometry.h"
 #include "core/vector_map_data.h"
+#include "map/vector_mesh.h"
 
 class QPainter;
 class QSGNode;
@@ -135,6 +136,16 @@ public:
     /// 只看耗时会误判（没触发重建时每帧都是 0 ms）。
     Q_INVOKABLE qint64 cacheRebuildsForTest() const { return cacheRebuilds_; }
     Q_INVOKABLE qint64 paintNodeCallsForTest() const { return paintNodeCalls_; }
+    /// 当前是否走 GPU 三角形路径（false = 软件后端的 CPU 光栅化回退）。
+    /// 回归测试据此断言「有 GPU 时不该再光栅化整层位图」。
+    Q_INVOKABLE bool gpuPathActiveForTest() const { return gpuPathActive_; }
+    /// 本帧实际提交的三角形数（GPU 路径）或 0（CPU 回退）。视口裁剪后应为数千级，
+    /// 而不是整层的百万级 —— 这是 GPU 路径的核心收益所在。
+    Q_INVOKABLE qint64 submittedTrianglesForTest() const { return submittedTriangles_; }
+    /// 本帧实际绘制的分块数。
+    Q_INVOKABLE int drawnTilesForTest() const { return drawnTiles_; }
+    /// 当前缓存的 GPU 网格字节数（CPU 回退时为 0）。
+    Q_INVOKABLE qint64 meshBytesForTest() const;
     /// 同步构建指定容差档位并返回该档路径数（仅测试用；正常路径走异步）。
     Q_INVOKABLE int buildTierForTest(double tolRef);
 
@@ -340,6 +351,44 @@ private:
     static bool hasDrawableContent(const RenderState& state);
     /// 释放离屏位图与其纹理引用。
     void dropCache();
+
+    // ---- GPU 路径（QSGGeometry + 自定义材质）---------------------------------
+    //
+    // 有 GPU 时不再把整层光栅化进离屏位图，而是把三角化后的几何直接交给场景图：
+    //   · 平移/缩放只改节点变换，**不重建任何几何**（原先每次移出 margin 就要
+    //     重新光栅化 13–57 ms）；
+    //   · 按分块做视口裁剪，一帧只提交可见块的索引（实测 z6 仅 9 块、5.7 万三角形）；
+    //   · 描边宽度由 shader 按屏幕像素扩张，缩放时线宽恒定且几何复用。
+    //
+    // 软件后端（无 GPU）仍走 QPainter 光栅化：软件渲染器不支持自定义材质，
+    // 且那条路径本来就是给 CI/远程桌面兜底的，性能不敏感。
+    bool gpuPathActive_ = false;
+    qint64 submittedTriangles_ = 0;
+    int drawnTiles_ = 0;
+    /// 按 (layer, gcj, tier) 缓存的 GPU 网格。与 CPU 档位缓存同样进程内共享。
+    static QMutex meshCacheMutex_;
+    static std::unordered_map<std::string, VectorMeshBuilder::LayerPtr> meshCaches_;
+    static std::unordered_map<std::string, char> meshInFlight_;
+    /// 本 item 当前持有的网格（与 meshKey_ 对应）。
+    ///
+    /// GUI 线程写、渲染线程读，故**必须**经 meshMutex_ 访问：早期版本直接裸读，
+    /// 在缩放换档（GUI 线程正在换 shared_ptr、渲染线程正在解引用）时 SIGSEGV。
+    VectorMeshBuilder::LayerPtr mesh_;
+    mutable QMutex meshMutex_;
+    std::string meshKey_;
+    double meshTolRef_ = -1.0;
+    /// 后台网格构建完成（GUI 线程回调）。
+    void onMeshBuilt(const std::string& key, const VectorMeshBuilder::LayerPtr& built);
+    /// GUI 线程发起一次网格构建。
+    void startMeshBuild(const std::string& key, const std::string& layer, bool gcj, double tolRef,
+                        const VectorMeshBuilder::Style& style);
+    /// 取（或请求构建）本层当前缩放的网格；无可用网格时返回 nullptr。
+    VectorMeshBuilder::LayerPtr resolveMesh(const std::string& layer, bool gcj, double tolRef,
+                                            const VectorMeshBuilder::Style& style,
+                                            bool* needAnotherFrame);
+    /// GPU 路径的节点构建。返回 nullptr 表示本帧无内容。
+    QSGNode* updateGpuNode(QSGNode* oldNode, const RenderState& state, double lat, double lon,
+                           double zoom, double scale);
 
     /// 最近一帧真实画出的「参考层级世界像素 -> 屏幕」映射的中心与缩放
     ///（见 screenPosForTest 的说明）。仅用于回归测试。

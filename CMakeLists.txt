@@ -108,6 +108,10 @@ qt_add_executable(komiraquake WIN32
 
     # map
     src/map/vector_map_item.cpp
+    src/map/vector_mesh.cpp
+
+    # core（三角化：纯 C++，无 Qt）
+    src/core/polygon_tessellator.cpp
 )
 
 target_include_directories(komiraquake PRIVATE src)
@@ -141,6 +145,9 @@ target_link_libraries(komiraquake PRIVATE
     Qt6::Multimedia
     Qt6::Svg
     Qt6::Concurrent
+    # 场景图的 QSG* 头经由 qsgtexture_platform.h 间接需要 GL 头；Qt6::OpenGL 提供
+    # 它的 include 路径（Nix 下 GL 头不在默认搜索路径）。
+    Qt6::OpenGL
 )
 
 set(KOMIRA_QML_FILES
@@ -240,6 +247,7 @@ qt_add_qml_module(komiraquake
 file(GLOB KOMIRA_ICON_FILES CONFIGURE_DEPENDS qml/icons/*.svg qml/icons/LICENSE.txt)
 qt_add_resources(komiraquake lucide_icons PREFIX "/icons" BASE "qml/icons" FILES ${KOMIRA_ICON_FILES})
 
+
 # Google Sans（OFL）静态拉丁子集，见 tools/import_google_sans.py；打包进二进制避免依赖系统字体。
 file(GLOB KOMIRA_FONT_FILES CONFIGURE_DEPENDS fonts/*.ttf fonts/OFL.txt)
 qt_add_resources(komiraquake komira_fonts PREFIX "/fonts" BASE "fonts" FILES ${KOMIRA_FONT_FILES})
@@ -304,7 +312,8 @@ if(BUILD_TESTING)
         src/core/geo_geometry.cpp src/core/vector_map_data.cpp
         src/core/intensity_calculator.cpp src/core/quake_calculator.cpp
         src/core/time_sync.cpp src/core/travel_table.cpp
-        src/core/source_estimator.cpp src/core/region_names.cpp)
+        src/core/source_estimator.cpp src/core/region_names.cpp
+        src/core/polygon_tessellator.cpp)
     target_include_directories(core_engine_test PRIVATE src)
     add_test(NAME core_engine COMMAND core_engine_test)
     qt_add_executable(qt_business_test tests/qt_business_test.cpp
@@ -348,7 +357,7 @@ if(BUILD_TESTING)
         KOMIRA_VERSION="${PROJECT_VERSION}")
     target_link_libraries(gui_test PRIVATE Qt6::Test Qt6::Core Qt6::Gui Qt6::Widgets
         Qt6::Quick Qt6::QuickControls2 Qt6::Network Qt6::WebSockets Qt6::Sql
-        Qt6::Multimedia Qt6::Svg Qt6::Concurrent sentry)
+        Qt6::Multimedia Qt6::Svg Qt6::Concurrent Qt6::OpenGL sentry)
     komira_copy_crashpad_handler(gui_test)
     qt_add_resources(gui_test test_lucide_icons PREFIX "/icons" BASE "qml/icons" FILES ${KOMIRA_ICON_FILES})
     qt_add_resources(gui_test test_komira_fonts PREFIX "/fonts" BASE "fonts" FILES ${KOMIRA_FONT_FILES})
