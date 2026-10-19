@@ -1282,7 +1282,58 @@ private slots:
         QCOMPARE(settings.intensityStandard(), 0);
     }
 
-    // 新增的提醒矩阵 / 声音分轨 / 图层 / 逐源过滤默认值，以及旧通知键的迁移。
+    /// 逐项 NOTIFY 必须真的隔离：改一个设置只能惊动它自己的绑定。
+    ///
+    /// 回归点（2026-10）：49 个属性原先全挂聚合的 changed()，改任意一项都会让 QML 里
+    /// `app.settings.*` 的全部绑定（160 处引用）重新求值 —— 设置页拖滑块时每帧重算整棵
+    /// 地图子树的绑定。拆分之后必须保证：① 相关信号发出；② 不相关的信号不发；
+    /// ③ 恢复默认时**所有**信号都发（否则 UI 停在旧值上，曾让主题按钮不回落）。
+    void settingsPerPropertySignalsAreIsolated() {
+        QSettings().clear();
+        SettingsStore settings;
+        QSignalSpy aggregate(&settings, &SettingsStore::changed);
+        QSignalSpy theme(&settings, &SettingsStore::themeModeChanged);
+        QSignalSpy blur(&settings, &SettingsStore::backgroundBlurChanged);
+        QSignalSpy basemap(&settings, &SettingsStore::basemapIdChanged);
+        QSignalSpy stationLayer(&settings, &SettingsStore::showStationLayerChanged);
+        QSignalSpy regionParams(&settings, &SettingsStore::sourceEstimationRegionParamsChanged);
+        QVERIFY(theme.isValid() && blur.isValid() && basemap.isValid());
+        QVERIFY(stationLayer.isValid() && regionParams.isValid());
+
+        settings.setThemeMode(QStringLiteral("dark"));
+        QCOMPARE(theme.count(), 1);
+        QCOMPARE(blur.count(), 0);
+        QCOMPARE(basemap.count(), 0);
+        QCOMPARE(stationLayer.count(), 0);
+        QCOMPARE(aggregate.count(), 1);
+
+        // 写同样的值必须完全静默（幂等）。
+        settings.setThemeMode(QStringLiteral("dark"));
+        QCOMPARE(theme.count(), 1);
+        QCOMPARE(aggregate.count(), 1);
+
+        settings.setBackgroundBlur(false);
+        QCOMPARE(blur.count(), 1);
+        QCOMPARE(theme.count(), 1);
+
+        // 区域参数是复合键，四个字段共用一个信号。
+        settings.setSourceEstimationTrigger(QStringLiteral("japan"), 3.5);
+        QCOMPARE(regionParams.count(), 1);
+        settings.setSourceEstimationClusterRadius(QStringLiteral("china"), 300);
+        QCOMPARE(regionParams.count(), 2);
+
+        // 恢复默认：所有逐项信号都要发出去。
+        const int beforeTheme = theme.count();
+        const int beforeBlur = blur.count();
+        const int beforeStations = stationLayer.count();
+        settings.resetToDefaults();
+        QVERIFY2(theme.count() > beforeTheme, "恢复默认必须发出 themeModeChanged");
+        QVERIFY2(blur.count() > beforeBlur, "恢复默认必须发出 backgroundBlurChanged");
+        QVERIFY2(stationLayer.count() > beforeStations,
+                 "恢复默认必须发出 showStationLayerChanged");
+    }
+
+    /// 新增的提醒矩阵 / 声音分轨 / 图层 / 逐源过滤默认值，以及旧通知键的迁移。
     void granularSettingsDefaultsAndMigration() {
         QSettings().clear();
         {

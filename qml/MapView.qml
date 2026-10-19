@@ -111,8 +111,8 @@ Item {
         return { lat: worldLat, lon: worldLon };
     }
 
-    function wrapLon(lon) { return ((lon + 180) % 360 + 360) % 360 - 180; }
-    function clampLat(lat) { return Math.max(-85.05112878, Math.min(85.05112878, lat)); }
+    function wrapLon(lon: real): real { return ((lon + 180) % 360 + 360) % 360 - 180; }
+    function clampLat(lat: real): real { return Math.max(-85.05112878, Math.min(85.05112878, lat)); }
     /// 镜头动画：程序化切换（滚轮/按钮缩放、事件取景、回到我的位置、复位）平滑补间；
     /// 拖动平移保持 1:1 跟手，直接写属性并停掉动画。
     readonly property int cameraDuration: theme.reduceMotion ? 0 : 600
@@ -137,15 +137,15 @@ Item {
              + (u3 - u2) * h * ms[i + 1];
     }
     /// 平移：先快后慢，缩放主段内速度压到最低。
-    function cameraPanEase(t) {
+    function cameraPanEase(t: real): real {
         return cameraHermite(t, [0, 0.35, 0.75, 1], [0, 0.60, 0.94, 1], [0, 2.0, 0.45, 0]);
     }
     /// 缩放：前段只轻微启动，主体集中在平移降速的第二段，尾段收口。
-    function cameraZoomEase(t) {
+    function cameraZoomEase(t: real): real {
         return cameraHermite(t, [0, 0.35, 0.75, 1], [0, 0.10, 0.85, 1], [0, 0.7, 1.05, 0]);
     }
     /// 纯缩放步进（滚轮/按钮）：立即起步的 OutCubic，180ms 内不拖沓。
-    function cameraZoomStepEase(t) {
+    function cameraZoomStepEase(t: real): real {
         const u = 1 - t;
         return 1 - u * u * u;
     }
@@ -745,19 +745,19 @@ Item {
 
     clip: true
 
-    function worldSize(z) { return tileSize * Math.pow(2, z); }
-    function projX(lon, z) { return (lon + 180) / 360 * worldSize(z); }
-    function projY(lat, z) {
+    function worldSize(z: real): real { return tileSize * Math.pow(2, z); }
+    function projX(lon: real, z: real): real { return (lon + 180) / 360 * worldSize(z); }
+    function projY(lat: real, z: real): real {
         const rad = clampLat(lat) * Math.PI / 180.0;
         const y = (1.0 - Math.log(Math.tan(rad) + 1.0 / Math.cos(rad)) / Math.PI) / 2.0;
         return y * worldSize(z);
     }
-    function unprojLon(x, z) { return x / worldSize(z) * 360.0 - 180.0; }
-    function unprojLat(y, z) {
+    function unprojLon(x: real, z: real): real { return x / worldSize(z) * 360.0 - 180.0; }
+    function unprojLat(y: real, z: real): real {
         const n = Math.PI - 2.0 * Math.PI * y / worldSize(z);
         return 180.0 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
     }
-    function pxPerKm(lat) {
+    function pxPerKm(lat: real): real {
         const cosLat = Math.max(0.01, Math.cos(lat * Math.PI / 180.0));
         return (worldSize(tileZoom) * tileScale / 360.0) / (111.32 * cosLat);
     }
@@ -765,8 +765,8 @@ Item {
     readonly property real originX: projX(centerLon, tileZoom) * tileScale - width / 2
     readonly property real originY: projY(centerLat, tileZoom) * tileScale - height / 2
 
-    function screenX(lon) { return width / 2 + wrapLon(lon - centerLon) / 360 * worldSize(zoom); }
-    function screenY(lat) { return projY(lat, tileZoom) * tileScale - originY; }
+    function screenX(lon: real): real { return width / 2 + wrapLon(lon - centerLon) / 360 * worldSize(zoom); }
+    function screenY(lat: real): real { return projY(lat, tileZoom) * tileScale - originY; }
 
     // 瓦片范围是整数，只在跨越瓦片边界或整数缩放级别时变化；
     // 拖动/捏合过程中 Repeater 因此不会每帧重建 delegate（否则瓦片会反复闪烁重载）。
@@ -1251,9 +1251,11 @@ Item {
         function onStationsApplied() { stationHover.refresh(); }
     }
     // 关闭测站图层时浮层必须立刻收起：此时地图上已经没有可指的点了。
+    // 听逐项信号而不是聚合的 changed()：SettingsStore 的 changed() 任何设置项变化都会发，
+    // 而这里只关心测站图层开关。
     Connections {
         target: app.settings
-        function onChanged() {
+        function onShowStationLayerChanged() {
             if (!app.settings.showStationLayer) stationHover.hide();
         }
     }

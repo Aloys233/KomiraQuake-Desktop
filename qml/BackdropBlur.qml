@@ -13,7 +13,12 @@ Item {
     /// 仍以 ~86 fps 渲染、吃掉约 25% CPU（每个玻璃卡片都在重绘整棵地图子树）。
     /// 相机移动时才置 true；静止时由下面的定时器低频补帧。
     property bool live: true
-    readonly property int blurRadius: 64
+    /// 模糊核半径。0 表示退化为「只做半透明底衬」。
+    ///
+    /// 拖动/缩放时是 11 张玻璃卡同时挂 ShaderEffectSource + MultiEffect 采样整块地图，
+    /// 模糊成本随 blurMax 线性上升；而相机移动中背景本身在飞，用户分辨不出模糊质量。
+    /// 因此移动时降到 32（看起来仍是磨砂玻璃），静止后回到 64。
+    readonly property int blurRadius: root.live ? 32 : 64
     // Keep the sample margin at least as wide as the full blur kernel.
     readonly property real padding: blurRadius
     clip: true

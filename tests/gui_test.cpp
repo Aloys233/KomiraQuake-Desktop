@@ -975,11 +975,13 @@ private slots:
         mapView->setProperty("zoom", 6.02);
         window->grabWindow();
 
+        // screenX/screenY 带类型标注（`function screenX(lon: real): real`），
+        // 编译后的元调用签名是 double(double)，不能再按 QVariant 传参。
         auto qmlNum = [&](const char* fn, double arg) -> double {
-            QVariant ret;
-            const bool ok = QMetaObject::invokeMethod(mapView, fn, Q_RETURN_ARG(QVariant, ret),
-                                                      Q_ARG(QVariant, QVariant(arg)));
-            return ok ? ret.toDouble() : qQNaN();
+            double ret = qQNaN();
+            const bool ok = QMetaObject::invokeMethod(mapView, fn, Q_RETURN_ARG(double, ret),
+                                                      Q_ARG(double, arg));
+            return ok ? ret : qQNaN();
         };
         auto aligned = [&]() -> bool {
             for (const QPointF& p : {QPointF(116.4, 39.9), QPointF(121.5, 31.2),
@@ -1004,6 +1006,83 @@ private slots:
             ok = aligned();
         }
         QVERIFY2(ok, "矢量层在缩放后与震中/定位标记错位");
+    }
+
+    /// LOD 分档与缓存记忆：低缩放必须用粗档、拉近必须回到全精度，且隐藏时释放位图。
+    ///
+    /// 回归点（2026-10 矢量层重构）：全精度重绘在缓存尺寸下要 13–57 ms/次，LOD 是把它
+    /// 压到一帧预算内的关键手段。若以后有人把档位算错（例如忘了乘 dpr、或档位方向反了），
+    /// 属性断言仍是全绿、只有手感变差 —— 所以这里直接断言绘制实际采用的容差档。
+    void vectorLodTiersAndCacheRelease() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("VectorLodTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("vector");
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        auto* district = window->findChild<QQuickItem*>("vectorDistrictLayer");
+        auto* world = window->findChild<QQuickItem*>("vectorWorldLayer");
+        QVERIFY(mapView && district && world);
+
+        // 几何与首个档位都在 worker 线程构建：等到本层真的画出东西为止。
+        auto lodTol = [&](QQuickItem* layer) {
+            double tol = 0.0;
+            QMetaObject::invokeMethod(layer, "lodToleranceForTest", Q_RETURN_ARG(double, tol));
+            return tol;
+        };
+        auto cacheBytes = [&](QQuickItem* layer) {
+            qint64 bytes = 0;
+            QMetaObject::invokeMethod(layer, "cacheBytesForTest", Q_RETURN_ARG(qint64, bytes));
+            return bytes;
+        };
+        mapView->setProperty("centerLat", 35.0);
+        mapView->setProperty("centerLon", 105.0);
+        mapView->setProperty("zoom", 5.0);
+        QVERIFY2(QTest::qWaitFor([&] { window->grabWindow(); return cacheBytes(world) > 0; }, 8000),
+                 "world layer never produced a cache bitmap");
+
+        // 全国概览（z5）：容差必须 > 0（说明真的在简化），且是 0.5 设备像素对应的档。
+        const double coarse = lodTol(world);
+        QVERIFY2(coarse > 0.0, qPrintable(QStringLiteral("z5 未启用 LOD，tol=%1").arg(coarse)));
+        // 期望 tolRef ≈ 0.5 / 2^(zoom-kRefZoom)，档位量化到 2 的幂：允许 1 个档的偏差。
+        const double ideal = 0.5 / std::pow(2.0, 5.0 - 10.0);
+        QVERIFY2(coarse <= ideal * 2.5 && coarse >= ideal / 2.5,
+                 qPrintable(QStringLiteral("z5 LOD 档位偏离预期：tol=%1 ideal=%2")
+                                .arg(coarse).arg(ideal)));
+
+        // 拉近到 z 12：0.5 设备像素对应的容差已远小于 1 参考层级像素，必须切回全精度。
+        mapView->setProperty("zoom", 12.0);
+        QTRY_VERIFY_WITH_TIMEOUT(([&] { window->grabWindow(); return lodTol(world) == 0.0; })(), 8000);
+
+        // 隐藏即释放：矢量叠加关闭后不应再占着十几 MB 位图。
+        QVERIFY(cacheBytes(world) > 0);
+        world->setProperty("visible", false);
+        QTRY_VERIFY_WITH_TIMEOUT(cacheBytes(world) == 0, 3000);
+
+        // 单张位图必须落在预算内（高分屏降档逻辑）。16 MiB / 4 B/px => 420 万像素。
+        world->setProperty("visible", true);
+        mapView->setProperty("zoom", 5.0);
+        QTRY_VERIFY_WITH_TIMEOUT(cacheBytes(world) > 0, 5000);
+        QVERIFY2(cacheBytes(world) <= 16LL * 1024 * 1024,
+                 qPrintable(QStringLiteral("缓存位图超预算：%1 B").arg(cacheBytes(world))));
+
+        // 区县层平时全透明（无震度）：必须一个面都不画，缓存保持为 0。
+        QVERIFY2(cacheBytes(district) == 0,
+                 "无震度时区县层不该建位图（1011 面全描边实测 24 ms）");
     }
 
     /// 拖动性能基准：模拟连续平移，测量每帧渲染耗时。
@@ -1032,21 +1111,46 @@ private slots:
         QVERIFY(mapView);
         QTest::qWait(300);
 
-        window->grabWindow();   // 预热：首次会加载 .kvb 并建投影缓存
+        // 几何与首个 LOD 档位在 worker 线程构建，必须先等它落地再计时，
+        // 否则测到的是「还没画出来」的 0 ms（曾经的探针就是这样测不到东西的）。
+        auto* world = window->findChild<QQuickItem*>("vectorWorldLayer");
+        QVERIFY(world);
+        auto cacheBytes = [&] {
+            qint64 bytes = 0;
+            QMetaObject::invokeMethod(world, "cacheBytesForTest", Q_RETURN_ARG(qint64, bytes));
+            return bytes;
+        };
+        mapView->setProperty("centerLat", 35.0);
+        mapView->setProperty("centerLon", 116.4);
+        mapView->setProperty("zoom", 6.0);
+        QVERIFY2(QTest::qWaitFor([&] { window->grabWindow(); return cacheBytes() > 0; }, 8000),
+                 "矢量层未在超时内完成首帧");
+        window->grabWindow();   // 预热：让 LOD 档位与纹理都就位
 
         qint64 worst = 0, total = 0;
         const int frames = 40;
         QElapsedTimer t;
+        auto rebuildsNow = [&] {
+            qint64 count = 0;
+            QMetaObject::invokeMethod(world, "cacheRebuildsForTest", Q_RETURN_ARG(qint64, count));
+            return count;
+        };
+        const qint64 before = rebuildsNow();
         for (int i = 0; i < frames; ++i) {
             t.restart();
-            mapView->setProperty("centerLon", 116.4 - i * 0.05);
+            // zoom 6 下 0.5° ≈ 23 px：40 帧共 ~900 px，必然跨过 160+128 px 的缓存余量，
+            // 逼出多次真实重建 —— 这正是「拖动卡顿」的来源，必须测到它。
+            mapView->setProperty("centerLon", 116.4 - i * 0.5);
             window->grabWindow();
             const qint64 ms = t.elapsed();
             worst = qMax(worst, ms);
             total += ms;
         }
+        const qint64 rebuilds = rebuildsNow() - before;
         qInfo() << "PROBE drag:" << frames << "frames, avg" << (total / frames) << "ms, worst"
-                << worst << "ms";
+                << worst << "ms, cache rebuilds" << rebuilds;
+        // 拖动 40 帧必须真的产生过重绘，否则这个探针又退化成「测不到东西」。
+        QVERIFY2(rebuilds > 0, "40 帧拖动没有触发任何缓存重建，探针无效");
     }
 
     /// 回归：目录整表重发时，未变化的事件不应重复写库；新条目合并成一次事务。
@@ -1205,11 +1309,13 @@ private slots:
         }
         QVERIFY2(changed > 500, "测站图层没有画出内容");
 
+        // screenX/screenY 带类型标注（`function screenX(lon: real): real`），
+        // 编译后的元调用签名是 double(double)，不能再按 QVariant 传参。
         auto qmlNum = [&](const char* fn, double arg) -> double {
-            QVariant ret;
-            const bool ok = QMetaObject::invokeMethod(mapView, fn, Q_RETURN_ARG(QVariant, ret),
-                                                      Q_ARG(QVariant, QVariant(arg)));
-            return ok ? ret.toDouble() : qQNaN();
+            double ret = qQNaN();
+            const bool ok = QMetaObject::invokeMethod(mapView, fn, Q_RETURN_ARG(double, ret),
+                                                      Q_ARG(double, arg));
+            return ok ? ret : qQNaN();
         };
         auto aligned = [&]() -> bool {
             for (const QPointF& p : {QPointF(116.4, 39.9), QPointF(121.5, 31.2),

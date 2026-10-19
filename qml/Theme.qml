@@ -3,9 +3,16 @@ import QtQuick
 // Shared material / type tokens; seismic colors remain the §9 contract.
 QtObject {
     id: theme
-    readonly property bool dark: app ? app.darkMode : false
-    readonly property bool reduceMotion: app && app.settings ? app.settings.reduceMotion : false
-    readonly property bool backgroundBlur: app && app.settings ? app.settings.backgroundBlur : true
+    // 这三项**不从 `app` 直接读**，而是由 Main.qml 的实例绑定注入。
+    //
+    // 原因是 `app` 是 context property，qmlcachegen 无法静态解析它：只要某个属性的
+    // 初始化表达式里出现 `app`，该属性的类型就退化成 QVariant，随后**所有**读它的绑定
+    // （`theme.outline` 这类颜色）都无法编译成 C++，实测仅「internal conversion」失败
+    // 就有 129 条。改成普通 bool 属性后，Theme 的颜色属性恢复静态类型，
+    // 下游绑定全部可编译；注入点在 Main.qml，语义完全不变。
+    property bool dark: false
+    property bool reduceMotion: false
+    property bool backgroundBlur: true
     readonly property int motionDuration: reduceMotion ? 0 : 150
     // 打包的 Google Sans（拉丁）；中文由应用字体的 families 回退到系统 CJK。
     readonly property string fontFamily: "Google Sans"
@@ -53,7 +60,7 @@ QtObject {
     readonly property color accentContainer: dark ? "#213F42" : "#DDEFF0"
     readonly property color accentBorder: dark ? "#3C797D" : "#98C6CA"
 
-    function severity(tag) {
+    function severity(tag: string): color {
         switch (tag) {
         case "CRITICAL": return dark ? criticalDark : criticalLight;
         case "WARNING": return dark ? warningDark : warningLight;
@@ -61,7 +68,7 @@ QtObject {
         default: return dark ? normalDark : normalLight;
         }
     }
-    function container(tag) {
+    function container(tag: string): color {
         const c = severity(tag);
         return Qt.rgba(c.r, c.g, c.b, 0.14);
     }
@@ -71,7 +78,7 @@ QtObject {
         "#9F9F9F", "#9F9F9F", "#CFCFCF", "#5FCFFF", "#3FAFFF", "#5FDF8F",
         "#F7E757", "#FF8F00", "#FF4F00", "#DF0F0F", "#7F007F", "#7F007F", "#7F007F"
     ]
-    function intensityColor(raw) {
+    function intensityColor(raw: real): color {
         const level = Math.round(raw);
         return csisColorBand[Math.max(0, Math.min(csisColorBand.length - 1, level))];
     }
@@ -85,7 +92,7 @@ QtObject {
         "#ff5900", "#fd3500", "#f81100", "#e50000", "#bd0000"
     ]
     /// 连续震度 → 测站颜色。缺测（`raw <= -3`）取最低档深蓝（默认观感即"蓝点"）。
-    function niedStationColor(raw) {
+    function niedStationColor(raw: real): color {
         const idx = Math.max(0, Math.min(20, Math.round((raw + 3) * 2)));
         return niedColorBand[idx];
     }
@@ -104,20 +111,20 @@ QtObject {
     ]
     /// KMA MMI → 颜色：MMI 0/1 是常态基线，取圆点色阶的蓝；MMI ≥ 2 取 `kmaColorBand`
     /// （下标 = MMI+2，对齐 kanameishi `kmaIntColorBand`）。
-    function kmaStationColor(raw) {
+    function kmaStationColor(raw: real): color {
         const mmi = Math.max(0, Math.min(11, Math.round(raw)));
         if (mmi < 2) return kmaDotColorBand[mmi];
         return kmaColorBand[Math.min(kmaColorBand.length - 1, mmi + 2)];
     }
     /// 卡片大号数字用的颜色：色阶原色在浅色卡上偏亮、深色卡上偏暗，
     /// 这里按主题做对比度校正（浅色卡压暗、深色卡提亮），保证数字可读。
-    function stationTextColor(raw) {
+    function stationTextColor(raw: real): color {
         const base = niedStationColor(raw);
         return dark ? Qt.lighter(base, 1.45) : Qt.darker(base, 1.5);
     }
     /// 卡片大号数字用色（按数据源制式）：`csis` 用中国烈度色阶、`kma` 用韩国 MMI 色阶，
     /// 其余用 NIED 连续色阶；同样按主题做对比度校正，保证数字可读。
-    function stationTextColorFor(raw, standard) {
+    function stationTextColorFor(raw: real, standard: string): color {
         let base;
         if (standard === "csis") base = intensityColor(raw);
         else if (standard === "kma") base = kmaStationColor(raw);
@@ -126,23 +133,23 @@ QtObject {
     }
     /// 悬停浮层里的烈度小色块：取同一套测站色阶的低透明度色，
     /// 让浮层与地图上刚指的那个站颜色对得上，同时不压过正文。
-    function stationFillColorFor(raw, standard) {
+    function stationFillColorFor(raw: real, standard: string): color {
         let base;
         if (standard === "csis") base = intensityColor(raw);
         else if (standard === "kma") base = kmaStationColor(raw);
         else base = niedStationColor(raw);
         return Qt.rgba(base.r, base.g, base.b, dark ? 0.30 : 0.18);
     }
-    function magnitudeColor(m) {
+    function magnitudeColor(m: real): color {
         if (m < 3.0) return "#00796B";
         if (m < 4.5) return "#F57F17";
         if (m < 6.0) return "#E64A19";
         return "#C2185B";
     }
-    function on(bg) { return bg.hslLightness < 0.5 ? "#FFFFFF" : "#1A1C1E"; }
+    function on(bg: color): color { return bg.hslLightness < 0.5 ? "#FFFFFF" : "#1A1C1E"; }
 
     /// 数据源连接状态用色（对齐 kanameishi）：在线绿 / 连接中黄 / 断开或异常红。
-    function connectionColor(tag) {
+    function connectionColor(tag: string): color {
         switch (tag) {
         case "CONNECTED": return clockSynced;
         case "CONNECTING": return severity("WATCH");

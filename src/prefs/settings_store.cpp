@@ -1,5 +1,6 @@
 #include "prefs/settings_store.h"
 
+#include <QList>
 #include <QStringList>
 
 #include <string>
@@ -66,6 +67,10 @@ SettingsStore::SettingsStore(QObject* parent) : QObject(parent) { migrateLegacyG
 void SettingsStore::resetToDefaults() {
     s_.clear();
     emit changed();
+    // 恢复默认会一次性改掉**所有**设置项，逐项信号必须全部发出去：
+    // QML 只监听具体某一项（不再依赖聚合的 changed()），漏发就会停在旧值上
+    // —— 例如主题按钮仍显示「深色」而实际已回到「跟随系统」。
+    emitAllChanged();
 }
 
 bool SettingsStore::hasSourceEstimationRegion(const QString& region) const {
@@ -171,7 +176,89 @@ void SettingsStore::resetSourceEstimationRegion(const QString& region) {
         s_.remove(key);
         touched = true;
     }
-    if (touched) emit changed();
+    if (touched) {
+        emit changed();
+        emit sourceEstimationRegionParamsChanged();
+    }
 }
 
+const QList<SettingsStore::KeySignal>& SettingsStore::keySignals() {
+    static const QList<KeySignal> kEntries = {
+        {"alertVolume", &SettingsStore::alertVolumeChanged},
+        {"announceCountdown", &SettingsStore::announceCountdownChanged},
+        {"announceEvent", &SettingsStore::announceEventChanged},
+        {"announceUpdate", &SettingsStore::announceUpdateChanged},
+        {"autoCheckUpdates", &SettingsStore::autoCheckUpdatesChanged},
+        {"backgroundBlur", &SettingsStore::backgroundBlurChanged},
+        {"basemapId", &SettingsStore::basemapIdChanged},
+        {"closeToTray", &SettingsStore::closeToTrayChanged},
+        {"customBasemapDatum", &SettingsStore::customBasemapDatumChanged},
+        {"customBasemapUrl", &SettingsStore::customBasemapUrlChanged},
+        {"customNtpServer", &SettingsStore::customNtpServerChanged},
+        {"developerMode", &SettingsStore::developerModeChanged},
+        {"disabledSources", &SettingsStore::disabledSourcesChanged},
+        {"disabledStationSources", &SettingsStore::disabledStationSourcesChanged},
+        {"enableAlarmTone", &SettingsStore::enableAlarmToneChanged},
+        {"enableNtpSync", &SettingsStore::enableNtpSyncChanged},
+        {"enableSoundAlert", &SettingsStore::enableSoundAlertChanged},
+        {"enableWarnings", &SettingsStore::enableWarningsChanged},
+        {"enabledSourceEstimationRegions", &SettingsStore::enabledSourceEstimationRegionsChanged},
+        {"intensityStandard", &SettingsStore::intensityStandardChanged},
+        {"isMuted", &SettingsStore::isMutedChanged},
+        {"jianRefreshToken", &SettingsStore::jianRefreshTokenChanged},
+        {"localIntensityFilter", &SettingsStore::localIntensityFilterChanged},
+        {"notifyAlert", &SettingsStore::notifyAlertChanged},
+        {"notifyEew", &SettingsStore::notifyEewChanged},
+        {"notifyInfo", &SettingsStore::notifyInfoChanged},
+        {"raiseAlert", &SettingsStore::raiseAlertChanged},
+        {"raiseEew", &SettingsStore::raiseEewChanged},
+        {"raiseInfo", &SettingsStore::raiseInfoChanged},
+        {"reduceMotion", &SettingsStore::reduceMotionChanged},
+        {"showEstimatedEpicenter", &SettingsStore::showEstimatedEpicenterChanged},
+        {"showProvinceBorders", &SettingsStore::showProvinceBordersChanged},
+        {"showStationLayer", &SettingsStore::showStationLayerChanged},
+        {"showWavefront", &SettingsStore::showWavefrontChanged},
+        {"silentStart", &SettingsStore::silentStartChanged},
+        {"simulatedUrl", &SettingsStore::simulatedUrlChanged},
+        {"sourceEstimationEnabled", &SettingsStore::sourceEstimationEnabledChanged},
+        {"sourceEstimationHoldSeconds", &SettingsStore::sourceEstimationHoldSecondsChanged},
+        {"themeMode", &SettingsStore::themeModeChanged},
+        {"vectorOverlay", &SettingsStore::vectorOverlayChanged},
+        {"whewsToken", &SettingsStore::whewsTokenChanged},
+    };
+    return kEntries;
+}
+
+bool SettingsStore::isRegionParamKey(const QString& key) {
+    static const QStringList kRegionFields = {QStringLiteral(".trigger"),
+                                              QStringLiteral(".minStations"),
+                                              QStringLiteral(".quietEvidence"),
+                                              QStringLiteral(".clusterRadius")};
+    if (!key.startsWith(QStringLiteral("sourceEstimation."))) return false;
+    for (const QString& field : kRegionFields) {
+        if (key.endsWith(field)) return true;
+    }
+    return false;
+}
+
+void SettingsStore::emitKeyChanged(const QString& key) {
+    // 区域参数是复合键（`sourceEstimation.<region>.<field>`），统一走一个信号。
+    if (isRegionParamKey(key)) {
+        emit sourceEstimationRegionParamsChanged();
+        return;
+    }
+    const auto& entries = keySignals();
+    for (const auto& entry : entries) {
+        if (key == QLatin1String(entry.key)) {
+            (this->*entry.signal)();
+            return;
+        }
+    }
+    // 未登记的键：没有逐项信号，但 changed() 已经发出，C++ 侧的复核不受影响。
+}
+
+void SettingsStore::emitAllChanged() {
+    for (const auto& entry : keySignals()) (this->*entry.signal)();
+    emit sourceEstimationRegionParamsChanged();
+}
 } // namespace komira

@@ -574,6 +574,15 @@ QSGNode* StationMapItem::updateSoftwareNode(QSGNode* oldNode, double lat, double
         node->setOwnsTexture(true);
     }
 
+    // 软件后端是**逐块 drawImage** 把 2500 个图块画进整层位图，成本随像素数平方增长：
+    // 实测 dpr=1 时 1.0 ms/帧、dpr=2 时 18.8 ms/帧（同一份数据）。这个后端只在无 GPU
+    // 的环境（CI/远程桌面/虚拟机）出现，清晰度让位于可用性：把 dpr 限到 1.5，
+    // 并把整层位图控制在 800 万像素以内。
+    qreal drawDpr = qMin<qreal>(dpr, 1.5);
+    const double pixels = w * h * double(drawDpr) * double(drawDpr);
+    if (pixels > 8.0e6) drawDpr = std::sqrt(8.0e6 / std::max(1.0, w * h));
+    dpr = qMax<qreal>(1.0, drawDpr);
+
     int csisPx = 0, dotPx = 0, idlePx = 0;
     stationSizes(zoom, &csisPx, &dotPx, &idlePx);
     if (atlas_.isNull() || atlasVersion_ != colorVersion_ || atlasDpr_ != dpr ||

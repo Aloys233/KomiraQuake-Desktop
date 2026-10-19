@@ -9,79 +9,79 @@ namespace komira {
 /// 设置项与默认值。《NATIVE_PORT_SPEC》 §7。统一由 changed() 通知，QML 绑定整体刷新。
 class SettingsStore : public QObject {
     Q_OBJECT
-    Q_PROPERTY(QString basemapId READ basemapId WRITE setBasemapId NOTIFY changed)
-    Q_PROPERTY(QString customBasemapUrl READ customBasemapUrl WRITE setCustomBasemapUrl NOTIFY changed)
-    Q_PROPERTY(int customBasemapDatum READ customBasemapDatum WRITE setCustomBasemapDatum NOTIFY changed)
+    Q_PROPERTY(QString basemapId READ basemapId WRITE setBasemapId NOTIFY basemapIdChanged)
+    Q_PROPERTY(QString customBasemapUrl READ customBasemapUrl WRITE setCustomBasemapUrl NOTIFY customBasemapUrlChanged)
+    Q_PROPERTY(int customBasemapDatum READ customBasemapDatum WRITE setCustomBasemapDatum NOTIFY customBasemapDatumChanged)
     /// 在栅格底图之上叠加矢量层（省界 / 区县）；开启时预警按区县烈度着色。
-    Q_PROPERTY(bool vectorOverlay READ vectorOverlay WRITE setVectorOverlay NOTIFY changed)
+    Q_PROPERTY(bool vectorOverlay READ vectorOverlay WRITE setVectorOverlay NOTIFY vectorOverlayChanged)
     /// 矢量层中的省界描边；关闭后只保留区县填色。
-    Q_PROPERTY(bool showProvinceBorders READ showProvinceBorders WRITE setShowProvinceBorders NOTIFY changed)
+    Q_PROPERTY(bool showProvinceBorders READ showProvinceBorders WRITE setShowProvinceBorders NOTIFY showProvinceBordersChanged)
     /// 地图叠加层：测站强度点与右上角测站卡片、P/S 波前圆。
-    Q_PROPERTY(bool showStationLayer READ showStationLayer WRITE setShowStationLayer NOTIFY changed)
-    Q_PROPERTY(bool showWavefront READ showWavefront WRITE setShowWavefront NOTIFY changed)
-    Q_PROPERTY(int intensityStandard READ intensityStandard WRITE setIntensityStandard NOTIFY changed)
-    Q_PROPERTY(double localIntensityFilter READ localIntensityFilter WRITE setLocalIntensityFilter NOTIFY changed)
-    Q_PROPERTY(bool enableWarnings READ enableWarnings WRITE setEnableWarnings NOTIFY changed)
-    Q_PROPERTY(bool enableSoundAlert READ enableSoundAlert WRITE setEnableSoundAlert NOTIFY changed)
+    Q_PROPERTY(bool showStationLayer READ showStationLayer WRITE setShowStationLayer NOTIFY showStationLayerChanged)
+    Q_PROPERTY(bool showWavefront READ showWavefront WRITE setShowWavefront NOTIFY showWavefrontChanged)
+    Q_PROPERTY(int intensityStandard READ intensityStandard WRITE setIntensityStandard NOTIFY intensityStandardChanged)
+    Q_PROPERTY(double localIntensityFilter READ localIntensityFilter WRITE setLocalIntensityFilter NOTIFY localIntensityFilterChanged)
+    Q_PROPERTY(bool enableWarnings READ enableWarnings WRITE setEnableWarnings NOTIFY enableWarningsChanged)
+    Q_PROPERTY(bool enableSoundAlert READ enableSoundAlert WRITE setEnableSoundAlert NOTIFY enableSoundAlertChanged)
     /// 提醒矩阵（视觉）：分级事件各自决定是否弹系统通知 / 置顶主窗口。
     /// alert = 通过本地烈度过滤的预警；eew = 其余实时预警；info = 目录地震信息。
-    Q_PROPERTY(bool notifyAlert READ notifyAlert WRITE setNotifyAlert NOTIFY changed)
-    Q_PROPERTY(bool raiseAlert READ raiseAlert WRITE setRaiseAlert NOTIFY changed)
-    Q_PROPERTY(bool notifyEew READ notifyEew WRITE setNotifyEew NOTIFY changed)
-    Q_PROPERTY(bool raiseEew READ raiseEew WRITE setRaiseEew NOTIFY changed)
-    Q_PROPERTY(bool notifyInfo READ notifyInfo WRITE setNotifyInfo NOTIFY changed)
-    Q_PROPERTY(bool raiseInfo READ raiseInfo WRITE setRaiseInfo NOTIFY changed)
+    Q_PROPERTY(bool notifyAlert READ notifyAlert WRITE setNotifyAlert NOTIFY notifyAlertChanged)
+    Q_PROPERTY(bool raiseAlert READ raiseAlert WRITE setRaiseAlert NOTIFY raiseAlertChanged)
+    Q_PROPERTY(bool notifyEew READ notifyEew WRITE setNotifyEew NOTIFY notifyEewChanged)
+    Q_PROPERTY(bool raiseEew READ raiseEew WRITE setRaiseEew NOTIFY raiseEewChanged)
+    Q_PROPERTY(bool notifyInfo READ notifyInfo WRITE setNotifyInfo NOTIFY notifyInfoChanged)
+    Q_PROPERTY(bool raiseInfo READ raiseInfo WRITE setRaiseInfo NOTIFY raiseInfoChanged)
     /// 播报内容分轨：首发/终报、更新报、倒计时与抵达、警报音可分别关闭。
-    Q_PROPERTY(bool announceEvent READ announceEvent WRITE setAnnounceEvent NOTIFY changed)
-    Q_PROPERTY(bool announceUpdate READ announceUpdate WRITE setAnnounceUpdate NOTIFY changed)
-    Q_PROPERTY(bool announceCountdown READ announceCountdown WRITE setAnnounceCountdown NOTIFY changed)
-    Q_PROPERTY(bool enableAlarmTone READ enableAlarmTone WRITE setEnableAlarmTone NOTIFY changed)
-    Q_PROPERTY(bool reduceMotion READ reduceMotion WRITE setReduceMotion NOTIFY changed)
-    Q_PROPERTY(bool backgroundBlur READ backgroundBlur WRITE setBackgroundBlur NOTIFY changed)
-    Q_PROPERTY(bool isMuted READ isMuted WRITE setIsMuted NOTIFY changed)
+    Q_PROPERTY(bool announceEvent READ announceEvent WRITE setAnnounceEvent NOTIFY announceEventChanged)
+    Q_PROPERTY(bool announceUpdate READ announceUpdate WRITE setAnnounceUpdate NOTIFY announceUpdateChanged)
+    Q_PROPERTY(bool announceCountdown READ announceCountdown WRITE setAnnounceCountdown NOTIFY announceCountdownChanged)
+    Q_PROPERTY(bool enableAlarmTone READ enableAlarmTone WRITE setEnableAlarmTone NOTIFY enableAlarmToneChanged)
+    Q_PROPERTY(bool reduceMotion READ reduceMotion WRITE setReduceMotion NOTIFY reduceMotionChanged)
+    Q_PROPERTY(bool backgroundBlur READ backgroundBlur WRITE setBackgroundBlur NOTIFY backgroundBlurChanged)
+    Q_PROPERTY(bool isMuted READ isMuted WRITE setIsMuted NOTIFY isMutedChanged)
     /// 已禁用的数据源 id 列表。采用「禁用集合」而非「启用集合」：未列出的源默认启用，
     /// 新增数据源无需迁移即默认开启（两端一致）。
-    Q_PROPERTY(QStringList disabledSources READ disabledSources WRITE setDisabledSources NOTIFY changed)
+    Q_PROPERTY(QStringList disabledSources READ disabledSources WRITE setDisabledSources NOTIFY disabledSourcesChanged)
     /// 已禁用的测站显示源 id 列表（仅桌面端）。空的禁用集合 = 三路测站都开启。
-    Q_PROPERTY(QStringList disabledStationSources READ disabledStationSources WRITE setDisabledStationSources NOTIFY changed)
+    Q_PROPERTY(QStringList disabledStationSources READ disabledStationSources WRITE setDisabledStationSources NOTIFY disabledStationSourcesChanged)
     /// Jian 数据源的刷新令牌（rt_…，登录后由应用写入并持久化；不向 UI 回显明文）。
-    Q_PROPERTY(QString jianRefreshToken READ jianRefreshToken WRITE setJianRefreshToken NOTIFY changed)
+    Q_PROPERTY(QString jianRefreshToken READ jianRefreshToken WRITE setJianRefreshToken NOTIFY jianRefreshTokenChanged)
     /// 是否已完成 Jian 登录（有刷新令牌）。未登录时设置页显示登录框，且该源不会被启动。
-    Q_PROPERTY(bool jianConfigured READ jianConfigured NOTIFY changed)
+    Q_PROPERTY(bool jianConfigured READ jianConfigured NOTIFY jianRefreshTokenChanged)
     /// Whews 数据源的访问令牌（wat_…，在 auth.beecld.com 申请；设置页粘贴后写入并持久化；
     /// 不向 UI 回显明文）。留空即视为未配置，不会建立任何连接。
-    Q_PROPERTY(QString whewsToken READ whewsToken WRITE setWhewsToken NOTIFY changed)
+    Q_PROPERTY(QString whewsToken READ whewsToken WRITE setWhewsToken NOTIFY whewsTokenChanged)
     /// 是否已配置 Whews 令牌。未配置时设置页显示令牌输入框，且该源不会被启动。
-    Q_PROPERTY(bool whewsConfigured READ whewsConfigured NOTIFY changed)
-    Q_PROPERTY(double alertVolume READ alertVolume WRITE setAlertVolume NOTIFY changed)
-    Q_PROPERTY(bool enableNtpSync READ enableNtpSync WRITE setEnableNtpSync NOTIFY changed)
-    Q_PROPERTY(QString customNtpServer READ customNtpServer WRITE setCustomNtpServer NOTIFY changed)
+    Q_PROPERTY(bool whewsConfigured READ whewsConfigured NOTIFY whewsTokenChanged)
+    Q_PROPERTY(double alertVolume READ alertVolume WRITE setAlertVolume NOTIFY alertVolumeChanged)
+    Q_PROPERTY(bool enableNtpSync READ enableNtpSync WRITE setEnableNtpSync NOTIFY enableNtpSyncChanged)
+    Q_PROPERTY(QString customNtpServer READ customNtpServer WRITE setCustomNtpServer NOTIFY customNtpServerChanged)
     /// 开发者模式：显出模拟数据源的卡片与地址输入框。关闭时该源不被启动、不建立任何连接。
-    Q_PROPERTY(bool developerMode READ developerMode WRITE setDeveloperMode NOTIFY changed)
+    Q_PROPERTY(bool developerMode READ developerMode WRITE setDeveloperMode NOTIFY developerModeChanged)
     /// 模拟数据源的 WebSocket 地址（如 ws://127.0.0.1:8080/ws）。留空即视为未配置。
-    Q_PROPERTY(QString simulatedUrl READ simulatedUrl WRITE setSimulatedUrl NOTIFY changed)
+    Q_PROPERTY(QString simulatedUrl READ simulatedUrl WRITE setSimulatedUrl NOTIFY simulatedUrlChanged)
     /// 主题模式：`system` / `light` / `dark`。替代旧版布尔 darkMode（迁移见 themeMode()）。
-    Q_PROPERTY(QString themeMode READ themeMode WRITE setThemeMode NOTIFY changed)
-    Q_PROPERTY(bool silentStart READ silentStart WRITE setSilentStart NOTIFY changed)
+    Q_PROPERTY(QString themeMode READ themeMode WRITE setThemeMode NOTIFY themeModeChanged)
+    Q_PROPERTY(bool silentStart READ silentStart WRITE setSilentStart NOTIFY silentStartChanged)
     /// 关闭主窗口时收进托盘（默认）；关闭时直接退出应用。
-    Q_PROPERTY(bool closeToTray READ closeToTray WRITE setCloseToTray NOTIFY changed)
-    Q_PROPERTY(bool autoCheckUpdates READ autoCheckUpdates WRITE setAutoCheckUpdates NOTIFY changed)
+    Q_PROPERTY(bool closeToTray READ closeToTray WRITE setCloseToTray NOTIFY closeToTrayChanged)
+    Q_PROPERTY(bool autoCheckUpdates READ autoCheckUpdates WRITE setAutoCheckUpdates NOTIFY autoCheckUpdatesChanged)
     /// 本地震源推算（Beta）：只吃实时测站强度场，不产事件、不参与告警。
-    Q_PROPERTY(bool sourceEstimationEnabled READ sourceEstimationEnabled WRITE setSourceEstimationEnabled NOTIFY changed)
+    Q_PROPERTY(bool sourceEstimationEnabled READ sourceEstimationEnabled WRITE setSourceEstimationEnabled NOTIFY sourceEstimationEnabledChanged)
     /// 触发阈值（同制式强度）：达到它的测站进入正证据，低于它的邻近站作为删失观测。
     /// 兼容旧键：只有中国区沿用旧 `sourceEstimationTrigger`，其余区域各有独立键。
-    Q_PROPERTY(double sourceEstimationTrigger READ sourceEstimationTrigger WRITE setSourceEstimationTrigger NOTIFY changed)
+    Q_PROPERTY(double sourceEstimationTrigger READ sourceEstimationTrigger WRITE setSourceEstimationTrigger NOTIFY sourceEstimationRegionParamsChanged)
     /// 发布门槛：触发测站数低于它时只显示「收集中」，不给震源。最小可设 1 站
     /// （1–2 站靠未触发站的删失约束定位，见 SourceEstimator::estimate 的说明）。
-    Q_PROPERTY(int sourceEstimationMinStations READ sourceEstimationMinStations WRITE setSourceEstimationMinStations NOTIFY changed)
+    Q_PROPERTY(int sourceEstimationMinStations READ sourceEstimationMinStations WRITE setSourceEstimationMinStations NOTIFY sourceEstimationRegionParamsChanged)
     /// 是否用未触发站做负证据（删失观测）。
-    Q_PROPERTY(bool sourceEstimationQuietEvidence READ sourceEstimationQuietEvidence WRITE setSourceEstimationQuietEvidence NOTIFY changed)
+    Q_PROPERTY(bool sourceEstimationQuietEvidence READ sourceEstimationQuietEvidence WRITE setSourceEstimationQuietEvidence NOTIFY sourceEstimationRegionParamsChanged)
     /// 证据消散后结果在地图上保留的秒数（全局：与区域无关）。
-    Q_PROPERTY(int sourceEstimationHoldSeconds READ sourceEstimationHoldSeconds WRITE setSourceEstimationHoldSeconds NOTIFY changed)
+    Q_PROPERTY(int sourceEstimationHoldSeconds READ sourceEstimationHoldSeconds WRITE setSourceEstimationHoldSeconds NOTIFY sourceEstimationHoldSecondsChanged)
     /// 触发区合并半径（km）：相距超过它的两片触发区**不会**被拟合成同一个震源。
-    Q_PROPERTY(int sourceEstimationClusterRadius READ sourceEstimationClusterRadius WRITE setSourceEstimationClusterRadius NOTIFY changed)
+    Q_PROPERTY(int sourceEstimationClusterRadius READ sourceEstimationClusterRadius WRITE setSourceEstimationClusterRadius NOTIFY sourceEstimationRegionParamsChanged)
     /// 在地图上画出推定震中（十字 + 不确定度圈）。
-    Q_PROPERTY(bool showEstimatedEpicenter READ showEstimatedEpicenter WRITE setShowEstimatedEpicenter NOTIFY changed)
+    Q_PROPERTY(bool showEstimatedEpicenter READ showEstimatedEpicenter WRITE setShowEstimatedEpicenter NOTIFY showEstimatedEpicenterChanged)
 
 public:
     explicit SettingsStore(QObject* parent = nullptr);
@@ -108,11 +108,11 @@ public:
     Q_INVOKABLE bool isSourceEstimationRegionEnabled(const QString& region) const;
     Q_INVOKABLE void setSourceEstimationRegionEnabled(const QString& region, bool enabled);
     Q_PROPERTY(QStringList enabledSourceEstimationRegions READ enabledSourceEstimationRegions
-                   WRITE setEnabledSourceEstimationRegions NOTIFY changed)
+                   WRITE setEnabledSourceEstimationRegions NOTIFY enabledSourceEstimationRegionsChanged)
     /// 与 `enabledSourceEstimationRegions` 同源，但拼成逗号串并带 `sourceEstimationRegions`
     /// 前缀：QML 里列表属性变化不一定触发所有绑定重算，字符串拼接是可靠的依赖来源。
     Q_PROPERTY(QString sourceEstimationRegionSignature READ sourceEstimationRegionSignature
-                   NOTIFY changed)
+                   NOTIFY enabledSourceEstimationRegionsChanged)
 
     Q_INVOKABLE double sourceEstimationTriggerFor(const QString& region) const;
     Q_INVOKABLE void setSourceEstimationTrigger(const QString& region, double v);
@@ -379,7 +379,58 @@ public:
     Q_INVOKABLE void resetToDefaults();
 
 signals:
+    /// 聚合信号：**任何**设置项变化都会发出。C++ 消费者（数据源启停、区县重算等）
+    /// 用它做「有变化就整体复核」，不需要知道具体是哪一项。
     void changed();
+
+    // ---- 逐项信号 ----
+    //
+    // QML 侧的绑定必须听具体的某一项：原先 49 个属性全挂 changed()，改任意一个设置
+    // 都会让 app.settings.* 的全部绑定（实测 160 处引用）重新求值 —— 设置页拖动滑块时
+    // 每一帧都在重算整棵地图子树的绑定。逐项通知后，只有真正相关的绑定会更新。
+    void alertVolumeChanged();
+    void announceCountdownChanged();
+    void announceEventChanged();
+    void announceUpdateChanged();
+    void autoCheckUpdatesChanged();
+    void backgroundBlurChanged();
+    void basemapIdChanged();
+    void closeToTrayChanged();
+    void customBasemapDatumChanged();
+    void customBasemapUrlChanged();
+    void customNtpServerChanged();
+    void developerModeChanged();
+    void disabledSourcesChanged();
+    void disabledStationSourcesChanged();
+    void enableAlarmToneChanged();
+    void enableNtpSyncChanged();
+    void enableSoundAlertChanged();
+    void enableWarningsChanged();
+    void enabledSourceEstimationRegionsChanged();
+    /// 四个区域的推算参数（触发烈度 / 最少站数 / 反证 / 合并半径）任一变化。
+    void sourceEstimationRegionParamsChanged();
+    void intensityStandardChanged();
+    void isMutedChanged();
+    void jianRefreshTokenChanged();
+    void localIntensityFilterChanged();
+    void notifyAlertChanged();
+    void notifyEewChanged();
+    void notifyInfoChanged();
+    void raiseAlertChanged();
+    void raiseEewChanged();
+    void raiseInfoChanged();
+    void reduceMotionChanged();
+    void showEstimatedEpicenterChanged();
+    void showProvinceBordersChanged();
+    void showStationLayerChanged();
+    void showWavefrontChanged();
+    void silentStartChanged();
+    void simulatedUrlChanged();
+    void sourceEstimationEnabledChanged();
+    void sourceEstimationHoldSecondsChanged();
+    void themeModeChanged();
+    void vectorOverlayChanged();
+    void whewsTokenChanged();
 
 private:
     template <typename T>
@@ -387,7 +438,23 @@ private:
         if (s_.value(key) == QVariant::fromValue(value)) return;
         s_.setValue(key, value);
         emit changed();
+        emitKeyChanged(key);
     }
+
+    /// 发出与 key 对应的逐项信号（以及依赖它的派生属性）。
+    /// key 是编译期字面量、调用极不频繁（用户改设置），线性比较 41 个字符串可以忽略。
+    void emitKeyChanged(const QString& key);
+    /// 发出全部逐项信号（恢复默认时用：所有值都可能变了）。
+    void emitAllChanged();
+
+    /// key -> 逐项信号的分发表。表驱动，两个入口共用（避免两处各写一份、漏掉新增项）。
+    struct KeySignal {
+        const char* key;
+        void (SettingsStore::*signal)();
+    };
+    static const QList<KeySignal>& keySignals();
+    /// `sourceEstimation.<region>.<field>` 形式的复合键。
+    static bool isRegionParamKey(const QString& key);
 
     QSettings s_;
 };

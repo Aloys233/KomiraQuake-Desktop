@@ -5,6 +5,13 @@ project(KomiraQuake VERSION 1.3.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 链接期优化能力探测（是否启用见下方 komiraquake 目标）。
+# 注意**不要**用全局的 CMAKE_INTERPROCEDURAL_OPTIMIZATION：它会把 sentry/crashpad
+# 这些第三方静态库一起拉进 LTO，构建时间翻倍且极易踩到它们的编译选项问题。
+# 只在 app 目标上开启，热点正是自己的几何/LOD 代码。
+include(CheckIPOSupported)
+check_ipo_supported(RESULT KOMIRA_IPO_SUPPORTED OUTPUT KOMIRA_IPO_ERROR LANGUAGES CXX)
+
 find_package(Qt6 6.5 REQUIRED COMPONENTS
     Core Gui Widgets Quick QuickControls2 Qml Network WebSockets Sql Multimedia Svg Concurrent
 )
@@ -115,6 +122,12 @@ if(DEFINED KOMIRA_BUILD_VERSION AND NOT KOMIRA_BUILD_VERSION STREQUAL "")
 endif()
 target_compile_definitions(komiraquake PRIVATE KOMIRA_VERSION="${KOMIRA_VERSION_VALUE}")
 
+if(KOMIRA_IPO_SUPPORTED)
+    set_property(TARGET komiraquake PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+else()
+    message(STATUS "IPO 不可用（${KOMIRA_IPO_ERROR}），跳过链接期优化")
+endif()
+
 target_link_libraries(komiraquake PRIVATE
     sentry
     Qt6::Core
@@ -173,10 +186,48 @@ foreach(qml_file ${KOMIRA_QML_FILES})
     set_source_files_properties(${qml_file} PROPERTIES QT_RESOURCE_ALIAS ${qml_name})
 endforeach()
 
+# qmlcachegen 必须能找到 Qt 自带的 QML 类型（QtQuick / QtQuick.Controls …），否则
+# 「编译绑定」大面积退化成运行时解释：实测缺导入路径时 1855 条绑定只有 72 条能编译
+# （3.9%），补上后绝大多数恢复。qt_add_qml_module 在跨模块引用时才自动加路径，
+# 这里显式声明依赖，保证主题、图层、设置页这些跨文件引用的类型可静态解析。
+# Qt 的 qml 目录布局因发行方式而异（Nix：<prefix>/lib/qt-6/qml；官方安装器：
+# <prefix>/qml；部分发行版：<prefix>/lib64/qt6/qml）。这里按候选逐个探测，
+# 认「里面确实有 QtQuick 目录」的那个，避免某个平台静默退回「没有导入路径」。
+# QT6_INSTALL_PREFIX 指向 qtbase，而 QtQuick 的 QML 类型在 qtdeclarative —— 两者
+# 在 Nix 里是不同的 store 路径，所以还要从 Qt6::Qml 的库位置反推一次前缀。
+get_target_property(_komira_qml_lib Qt6::Qml IMPORTED_LOCATION)
+if(NOT _komira_qml_lib)
+    get_target_property(_komira_qml_lib Qt6::Qml LOCATION)
+endif()
+if(_komira_qml_lib)
+    get_filename_component(_komira_qml_libdir "${_komira_qml_lib}" DIRECTORY)
+    get_filename_component(_komira_qml_prefix "${_komira_qml_libdir}" DIRECTORY)
+endif()
+
+set(KOMIRA_QML_IMPORT_PATH "")
+foreach(_komira_qml_candidate IN ITEMS
+        "${_komira_qml_prefix}/lib/qt-6/qml"
+        "${_komira_qml_prefix}/lib64/qt6/qml"
+        "${_komira_qml_prefix}/qml"
+        "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}"
+        "${QT6_INSTALL_PREFIX}/lib/qt-6/qml"
+        "${QT6_INSTALL_PREFIX}/lib64/qt6/qml"
+        "${QT6_INSTALL_PREFIX}/qml")
+    if(IS_DIRECTORY "${_komira_qml_candidate}/QtQuick")
+        set(KOMIRA_QML_IMPORT_PATH "${_komira_qml_candidate}")
+        break()
+    endif()
+endforeach()
+if(KOMIRA_QML_IMPORT_PATH STREQUAL "")
+    message(WARNING "找不到 Qt 的 QML 导入目录；编译绑定将退化为运行时解释（功能不受影响，"
+                    "但 QML 绑定会慢数倍）。")
+endif()
+
 qt_add_qml_module(komiraquake
     URI KomiraQuake
     VERSION 1.0
     QML_FILES ${KOMIRA_QML_FILES}
+    IMPORT_PATH ${KOMIRA_QML_IMPORT_PATH}
     # 矢量地图渲染项：用 QML_ELEMENT 注册（由 qt_add_qml_module 生成注册代码，
     # 无需也不应再手写 qmlRegisterType，否则与模块系统冲突）。
     SOURCES

@@ -9,7 +9,13 @@ ApplicationWindow {
     width: 1280; height: 800
     minimumWidth: 360; minimumHeight: 520
     title: "KomiraQuake - 地震预警"
-    Theme { id: appTheme }
+    // 主题令牌从这里注入：Theme 本身不引用 context property `app`（见 Theme.qml 注释）。
+    Theme {
+        id: appTheme
+        dark: app ? app.darkMode : false
+        reduceMotion: app && app.settings ? app.settings.reduceMotion : false
+        backgroundBlur: app && app.settings ? app.settings.backgroundBlur : true
+    }
     color: appTheme.surface
     // 关闭到托盘（默认）：只隐藏窗口；关闭该设置后按系统惯例直接退出。
     onClosing: function(close) {
