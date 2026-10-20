@@ -24,12 +24,6 @@ Column {
                 currentIndex: Math.max(0, ids.indexOf(app.settings.basemapId))
                 onActivated: index => app.settings.basemapId = ids[index]
             }
-            Text {
-                width: parent.width
-                text: "栅格底图可叠加矢量层；选择「矢量」时矢量本身就是底图。"
-                wrapMode: Text.Wrap; lineHeight: 1.4
-                color: root.theme.outline; font.pixelSize: 12
-            }
         }
         Column {
             width: parent.width; spacing: 10
@@ -58,7 +52,7 @@ Column {
             width: parent.width; theme: root.theme
             visible: app.settings.basemapId !== "vector"
             text: "叠加矢量层"
-            description: "在栅格底图之上叠加省界与区县，预警时按区县烈度着色。"
+            description: "叠加省界与区县边界。"
             checked: app.settings.vectorOverlay
             onToggled: app.settings.vectorOverlay = checked
         }
@@ -66,7 +60,6 @@ Column {
             objectName: "provinceBorderSwitch"
             width: parent.width; theme: root.theme
             text: "省界描边"
-            description: "矢量层中的省级分界线；关闭后只保留区县填色。低缩放级别本就不画省界。"
             checked: app.settings.showProvinceBorders
             enabled: app.settings.basemapId === "vector" || app.settings.vectorOverlay
             onToggled: app.settings.showProvinceBorders = checked
@@ -75,7 +68,7 @@ Column {
             objectName: "stationLayerSwitch"
             width: parent.width; theme: root.theme
             text: "测站强度图层"
-            description: "在地图上绘制各测站源的实时强度点，并显示右上角测站最大值卡片。数据连接不受影响。"
+            description: "在地图上显示实时测站强度。"
             checked: app.settings.showStationLayer
             onToggled: app.settings.showStationLayer = checked
         }
@@ -83,7 +76,7 @@ Column {
             objectName: "wavefrontSwitch"
             width: parent.width; theme: root.theme
             text: "P/S 波前圆"
-            description: "按走时表绘制 P 波与 S 波的扩散范围；关闭后只保留倒计时与预警卡。"
+            description: "显示地震波扩散范围。"
             checked: app.settings.showWavefront
             onToggled: app.settings.showWavefront = checked
         }

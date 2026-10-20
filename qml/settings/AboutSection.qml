@@ -14,21 +14,20 @@ Column {
         GlassSwitch {
             objectName: "autoStartSwitch"
             width: parent.width; theme: root.theme; text: "开机自启"
-            description: "登录系统后自动启动 KomiraQuake，保持预警连接。"
             checked: app.autoStart.enabled
             onToggled: app.autoStart.enabled = checked
         }
         GlassSwitch {
             objectName: "silentStartSwitch"
             width: parent.width; theme: root.theme; text: "静默启动"
-            description: "启动时不显示主窗口，只保留托盘图标；可从托盘菜单随时打开。"
+            description: "启动时只显示托盘图标。"
             checked: app.settings.silentStart
             onToggled: app.settings.silentStart = checked
         }
         GlassSwitch {
             objectName: "closeToTraySwitch"
             width: parent.width; theme: root.theme; text: "关闭窗口时收进托盘"
-            description: "关闭主窗口后继续在后台保持连接；从托盘菜单可重新打开或退出。关闭本项后，关闭窗口即退出应用。"
+            description: "关闭后继续在后台运行。"
             checked: app.settings.closeToTray
             onToggled: app.settings.closeToTray = checked
         }
@@ -39,17 +38,9 @@ Column {
         GlassSwitch {
             objectName: "devModeSwitch"
             width: parent.width; theme: root.theme; text: "开发者模式"
-            description: "显出「数据源」页的模拟数据源卡片，用于在没有真实地震时演练告警链路。"
+            description: "显示模拟数据源。"
             checked: app.settings.developerMode
             onToggled: app.settings.developerMode = checked
-        }
-        Text {
-            width: parent.width
-            text: "模拟源需要另填一个 WebSocket 地址（默认 ws://127.0.0.1:8080/ws），"
-                + "并从「数据源」页启用它。此外地震预警总开关默认为关，"
-                + "要测试声音与全屏预警需单独打开。"
-            wrapMode: Text.Wrap; lineHeight: 1.4
-            color: root.theme.outline; font.pixelSize: 11
         }
     }
 
@@ -86,7 +77,6 @@ Column {
         GlassSwitch {
             objectName: "autoCheckUpdatesSwitch"
             width: parent.width; theme: root.theme; text: "自动检查更新"
-            description: "启动时在后台静默检查一次新版本，发现更新后在此提示。"
             checked: app.settings.autoCheckUpdates
             onToggled: app.settings.autoCheckUpdates = checked
         }

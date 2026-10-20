@@ -62,12 +62,6 @@ Column {
                 }
             }
         }
-        Text {
-            width: parent.width
-            text: "「跟随系统」随桌面环境的明暗设置自动切换。选择后立即应用到整个界面。"
-            wrapMode: Text.Wrap; lineHeight: 1.4
-            color: root.theme.outline; font.pixelSize: 12
-        }
     }
 
     SettingsSection {
@@ -75,18 +69,18 @@ Column {
         GlassSwitch {
             objectName: "backgroundBlurSwitch"
             width: parent.width; theme: root.theme; text: "背景模糊"
-            description: root.GraphicsInfo.api === GraphicsInfo.Software
-                ? "当前为软件渲染，不支持背景模糊；即使开启也会使用实色表面。"
-                : root.GraphicsInfo.api === GraphicsInfo.Unknown
-                ? "渲染后端尚未就绪，暂用实色表面；就绪后按此开关启用地图浮层模糊。"
-                : "模糊地图浮层后方，保持文字清晰；列表和设置页使用实色表面。"
+            // 渲染后端不支持模糊时只给一句说明；开关仍可写回设置，换到支持的
+            // 后端（或下次启动拿到 GPU）后即刻生效。
+            readonly property bool supported: root.GraphicsInfo.api !== GraphicsInfo.Software
+                                              && root.GraphicsInfo.api !== GraphicsInfo.Unknown
+            description: supported ? "" : "当前渲染环境不支持。"
             checked: app.settings.backgroundBlur
             onToggled: app.settings.backgroundBlur = checked
         }
         GlassSwitch {
             objectName: "reduceMotionSwitch"
             width: parent.width; theme: root.theme; text: "减少动态效果"
-            description: "停用装饰过渡。真实波前、预计倒计时和数据更新不受影响。"
+            description: "减弱过渡动画。"
             checked: app.settings.reduceMotion
             onToggled: app.settings.reduceMotion = checked
         }

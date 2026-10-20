@@ -35,13 +35,10 @@ Column {
             }
             Text {
                 width: parent.width
-                text: app.locationStatusText + " · " + app.userLatitude.toFixed(4) + "°, " + app.userLongitude.toFixed(4) + "°"
+                // 未定位时上面一行已经是「未设置定位」，再重复一次坐标 0,0 只是噪声。
+                visible: app.hasLocation
+                text: app.userLatitude.toFixed(4) + "°, " + app.userLongitude.toFixed(4) + "°"
                 color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap
-            }
-            Text {
-                width: parent.width
-                text: "本地烈度、距离与预计到时以此位置估算。未定位时仍可接收地震事件。"
-                color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4
             }
         }
         Flow {

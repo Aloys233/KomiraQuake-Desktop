@@ -23,7 +23,7 @@ Column {
 
     Text {
         width: parent.width
-        text: "各数据源平级、互为备份；关闭某个源后应用会改用其余源。"
+        text: "多个数据源互为备份；关闭某个源后应用会改用其余源。"
         wrapMode: Text.Wrap; lineHeight: 1.4
         color: root.theme.outline; font.pixelSize: 12
     }
@@ -73,54 +73,31 @@ Column {
                         elide: Text.ElideRight
                     }
                     Text {
+                        // 只在有实测延迟时显示；未连接不占位（「— ms」对用户是噪声）。
+                        visible: card.modelData.latency !== "— ms"
                         text: card.modelData.latency
                         color: root.theme.outline; font.pixelSize: 12
                         font.family: root.theme.numberFamily
                     }
                 }
 
-                // 目录刷新。点按展开/收起完整说明。
-                Column {
-                    id: dirBlock
-                    width: parent.width; spacing: 6
-                    /// 说明默认单行省略，点按展开完整说明。
-                    property bool expanded: false
-                    Item {
-                        width: parent.width; height: dirRow.implicitHeight
-                        RowLayout {
-                            id: dirRow
-                            width: parent.width; spacing: 8
-                            Rectangle {
-                                Layout.preferredWidth: 8; Layout.preferredHeight: 8; radius: 4
-                                color: root.theme.severity(card.modelData.directoryStatusTag)
-                                Layout.alignment: Qt.AlignVCenter
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: card.modelData.directory
-                                  + (card.modelData.directoryLatency === "— ms" ? "" : " · " + card.modelData.directoryLatency)
-                                color: root.theme.outline; font.pixelSize: 12
-                                elide: Text.ElideRight
-                                maximumLineCount: 1
-                            }
-                            AppIcon {
-                                name: dirBlock.expanded ? "chevron-down" : "chevron-right"
-                                size: 14; color: root.theme.outline
-                                Layout.alignment: Qt.AlignVCenter
-                            }
-                        }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: dirBlock.expanded = !dirBlock.expanded
-                        }
+                // 目录刷新只在出问题时才占一行：成功/未刷新与上一行的连接态重复，
+                // 失败原因（如令牌失效）才是用户需要看到的信息。
+                RowLayout {
+                    width: parent.width; spacing: 8
+                    visible: card.modelData.directoryStatusTag === "WARNING"
+                             || card.modelData.directoryStatusTag === "WATCH"
+                    Rectangle {
+                        Layout.preferredWidth: 8; Layout.preferredHeight: 8; radius: 4
+                        color: root.theme.severity(card.modelData.directoryStatusTag)
+                        Layout.alignment: Qt.AlignVCenter
                     }
                     Text {
-                        width: parent.width
-                        visible: dirBlock.expanded
-                        text: card.modelData.description
-                        wrapMode: Text.Wrap; lineHeight: 1.4
-                        color: root.theme.outline; font.pixelSize: 11
+                        Layout.fillWidth: true
+                        text: card.modelData.directory
+                        color: root.theme.outline; font.pixelSize: 12
+                        elide: Text.ElideRight
+                        maximumLineCount: 1
                     }
                 }
 
@@ -144,11 +121,6 @@ Column {
                         enabled: jianKeyField.text.trim().length > 0
                         onClicked: { app.loginJian(jianKeyField.text.trim()); jianKeyField.text = ""; }
                     }
-                    Text {
-                        width: parent.width
-                        text: "登录成功后刷新令牌会保存在本机，访问令牌由应用自动续取。设备有连接数上限，请避免频繁重连。"
-                        color: root.theme.outline; font.pixelSize: 11; wrapMode: Text.Wrap; lineHeight: 1.4
-                    }
                 }
 
                 // 模拟源（仅开发自测）：填自建服务端的地址。留空即视为未配置，不会连接。
@@ -171,12 +143,6 @@ Column {
                         enabled: simulatedUrlField.text.trim() !== app.settings.simulatedUrl
                         onClicked: app.setSimulatedUrl(simulatedUrlField.text.trim())
                     }
-                    Text {
-                        width: parent.width
-                        text: "报文机构固定为 SIM，不会与真实地震合并。同一地址重放会被终态墓碑压制，"
-                            + "请在服务端控制台用「新一轮」换 id。"
-                        color: root.theme.outline; font.pixelSize: 11; wrapMode: Text.Wrap; lineHeight: 1.4
-                    }
                 }
 
                 // Whews 需令牌：直接在 auth.beecld.com 申请 wat_…，粘贴即生效（无需换票）。
@@ -198,11 +164,6 @@ Column {
                         enabled: whewsTokenField.text.trim().length > 0
                         onClicked: { app.setWhewsToken(whewsTokenField.text.trim()); whewsTokenField.text = ""; }
                     }
-                    Text {
-                        width: parent.width
-                        text: "令牌保存后本机直连，不经第三方。单令牌最多 20 条并发连接，本应用只用 1 条聚合连接。"
-                        color: root.theme.outline; font.pixelSize: 11; wrapMode: Text.Wrap; lineHeight: 1.4
-                    }
                 }
             }
         }
@@ -211,17 +172,10 @@ Column {
     // 测站显示源：只画地图、不产事件，故与上面的事件源分开管理。
     SettingsSection {
         width: parent.width; theme: root.theme; title: "测站显示源"; iconName: "activity"
-        Text {
-            width: parent.width
-            text: "仅用于地图测站强度与右上角卡片，不参与预警、去重或历史记录。关闭后立即断开该源。"
-            wrapMode: Text.Wrap; lineHeight: 1.4
-            color: root.theme.outline; font.pixelSize: 12
-        }
         GlassSwitch {
             objectName: "kmoniStationSwitch"
             width: parent.width; theme: root.theme
             text: "NIED 强震监测"
-            description: "經 Jian 转发的 Kmoni 实时测站震度（JMA 計測震度）。"
             checked: app.settings.isStationSourceEnabled("kmoni")
             onToggled: app.settings.setStationSourceEnabled("kmoni", checked)
         }
@@ -229,7 +183,6 @@ Column {
             objectName: "snetStationSwitch"
             width: parent.width; theme: root.theme
             text: "S-Net 海底观测网"
-            description: "經 Jian 转发的日本近海海底地震仪实时震度（JMA 計測震度）。"
             checked: app.settings.isStationSourceEnabled("snet")
             onToggled: app.settings.setStationSourceEnabled("snet", checked)
         }
@@ -237,7 +190,6 @@ Column {
             objectName: "kmaStationSwitch"
             width: parent.width; theme: root.theme
             text: "KMA PEWS 测站"
-            description: "經 Jian 转发的韩国气象厅实时测站烈度（韩国 MMI）。"
             checked: app.settings.isStationSourceEnabled("kma_station")
             onToggled: app.settings.setStationSourceEnabled("kma_station", checked)
         }
@@ -245,7 +197,6 @@ Column {
             objectName: "pancakesSeisSwitch"
             width: parent.width; theme: root.theme
             text: "PancakesSeis 加速度台站"
-            description: "设备端按 GB/T 17742-2020 计算的仪器烈度（CSIS）。"
             checked: app.settings.isStationSourceEnabled("pancakes_seis")
             onToggled: app.settings.setStationSourceEnabled("pancakes_seis", checked)
         }
@@ -253,7 +204,6 @@ Column {
             objectName: "wolfxSeisSwitch"
             width: parent.width; theme: root.theme
             text: "Wolfx SeisJS 台站"
-            description: "报文自带中国地震烈度（CSIS）。"
             checked: app.settings.isStationSourceEnabled("wolfx_seis")
             onToggled: app.settings.setStationSourceEnabled("wolfx_seis", checked)
         }
@@ -264,7 +214,7 @@ Column {
         width: parent.width; theme: root.theme; title: "信息事件震级过滤"; iconName: "sliders-horizontal"
         Text {
             width: parent.width
-            text: "低于所选震级的目录情报不会显示、也不会入库。实时预警不受此过滤影响。"
+            text: "低于所选震级的地震信息不显示。"
             wrapMode: Text.Wrap; lineHeight: 1.4
             color: root.theme.outline; font.pixelSize: 12
         }

@@ -12,15 +12,15 @@ Item {
     readonly property bool compact: width < 760
     // 任务式分区：先决定「什么值得提醒」，再拆声音、地图、外观、定位、数据源与系统行为。
     readonly property var sections: [
-        { key: "warning", title: "预警提醒", icon: "bell", description: "提醒条件与分级提醒方式。" },
-        { key: "audio", title: "声音", icon: "volume-2", description: "警报音量与播报内容分轨。" },
-        { key: "map", title: "地图与图层", icon: "map", description: "底图，以及地图上的矢量、测站与波前叠加层。" },
-        { key: "appearance", title: "外观", icon: "sun", description: "主题、背景模糊与动态效果。" },
-        { key: "location", title: "定位", icon: "map-pin", description: "设置用于估算本地烈度、距离与预计到时的位置。" },
-        { key: "sourceEstimation", title: "震源推算", icon: "locate-fixed", description: "只用实时测站强度反推震中、震级与深度（Beta）。" },
-        { key: "source", title: "数据源", icon: "radio", description: "逐源启停、测站显示与信息事件震级过滤。" },
-        { key: "clock", title: "时间校准", icon: "clock", description: "网络授时：开关、自定义 NTP 服务器与校准状态。" },
-        { key: "about", title: "启动与更新", icon: "refresh-cw", description: "开机自启、静默启动、关闭行为与版本更新。" }
+        { key: "warning", title: "预警提醒", icon: "bell", description: "提醒条件与提醒方式。" },
+        { key: "audio", title: "声音", icon: "volume-2", description: "警报音量与播报内容。" },
+        { key: "map", title: "地图与图层", icon: "map", description: "底图与叠加图层。" },
+        { key: "appearance", title: "外观", icon: "sun", description: "主题与显示效果。" },
+        { key: "location", title: "定位", icon: "map-pin", description: "估算本地烈度与预计到时的位置。" },
+        { key: "sourceEstimation", title: "震源推算", icon: "locate-fixed", description: "用测站强度反推震源（Beta）。" },
+        { key: "source", title: "数据源", icon: "radio", description: "数据源启停与过滤。" },
+        { key: "clock", title: "时间校准", icon: "clock", description: "网络校时与自定义服务器。" },
+        { key: "about", title: "启动与更新", icon: "refresh-cw", description: "开机自启、静默启动与版本更新。" }
     ]
     signal back()
     signal pickLocationRequested()
@@ -40,7 +40,6 @@ Item {
         Rectangle { Layout.preferredWidth: 1; Layout.preferredHeight: 22; color: root.theme.glassBorder }
         Text { text: "设置"; color: root.theme.textPrimary; font.pixelSize: 20; font.weight: Font.Medium }
         Item { Layout.fillWidth: true }
-        Text { visible: !root.compact; text: "修改即时生效"; color: root.theme.outline; font.pixelSize: 12 }
         GlassButton {
             objectName: "resetSettingsButton"
             theme: root.theme; flat: true; iconName: "refresh-cw"

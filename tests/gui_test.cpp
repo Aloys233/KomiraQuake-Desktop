@@ -3028,6 +3028,18 @@ private slots:
             QVERIFY(blur);
             const qreal padding = blur->property("padding").toReal();
             QVERIFY(padding >= blur->property("blurRadius").toReal());
+            // 模糊核恒为全模糊：相机移动（live=true）与静止（live=false）不得降档。
+            // 回归自 e0d8262 的「移动时 blurMax 32 / 静止 64」——用户实测看到拖动时
+            // 模糊像被关掉一会儿（blurRadius 同时决定 padding，一变就要重建采样纹理）。
+            QCOMPARE(blur->property("blurRadius").toInt(), 64);
+            card->setProperty("backdropLive", false);
+            QTRY_VERIFY(!blur->property("live").toBool());
+            QCOMPARE(blur->property("blurRadius").toInt(), 64);
+            QCOMPARE(blur->property("padding").toReal(), padding);
+            card->setProperty("backdropLive", true);
+            QTRY_VERIFY(blur->property("live").toBool());
+            QCOMPARE(blur->property("blurRadius").toInt(), 64);
+            QCOMPARE(blur->property("padding").toReal(), padding);
             auto rect = [&] { return sample->property("sourceRect").toRectF(); };
             QCOMPARE(rect().topLeft(), QPointF(100 - padding, 90 - padding));
             card->setX(120);

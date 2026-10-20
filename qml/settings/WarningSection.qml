@@ -17,7 +17,7 @@ Column {
         GlassSwitch {
             objectName: "warningsSwitch"
             width: parent.width; theme: root.theme; text: "地震预警"
-            description: "总开关。开启后仅按本地烈度过滤决定是否提醒；关闭时地震事件只展示，不产生声音、震动或全屏预警。"
+            description: app.settings.enableWarnings ? "" : "已关闭，地震只在界面上展示。"
             checked: app.settings.enableWarnings
             onToggled: app.settings.enableWarnings = checked
         }
@@ -44,7 +44,7 @@ Column {
             valueText: app.settings.localIntensityFilter <= 0
                 ? "关闭"
                 : app.settings.localIntensityFilter.toFixed(1) + " 度"
-            description: "仅当本地预估烈度达到该值及以上时提醒（按上方所选烈度标准的显示档位比较）；设为 0 表示不作筛选。"
+            description: "低于该烈度不提醒；0 表示不筛选。"
             from: 0; to: 8; stepSize: 0.5
             value: app.settings.localIntensityFilter
             active: app.settings.enableWarnings
@@ -54,12 +54,6 @@ Column {
 
     SettingsSection {
         width: parent.width; theme: root.theme; title: "提醒方式"; iconName: "bell"
-        Text {
-            width: parent.width
-            text: "按事件级别分别选择视觉提醒。声音与音量在「声音」分区；「置顶主窗口」会抢走当前焦点。"
-            wrapMode: Text.Wrap; lineHeight: 1.4
-            color: root.theme.outline; font.pixelSize: 12
-        }
 
         // 警报级：通过本地烈度过滤，会触发倒计时与声音。
         Column {
@@ -69,7 +63,7 @@ Column {
             Text { text: "警报级预警"; color: root.theme.textPrimary; font.pixelSize: 14; font.weight: Font.Medium }
             Text {
                 width: parent.width
-                text: "本地预估烈度达到过滤阈值；会触发倒计时、声音与全屏预警。"
+                text: "达到烈度过滤阈值。"
                 wrapMode: Text.Wrap; lineHeight: 1.35
                 color: root.theme.outline; font.pixelSize: 12
             }
@@ -97,7 +91,7 @@ Column {
             Text { text: "任意预警"; color: root.theme.textPrimary; font.pixelSize: 14; font.weight: Font.Medium }
             Text {
                 width: parent.width
-                text: "包括未达本地阈值的预警与后续更新报；默认不对其做视觉提醒。"
+                text: "未达阈值的预警与更新报。"
                 wrapMode: Text.Wrap; lineHeight: 1.35
                 color: root.theme.outline; font.pixelSize: 12
             }
@@ -124,7 +118,7 @@ Column {
             Text { text: "地震信息"; color: root.theme.textPrimary; font.pixelSize: 14; font.weight: Font.Medium }
             Text {
                 width: parent.width
-                text: "目录中的地震情报（含正式报）；不受「地震预警」总开关影响，也不会播放预警音效。"
+                text: "目录中的地震信息。"
                 wrapMode: Text.Wrap; lineHeight: 1.35
                 color: root.theme.outline; font.pixelSize: 12
             }

@@ -13,21 +13,23 @@ Column {
         GlassSwitch {
             objectName: "ntpSwitch"
             width: parent.width; theme: root.theme; text: "网络校时 (SNTP)"
-            description: "以网络时间为倒计时与走时反解的基准；SNTP 失败时回退 HTTP 授时。"
             checked: app.settings.enableNtpSync
             onToggled: app.settings.enableNtpSync = checked
         }
         Column {
             width: parent.width; spacing: 6
-            // 状态行：当前校时结果。关闭时说明后果，而不是只显示「已关闭」。
+            // 状态行：当前校时结果。`state` 是本地化文案（已校准 / 校准过期 / 本地时钟），
+            // 配色必须看布尔 `synced`，否则对比一个永远不成立的字符串，色条恒为灰。
             Rectangle {
                 width: parent.width; height: 3; radius: 2
-                color: app.clockInfo.state === "synced" ? root.theme.clockSynced : root.theme.outlineVariant
+                color: app.clockInfo.synced ? root.theme.clockSynced : root.theme.outlineVariant
                 visible: app.settings.enableNtpSync
             }
             Text {
                 width: parent.width
-                text: "校时状态 · " + app.clockInfo.state + "\n" + app.clockInfo.detail
+                // 已校准时只报状态；未校准才补充原因（等待授时 / 使用本地时钟）。
+                text: "校时状态 · " + app.clockInfo.state
+                      + (app.clockInfo.synced ? "" : "\n" + app.clockInfo.detail)
                 color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.5
             }
         }
@@ -43,18 +45,13 @@ Column {
                 id: ntpServerField; objectName: "customNtpField"
                 width: parent.width; theme: root.theme
                 text: app.settings.customNtpServer
-                placeholderText: "如 ntp.aliyun.com（留空用默认）"
+                placeholderText: "留空使用默认服务器"
                 Accessible.name: "自定义 NTP 服务器"
             }
             GlassButton {
                 theme: root.theme; text: "应用并重新校时"; iconName: "check"
                 enabled: ntpServerField.text.trim() !== app.settings.customNtpServer
                 onClicked: { app.settings.customNtpServer = ntpServerField.text.trim(); app.refreshClock(); }
-            }
-            Text {
-                width: parent.width
-                text: "留空时按内置顺序尝试：ntp.aliyun.com / ntp1.aliyun.com / ntp.tencent.com / pool.ntp.org / time.apple.com。自定义主机将优先尝试。"
-                color: root.theme.outline; font.pixelSize: 12; wrapMode: Text.Wrap; lineHeight: 1.4
             }
         }
     }
