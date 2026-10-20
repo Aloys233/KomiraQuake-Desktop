@@ -14,7 +14,7 @@
 #include <string>
 
 #ifndef KOMIRA_VERSION
-#define KOMIRA_VERSION "1.3.1"
+#define KOMIRA_VERSION "1.3.2"
 #endif
 
 namespace komira {
