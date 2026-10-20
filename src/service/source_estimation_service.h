@@ -42,7 +42,13 @@ public:
     /// 时间基准（与倒计时/告警同一只校时时钟）。
     void setNowProvider(std::function<long long()> provider);
     /// 注入一帧测站观测（容器的 entries 顺序与来源无关，内部按制式归类）。
-    void ingestObservations(const std::vector<StationSnapshot::Entry>& entries);
+    ///
+    /// 参数是**共享只读帧**：AppController 刚为 StationSnapshot 构造的那一份。
+    /// 本服务只持有 shared_ptr，不再复制整表（2500 条 × 10 Hz 的拷贝是可测的抖动源）。
+    void ingestObservations(const StationSnapshot::EntryList& entries);
+    /// 便捷重载：调用方手上只有一张普通 vector 时用它（内部包一层 shared_ptr，
+    /// 只有一次移动，不会多复制条目）。
+    void ingestObservations(std::vector<StationSnapshot::Entry> entries);
     /// 设置变更：重置触发簿记，让新阈值立即生效。
     void reloadSettings();
     /// 清空全部状态（测站源全部关闭 / 应用退出）。
@@ -156,7 +162,8 @@ private:
     QFutureWatcher<EstimateBatch> watcher_;
     bool pending_ = false;
 
-    std::vector<StationSnapshot::Entry> latestEntries_;
+    /// 最近一帧观测（与 StationSnapshot 共享同一份只读数据）。
+    StationSnapshot::EntryList latestEntries_;
     long long latestEntriesMs_ = 0;
     long long lastRunMs_ = 0;
 

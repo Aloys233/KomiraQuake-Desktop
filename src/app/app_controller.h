@@ -63,8 +63,6 @@ class AppController : public QObject {
     /// 校时状态：`{ enabled, state, detail }`。设置页展示；地震时间语义走 NtpClock::now()。
     Q_PROPERTY(QVariantMap clockInfo READ clockInfo NOTIFY clockChanged)
     Q_PROPERTY(QVariantList history READ history NOTIFY historyChanged)
-    /// 右侧列表数据：目录条目用权威数据，并与实时预警按「发震时刻 + 震中」合并为一条。
-    Q_PROPERTY(QVariantList eventList READ eventList NOTIFY eventListChanged)
     /// 稳定的侧栏模型；避免 QML 每次目录事件都替换 JS 数组并重建 delegate 上下文。
     Q_PROPERTY(QAbstractItemModel* eventModel READ eventModel CONSTANT)
     Q_PROPERTY(bool hasWarning READ hasWarning NOTIFY warningChanged)
@@ -88,13 +86,24 @@ class AppController : public QObject {
     Q_PROPERTY(int hudIndex READ hudIndex NOTIFY hudEventChanged)
     Q_PROPERTY(int hudCount READ hudCount NOTIFY hudEventChanged)
     /// P/S 波前圆半径（km），-1 表示不画。
-    Q_PROPERTY(QVariantMap waveRadii READ waveRadii NOTIFY waveRadiiChanged)
+    ///
+    /// 5 个标量各自成 Q_PROPERTY 而不是一张 QVariantMap：旧实现每个 16 ms tick 都新建一张
+    /// map，QML 里 7 处绑定各自读它 → 每帧 7 次 map 构造 + 全量重绑（值没变也重绑）。
+    /// 标量属性只在**值真的变化**时才发通知。
+    Q_PROPERTY(double wavePKm READ wavePKm NOTIFY waveRadiiChanged)
+    Q_PROPERTY(double waveSKm READ waveSKm NOTIFY waveRadiiChanged)
+    Q_PROPERTY(double wavePOpacity READ wavePOpacity NOTIFY waveRadiiChanged)
+    Q_PROPERTY(double waveSOpacity READ waveSOpacity NOTIFY waveRadiiChanged)
+    Q_PROPERTY(double waveSFillOpacity READ waveSFillOpacity NOTIFY waveRadiiChanged)
     /// 区县名 -> CSIS 烈度原始值，供矢量地图按烈度给区县面填色。
     Q_PROPERTY(QVariantMap districtIntensity READ districtIntensity NOTIFY districtIntensityChanged)
     /// 实时测站震度的**快照对象**（**仅显示，不参与预警**）：合并各测站源，地图项直接读
     /// C++ vector。指针恒定，内容更新走 StationSnapshot::changed()，不经 QVariantList/JS 转换。
     Q_PROPERTY(QObject* stationSnapshot READ stationSnapshot CONSTANT)
     /// 逐测站源的实时最大值卡片数据：`[{ id, name, caption, hasData, raw, text, stationCount, frameTime }]`。
+    /// 逐测站源的实时最大值卡片数据。**缓存**在 `stationSourcesCache_`：只有内容真变了
+    /// 才重建并通知（旧实现每次读属性都为 5 路源重算文本、时间格式与颜色，
+    /// 而 QML 里每个 delegate 各读一次 = 每 100 ms 十几张 map）。
     Q_PROPERTY(QVariantList stationSources READ stationSources NOTIFY stationIntensityChanged)
     /// 本地震源推算（Beta）：只吃实时测站强度场，不产事件、不参与告警。
     /// `{ state, enabled, visible, latitude, longitude, depthKm, magnitude, family,
@@ -117,12 +126,18 @@ public:
     double userLatitude() const;
     double userLongitude() const;
     QString locationStatusText() const;
-    QVariantList sources() const;
+    /// 逐源状态列表的快照（**缓存**，见 rebuildSources()）。
+    QVariantList sources() const { return sourcesCache_; }
     QVariantMap clockInfo() const;
     /// 校时后的当前时刻，固定渲染为 UTC+8 的 `yyyy-MM-dd HH:mm:ss`（与设备时区无关）。
     /// 《NATIVE_PORT_SPEC》 §12。
     Q_INVOKABLE QString clockTextUtc8() const;
+    /// 历史事件数组（`toMap` 全字段）。**懒构造 + 缓存**：QML 已不再读它，
+    /// 旧实现却每次目录刷新都重建 200 张 QVariantMap 并 emit。
     QVariantList history() const;
+    /// 兼容入口：完整事件数组（含全部字段）。QML 已改用 `eventModel` 的逐列 role，
+    /// 这里仅供 C++ 测试/调试调用，且**不再**随每次刷新发 `eventListChanged`
+    /// —— 那曾让每次目录更新都重建一份约 200×40 项的 QVariant 树，而 QML 根本没人读。
     QVariantList eventList() const;
     QAbstractItemModel* eventModel() const { return eventModel_; }
     bool hasWarning() const { return hasActiveWarning_; }
@@ -146,7 +161,11 @@ public:
     QVariant hudEvent() const;
     int hudIndex() const;
     int hudCount() const;
-    QVariantMap waveRadii() const;
+    double wavePKm() const { return wavePKm_; }
+    double waveSKm() const { return waveSKm_; }
+    double wavePOpacity() const { return wavePOpacity_; }
+    double waveSOpacity() const { return waveSOpacity_; }
+    double waveSFillOpacity() const { return waveSFillOpacity_; }
     QVariantMap districtIntensity() const { return districtIntensity_; }
     QObject* stationSnapshot() const { return stationSnapshot_; }
     QVariantList stationSources() const;
@@ -191,7 +210,6 @@ signals:
     void clockChanged();
     void locationChanged();
     void historyChanged();
-    void eventListChanged();
     void warningChanged();
     void warningOverlayChanged();
     void countdownChanged();
@@ -210,6 +228,10 @@ signals:
 
 private:
     void wire();
+    /// 逐项接线（设置变化 → 只跑真正相关的那一段）。
+    void wireSettings();
+    /// 数据源/凭据/开发者模式变化：重推凭据并按门控重启或停止各源。
+    void applySourceSettings();
     /// inDirectory：事件来自 HTTP 目录（进入列表/历史）；否则为 WS 实时预警（只告警不入列表）。
     /// source：发出该帧的源，用于把仓库层的处置结果回传给需要它的数据源（见 EarthquakeSource::onAdmission）。
     void handleEvent(const EarthquakeEvent& event, bool replay, bool inDirectory,
@@ -219,8 +241,13 @@ private:
     bool upsertHistory(const EarthquakeEvent& event);
     /// 把事件排进下一批写库；同 id 去重。
     void queueHistoryWrite(const EarthquakeEvent& event);
-    /// 一次事务写完全部待写事件，并 prune 一次。
+    /// 一次事务写完全部待写事件，并 prune 一次；随后合并落盘墓碑。
     void flushHistoryWrites();
+    /// 排入墓碑写回（同 identity 覆盖）。预警结束/取消是低频事件，但每次都要 3 条 SQL，
+    /// 合并进同一条 80 ms 写回可避免 GUI 线程在倒计时期间做同步事务。
+    void queueTombstoneWrite(const QString& identity, long long endedAt);
+    /// 把待写墓碑落盘（合并调用）。
+    void flushTombstoneWrites();
     void onTick();
     void recomputeEvents();
     void syncWarning();
@@ -236,6 +263,17 @@ private:
     bool hudWindowOpen(const EarthquakeEvent& event, long long now) const;
     /// 安排一次 HUD 可见性重算（跨过 10 分钟窗口时隐藏自动焦点的 HUD）。
     void scheduleHudRefresh();
+    /// 重建 `stationSourcesCache_`；内容未变则返回 false（调用方据此决定是否发信号）。
+    bool rebuildStationCards();
+    /// 重建 `sourcesCache_`；内容未变则返回 false。
+    bool rebuildSources();
+    /// 数据源状态变化：合并到一次 250 ms 的单次定时器里再通知 UI。
+    ///
+    /// Wolfx 的每一条 WS 报文都会 `emit infoChanged()`（其中多数只更新 lastHeartbeat/
+    /// latency）。旧实现把 infoChanged 直接接到 `statusChanged`，于是每帧报文都让 QML
+    /// 侧的 `app.sources`（一个 QVariantList 属性）整体重建 + 全部绑定重算 —— 推流
+    /// 频繁时这条路径比数据解析本身还贵。
+    void scheduleStatusRefresh();
     /// 将高频测站帧合并为固定频率的快照刷新，避免每条站点帧都重建整张表。
     void scheduleStationIntensityRefresh();
     /// 按各测站源的最新读数重建 StationSnapshot（纯 POD 拷贝，不发 QML 信号）。
@@ -265,6 +303,13 @@ private:
     static QVariantMap computeDistrictIntensity(const VectorMapData& data, double magnitude,
                                                 double depthKm, double lat, double lon);
     void refreshEventModel();
+    /// 侧栏当前应显示的事件（目录 + 实时预警合并、按发震时刻倒序）及 isActive 标记。
+    /// 供 `eventList()`（兼容调试/测试）与 `refreshEventModel()`（行模型）共用一次合并。
+    std::vector<std::pair<EarthquakeEvent, bool>> mergedEvents() const;
+    /// 把一条事件装进侧栏行（只填 delegate 真正会读的字段）。
+    EventListModel::Row makeRow(const EarthquakeEvent& event, bool active) const;
+    /// 焦点变化后只刷新受影响的两行（旧的与新的），不重建整表。
+    void syncEventModelFocus();
     void scheduleDirectoryUiRefresh();
     /// 开启自动检查时，本次会话安排一次静默检查更新（只做一次）。
     void maybeAutoCheckUpdates();
@@ -288,6 +333,8 @@ private:
     QList<EarthquakeSource*> sources_;
     EventListModel* eventListModel_ = nullptr;
     EventFilterModel* eventModel_ = nullptr;
+    /// 上次写入行模型的焦点 id：焦点变化时只需刷这两行（旧的、新的）。
+    QString focusedEventId_;
     /// Jian 源需要登录凭据交换，保留具体类型访问登录/令牌注入入口。
     JianSource* jian_ = nullptr;
     /// Whews 源需注入 `wat_…` 令牌，保留具体类型访问令牌注入入口。
@@ -330,13 +377,24 @@ private:
     QTimer stationIntensityRefreshTimer_;
     StationSnapshot* stationSnapshot_ = nullptr;
     /// 悬停浮层元数据（与 stationSnapshot_ 的 entries 下标对齐），按台站表变化重建。
-    std::vector<StationSnapshot::StationMeta> stationMetas_;
+    StationSnapshot::MetaList stationMetas_;
+    /// `stationSources` 属性背后的缓存（见 Q_PROPERTY 注释）。
+    QVariantList stationSourcesCache_;
+    /// `sources` 属性背后的缓存（同上）。
+    QVariantList sourcesCache_;
+    /// `history` 属性背后的缓存：`historyDirty_` 为真时才重建。
+    mutable QVariantList historyCache_;
+    mutable bool historyDirty_ = true;
+    /// 数据源状态合并定时器（见 scheduleStatusRefresh）。
+    QTimer statusRefreshTimer_;
     /// 台站表变化后置脏：下一次 refreshStationSnapshot 连元数据一起替换。
     bool stationMetaDirty_ = true;
     /// 目录同步会把上百条事件一条条送进来；逐条写库 + 逐条 prune 会在启动/复显时
     /// 阻塞 GUI 线程一秒以上（实测 200 条约 400 ms，慢盘更久）。合并成一次事务。
     QTimer historyFlushTimer_;
     std::map<std::string, EarthquakeEvent> pendingHistoryWrites_;
+    /// 待落盘的墓碑：identity -> endedAt。
+    std::map<std::string, long long> pendingTombstones_;
 
     /// 地图焦点：用户从列表选中，或被实时 EEW 自动接管。
     EarthquakeEvent mapFocus_;
@@ -362,6 +420,10 @@ private:
     double waveSOpacity_ = 0.0;
     /// S 波径向渐变填充的不透明度（仅影响半径内非零）。
     double waveSFillOpacity_ = 0.0;
+    /// 波前「影响半径」缓存：只随焦点的震级/深度变化而失效（见 updateWaveRadii）。
+    double waveCacheMagnitude_ = -1.0;
+    double waveCacheDepth_ = -1.0;
+    double waveCacheFadeKm_ = 0.0;
 
     /// 波前圆参数。《NATIVE_PORT_SPEC》 §12：>2000 km 切 `jb` 表，>10000 km 不再画。
     static constexpr double kWaveTableSwitchKm = 2000.0;

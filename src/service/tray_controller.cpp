@@ -31,9 +31,16 @@ TrayController::TrayController(AppController* app, QObject* parent)
     menu_->addSeparator();
     menu_->addAction(QStringLiteral("退出 KomiraQuake"), this, []() { QCoreApplication::quit(); });
 
+    // 图标只画一次：状态切换时复用（见 refresh）。
+    normalIcon_ = makeIcon(QColor(0x00, 0x68, 0x74));
+    criticalIcon_ = makeIcon(QColor(0xBA, 0x1A, 0x1A));
+    warningIcon_ = makeIcon(QColor(0xBC, 0x28, 0x00));
+    blinkDarkIcon_ = makeIcon(QColor(0x24, 0x2C, 0x2E));
+
     tray_.setContextMenu(menu_);
     tray_.setToolTip(QStringLiteral("KomiraQuake 地震预警"));
-    tray_.setIcon(makeIcon(QColor(0x00, 0x68, 0x74)));
+    currentIcon_ = normalIcon_;
+    tray_.setIcon(currentIcon_);
 
     connect(&tray_, &QSystemTrayIcon::activated, this,
             [this](QSystemTrayIcon::ActivationReason reason) {
@@ -52,6 +59,14 @@ TrayController::TrayController(AppController* app, QObject* parent)
     connect(app_, &AppController::warningChanged, this, &TrayController::refresh);
     connect(app_, &AppController::notifiableEvent, this, &TrayController::announceTier);
     refresh();
+}
+
+void TrayController::applyIcon(const QIcon& icon) {
+    // QSystemTrayIcon::setIcon 是一次 D-Bus / 平台调用：闪烁定时器 500 ms 一轮，
+    // 值没变时不该重复下发（尤其「预警但未达闪烁档」时旧实现每轮都重建同一张图）。
+    if (currentIcon_.cacheKey() == icon.cacheKey()) return;
+    currentIcon_ = icon;
+    tray_.setIcon(icon);
 }
 
 QIcon TrayController::makeIcon(const QColor& color) {
@@ -136,9 +151,8 @@ void TrayController::refresh() {
 
     if (alert) {
         if (!blinkTimer_.isActive()) blinkTimer_.start();
-        const QColor base = tag == QLatin1String("CRITICAL") ? QColor(0xBA, 0x1A, 0x1A)
-                                                             : QColor(0xBC, 0x28, 0x00);
-        tray_.setIcon(makeIcon(blinkOn_ ? base : QColor(0x24, 0x2C, 0x2E)));
+        const QIcon& base = tag == QLatin1String("CRITICAL") ? criticalIcon_ : warningIcon_;
+        applyIcon(blinkOn_ ? base : blinkDarkIcon_);
         tray_.setToolTip(QStringLiteral("⚠ 地震预警：%1").arg(warning.value("location").toString()));
     } else {
         blinkTimer_.stop();
@@ -150,7 +164,7 @@ void TrayController::refresh() {
             else
                 ++it;
         }
-        tray_.setIcon(makeIcon(QColor(0x00, 0x68, 0x74)));
+        applyIcon(normalIcon_);
         tray_.setToolTip(QStringLiteral("KomiraQuake 地震预警 · 正常守候中"));
     }
 }

@@ -50,6 +50,10 @@ Item {
             stepSize: root.stepSize
             value: root.value
             Accessible.name: root.title
+            // 拖动时逐帧提交，但**每次只写这一个键**：AppController 现在按项接线
+            // （见 wireSettings()），音量滑块只改 QAudioOutput 音量，不再连带重推
+            // 数据源、重算全表烈度、重建测站元数据。SettingsStore::set() 自身
+            // 对「值没变」也会早退，因此同一档位重复拖动不产生任何写入。
             onMoved: root.moved(value)
         }
 

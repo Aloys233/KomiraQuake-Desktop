@@ -62,7 +62,23 @@ void migrateLegacyGlobal(QSettings& settings) {
 
 } // namespace
 
-SettingsStore::SettingsStore(QObject* parent) : QObject(parent) { migrateLegacyGlobal(s_); }
+SettingsStore::SettingsStore(QObject* parent) : QObject(parent) {
+    migrateLegacyGlobal(s_);
+    // 200 ms：比一次拖动明显长，又短到用户切页/关程序前一定落盘。
+    syncTimer_.setSingleShot(true);
+    syncTimer_.setInterval(200);
+    connect(&syncTimer_, &QTimer::timeout, this, &SettingsStore::flushSync);
+}
+
+void SettingsStore::flushSync() {
+    syncTimer_.stop();
+    s_.sync();
+}
+
+SettingsStore::~SettingsStore() {
+    // 析构时兜底：把合并窗口内还没落盘的值写出去。
+    if (syncTimer_.isActive()) flushSync();
+}
 
 void SettingsStore::resetToDefaults() {
     s_.clear();

@@ -36,11 +36,18 @@ Item {
     // binding and only makes QQmlExpression log "depends on non-bindable
     // properties" on every update. No item in this app uses the transform list,
     // and the bindable inputs below cover layout/scale/rotation changes.
+    // 逐项写入**预分配**数组再拼接：这个函数在相机移动时每帧对两条父链各求值一次，
+    // 旧写法 `stamp += [..].join(",")` 每层都要新建一个数组、再拼一个新字符串。
+    // 改用固定 7 元数组 + push 到同一个缓冲，仍保证「读到了这些属性」（依赖追踪靠读取，
+    // 不靠结果），但每帧不再产生 N 个中间数组。
+    readonly property var transformFields: new Array(7)
     function transformStamp(item) {
         let stamp = "";
         while (item) {
-            stamp += [item.x, item.y, item.width, item.height, item.scale,
-                      item.rotation, item.transformOrigin].join(",");
+            const f = root.transformFields;
+            f[0] = item.x; f[1] = item.y; f[2] = item.width; f[3] = item.height;
+            f[4] = item.scale; f[5] = item.rotation; f[6] = item.transformOrigin;
+            stamp += f.join(",");
             item = item.parent;
         }
         return stamp;

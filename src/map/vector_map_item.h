@@ -276,6 +276,12 @@ private:
 
     /// 基础几何（参考层级世界像素）。GUI 线程独占；渲染线程通过 published_ 取。
     LayerGeometryPtr geometry_;
+    /// 要素名 -> 下标（与 geometry_->features 对齐）。区县着色时用它在 GUI 线程把
+    /// QVariantMap 的键解析成下标，避免渲染线程每帧做 1011 次字符串哈希。
+    ///
+    /// **只在几何换新时建一次**：旧实现在每次 publishState() 里重建整张表，
+    /// 而 publishState 会被每个 setter（fill/stroke/lod/districtIntensity…）调用。
+    std::unordered_map<std::string, int> featureIndex_;
 
     /// 跨线程发布给渲染线程的**不可变**快照。
     /// updatePaintNode 在渲染线程执行，而所有 setter 都在 GUI 线程 —— 直接共享成员就是
@@ -370,10 +376,24 @@ private:
     bool gpuPathActive_ = false;
     qint64 submittedTriangles_ = 0;
     int drawnTiles_ = 0;
-    /// 按 (layer, gcj, tier) 缓存的 GPU 网格。与 CPU 档位缓存同样进程内共享。
+    /// 按 (layer, gcj, tier, style) 缓存的 GPU 网格。与 CPU 档位缓存同样进程内共享。
+    ///
+    /// 带**字节预算 + LRU 淘汰**：key 里烘焙了完整样式（主题色 / 线宽 / dpr 换算后的
+    /// 屏幕比例），换一次主题或连续拖滑块就会多出一整套新 key；旧实现只进不出，
+    /// 每个 key 是几十 MB 的顶点缓冲，长时间运行会把内存吃满。
+    struct MeshEntry {
+        VectorMeshBuilder::LayerPtr layer;
+        quint64 lastUse = 0;
+    };
     static QMutex meshCacheMutex_;
-    static std::unordered_map<std::string, VectorMeshBuilder::LayerPtr> meshCaches_;
+    static std::unordered_map<std::string, MeshEntry> meshCaches_;
     static std::unordered_map<std::string, char> meshInFlight_;
+    /// 当前网格缓存占用的字节数。
+    static qint64 meshBytes_;
+    /// 网格缓存预算（与 CPU 档位缓存同量级：两个后端不会同时活跃）。
+    static constexpr qint64 kMeshBudgetBytes = 64LL * 1024 * 1024;
+    /// 淘汰超预算的网格。调用方必须持有 meshCacheMutex_。
+    static void evictMeshesLocked();
     /// 已上传到场景图的几何是否与当前 mesh_ 对应。
     ///
     /// 场景图节点**只在几何真的变了**（换层/换档/换样式）时才重建，相机变化只更新

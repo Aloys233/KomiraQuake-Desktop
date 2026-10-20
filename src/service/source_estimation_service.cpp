@@ -8,6 +8,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -247,7 +248,7 @@ void SourceEstimationService::reset() {
         region.states.clear();
         clearRegion(region, enabled_ ? QStringLiteral("idle") : QStringLiteral("disabled"));
     }
-    latestEntries_.clear();
+    latestEntries_.reset();
     latestEntriesMs_ = 0;
     lastRunMs_ = 0;
     publish();
@@ -270,16 +271,36 @@ qint64 SourceEstimationService::stationKey(IntensityFamily family, double latitu
     return (lat << 22) | (lon << 2) | familyBits;
 }
 
+void SourceEstimationService::ingestObservations(std::vector<StationSnapshot::Entry> entries) {
+    ingestObservations(
+        std::make_shared<const std::vector<StationSnapshot::Entry>>(std::move(entries)));
+}
+
 void SourceEstimationService::ingestObservations(
-    const std::vector<StationSnapshot::Entry>& entries) {
-    latestEntries_ = entries;
+    const StationSnapshot::EntryList& entries) {
+    // 零拷贝接管：只持 shared_ptr，不复制条目表。
+    latestEntries_ = entries ? entries : std::make_shared<const std::vector<StationSnapshot::Entry>>();
     latestEntriesMs_ = nowProvider_();
     if (!enabled_) return;
     const long long now = latestEntriesMs_;
 
     // 先清零各区触发计数，再逐站归区、按**该区自己的**阈值簿记首次触发时刻。
     for (RegionState& region : regions_) region.triggeredCount = 0;
-    for (const StationSnapshot::Entry& entry : entries) {
+
+    // 阈值按 (区, 测站制式) 预换算一次：`intensityFromCsis(csisEquivalent(...))` 里是
+    // 分段映射，旧实现把它放在逐站循环里 —— 2500 站 × 10 Hz 就是每秒 2.5 万次换算，
+    // 而结果只取决于 4 个区 × 3 种制式。
+    std::array<std::array<double, 3>, 4> thresholds{};
+    for (std::size_t r = 0; r < regions_.size(); ++r) {
+        const RegionState& region = regions_[r];
+        for (int f = 0; f < 3; ++f) {
+            const auto family = static_cast<IntensityFamily>(f);
+            thresholds[r][static_cast<std::size_t>(f)] =
+                intensityFromCsis(family, csisEquivalent(region.family, region.trigger));
+        }
+    }
+
+    for (const StationSnapshot::Entry& entry : *latestEntries_) {
         if (!std::isfinite(entry.raw)) continue;
         const IntensityFamily family = familyOf(entry);
         if (!SourceEstimator::usableIntensity(family, entry.raw)) continue;
@@ -288,10 +309,10 @@ void SourceEstimationService::ingestObservations(
         RegionState& region = regionState(stationRegion);
         // 该区没启用：整区跳过，既不记账也不参与任何计算。
         if (!region.enabled) continue;
-        // 区域主导制式与测站制式不同的情况（例如台湾将来接入 CWA 之外的源）：
-        // 阈值换算到该制式再比，保证「触发」在同一个物理量级上。
-        const double threshold = intensityFromCsis(family, csisEquivalent(region.family,
-                                                                         region.trigger));
+        // 区域主导制式与测站制式不同时（例如台湾将来接入 CWA 之外的源）用预换算的阈值，
+        // 保证「触发」在同一个物理量级上。
+        const double threshold =
+            thresholds[regionIndex(stationRegion)][static_cast<std::size_t>(family)];
         const bool isTriggered = entry.raw >= threshold;
         const qint64 key = stationKey(family, entry.lat, entry.lon);
         auto it = region.states.find(key);
@@ -374,7 +395,7 @@ void SourceEstimationService::runEstimation() {
     }
     const long long now = nowProvider_();
     if (now - lastRunMs_ < kMinRunIntervalMs) return;
-    if (latestEntries_.empty()) return;
+    if (!latestEntries_ || latestEntries_->empty()) return;
     // 全部区域都没到发布门槛时不必起线程：直接维护「收集中」状态。
     // 注意：这里**不**改 region.state —— 过期后的区应当保持 expired，直到又有站越阈值。
     bool anyReady = false;
@@ -409,7 +430,7 @@ void SourceEstimationService::runEstimation() {
     // 同一帧里**没越过阈值**的日本区站：着未着证据，只用来否决错误候选。
     std::vector<std::pair<double, double>> quietArrivals;
     const RegionState& japan = regionState(SourceRegion::Japan);
-    for (const StationSnapshot::Entry& entry : latestEntries_) {
+    for (const StationSnapshot::Entry& entry : *latestEntries_) {
         const IntensityFamily family = familyOf(entry);
         if (!SourceEstimator::usableIntensity(family, entry.raw)) continue;
         SourceRegion stationRegion = SourceRegion::China;

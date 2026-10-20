@@ -3,12 +3,15 @@
 #include <QObject>
 #include <QSettings>
 #include <QString>
+#include <QTimer>
 
 namespace komira {
 
 /// 设置项与默认值。《NATIVE_PORT_SPEC》 §7。统一由 changed() 通知，QML 绑定整体刷新。
 class SettingsStore : public QObject {
     Q_OBJECT
+public:
+    ~SettingsStore() override;
     Q_PROPERTY(QString basemapId READ basemapId WRITE setBasemapId NOTIFY basemapIdChanged)
     Q_PROPERTY(QString customBasemapUrl READ customBasemapUrl WRITE setCustomBasemapUrl NOTIFY customBasemapUrlChanged)
     Q_PROPERTY(int customBasemapDatum READ customBasemapDatum WRITE setCustomBasemapDatum NOTIFY customBasemapDatumChanged)
@@ -437,9 +440,15 @@ private:
     void set(const QString& key, const T& value) {
         if (s_.value(key) == QVariant::fromValue(value)) return;
         s_.setValue(key, value);
+        // QSettings 的写入是**同步落盘**的：拖动一次滑块若每帧都调 setValue()，
+        // 就是每帧一次文件 I/O（Windows 上还是注册表写入），足够把拖动拖出掉帧。
+        // 值已经改了，只是把落盘交给下一次事件循环 —— sync() 前的读取仍走内存缓存。
+        if (!syncTimer_.isActive()) syncTimer_.start();
         emit changed();
         emitKeyChanged(key);
     }
+    /// 把待写的 QSettings 同步到磁盘（合并写入，见 set()）。
+    void flushSync();
 
     /// 发出与 key 对应的逐项信号（以及依赖它的派生属性）。
     /// key 是编译期字面量、调用极不频繁（用户改设置），线性比较 41 个字符串可以忽略。
@@ -457,6 +466,8 @@ private:
     static bool isRegionParamKey(const QString& key);
 
     QSettings s_;
+    /// QSettings 落盘合并定时器（见 set()）。
+    QTimer syncTimer_;
 };
 
 } // namespace komira

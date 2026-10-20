@@ -26,6 +26,9 @@ Item {
     readonly property real km: info && info.uncertaintyKm !== undefined ? info.uncertaintyKm : 0
     /// 当前缩放下每公里对应多少像素（由 MapView 注入）。
     property real kmPerPixel: 0
+    /// 已纠偏的坐标（由 MapView 统一算好后注入）。旧实现让每个 x/y 绑定各自调用
+    /// `shiftCoord()`，四次标记共 8 次跨语言调用 + 8 个临时对象。
+    property var shifted: ({ lat: 0, lon: 0 })
     /// 不确定度圈半径（像素）；太小的圈会退化成点，绘制时按阈值忽略。
     readonly property real radiusPx: Math.max(0, km * kmPerPixel)
 

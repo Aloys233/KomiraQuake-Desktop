@@ -6,6 +6,7 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <utility>
 
 #include "source/snet_station_protocol.h"
 
@@ -149,7 +150,8 @@ void SnetStationSource::handleMessage(const QString& text) {
 
 double SnetStationSource::maxIntensity() const {
     double best = SnetStationProtocol::kMissing;
-    for (double value : intensity_) {
+    // std::as_const：这些访问器是只读的，非 const 迭代会让 QVector 触发 detach 检查。
+    for (double value : std::as_const(intensity_)) {
         if (value > best) best = value;
     }
     return best;

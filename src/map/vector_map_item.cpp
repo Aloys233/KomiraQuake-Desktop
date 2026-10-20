@@ -146,8 +146,9 @@ std::unordered_map<std::string, VectorMapItem::TierEntry> VectorMapItem::tierCac
 std::unordered_map<std::string, char> VectorMapItem::tierInFlight_;
 std::vector<QPointer<VectorMapItem>> VectorMapItem::waiters_;
 QMutex VectorMapItem::meshCacheMutex_;
-std::unordered_map<std::string, VectorMeshBuilder::LayerPtr> VectorMapItem::meshCaches_;
+std::unordered_map<std::string, VectorMapItem::MeshEntry> VectorMapItem::meshCaches_;
 std::unordered_map<std::string, char> VectorMapItem::meshInFlight_;
+qint64 VectorMapItem::meshBytes_ = 0;
 qint64 VectorMapItem::tierBytes_ = 0;
 quint64 VectorMapItem::useCounter_ = 0;
 
@@ -251,8 +252,9 @@ void VectorMapItem::setStrokeScale(qreal v) {
 void VectorMapItem::setDistrictIntensity(const QVariantMap& v) {
     if (districtIntensity_ == v) return;
     districtIntensity_ = v;
+    // invalidateRenderCache() 已经 publishState()：旧实现紧接着又 publish 了一次，
+    // 等于每次着色变化都把整份 RenderState（含 1011 项下标表）打包两遍。
     invalidateRenderCache();
-    publishState();
     emit districtIntensityChanged();
     update();
 }
@@ -260,8 +262,7 @@ void VectorMapItem::setDistrictIntensity(const QVariantMap& v) {
 void VectorMapItem::setLodEnabled(bool v) {
     if (lodEnabled_ == v) return;
     lodEnabled_ = v;
-    cacheValid_ = false;
-    publishState();
+    invalidateRenderCache();
     emit lodEnabledChanged();
     update();
 }
@@ -339,20 +340,15 @@ void VectorMapItem::publishState() {
     next.geometry = geometry_;
     next.geometryReady = geometry_ != nullptr;
 
-    // 区县着色：把 QVariantMap 的 QString 键一次性映射到要素下标。原先这一步在渲染线程
-    // 每帧做 1011 次 QString::fromStdString + 哈希查找（实测 0.12 ms，还要分配上千次）。
+    // 区县着色：把 QVariantMap 的 QString 键映射到要素下标。name -> 下标的表在几何
+    // 到达时（onBaseGeometryBuilt）预建一次，这里只做查找 —— 旧实现每次
+    // publishState() 都要为 1011 个要素重建一张 std::string 哈希表。
     if (layerName_ == QStringLiteral("district") && geometry_ && !districtIntensity_.isEmpty()) {
-        const auto& features = geometry_->features;
-        std::unordered_map<std::string, int> indexByFeature;
-        indexByFeature.reserve(features.size());
-        for (std::size_t i = 0; i < features.size(); ++i) {
-            indexByFeature.emplace(features[i].name, static_cast<int>(i));
-        }
         next.shadedIndices.reserve(static_cast<std::size_t>(districtIntensity_.size()));
         next.shadedRaw.reserve(static_cast<std::size_t>(districtIntensity_.size()));
         for (auto it = districtIntensity_.constBegin(); it != districtIntensity_.constEnd(); ++it) {
-            const auto found = indexByFeature.find(it.key().toStdString());
-            if (found == indexByFeature.end()) continue;
+            const auto found = featureIndex_.find(it.key().toStdString());
+            if (found == featureIndex_.end()) continue;
             next.shadedIndices.push_back(found->second);
             next.shadedRaw.push_back(it.value().toDouble());
         }
@@ -372,6 +368,13 @@ void VectorMapItem::requestBaseGeometry() {
         const auto cached = baseCaches_.find(key);
         if (cached != baseCaches_.end()) {
             geometry_ = cached->second;
+            featureIndex_.clear();
+            if (geometry_) {
+                featureIndex_.reserve(geometry_->features.size());
+                for (std::size_t i = 0; i < geometry_->features.size(); ++i) {
+                    featureIndex_.emplace(geometry_->features[i].name, static_cast<int>(i));
+                }
+            }
             geometryReady_ = true;
             publishState();
             return;
@@ -421,6 +424,14 @@ void VectorMapItem::onBaseGeometryBuilt(const std::string& key, const LayerGeome
     if (baseKey(layerName_.toStdString(), gcjShift_) != key) return;   // 期间换层了
     if (geometry_ != built) {
         geometry_ = built;
+        // 要素名 -> 下标只在这里建一次（见 featureIndex_ 的注释）。
+        featureIndex_.clear();
+        if (geometry_) {
+            featureIndex_.reserve(geometry_->features.size());
+            for (std::size_t i = 0; i < geometry_->features.size(); ++i) {
+                featureIndex_.emplace(geometry_->features[i].name, static_cast<int>(i));
+            }
+        }
         geometryReady_ = true;
         publishState();
     }
@@ -689,11 +700,36 @@ void VectorMapItem::startMeshBuild(const std::string& key, const std::string& la
     });
 }
 
+void VectorMapItem::evictMeshesLocked() {
+    // 按最近使用时间淘汰，直到回到预算内。仍被某个 item 持有的网格由 shared_ptr 保活，
+    // 因此淘汰只影响「以后再取要重建」，不会让正在渲染的几何失效。
+    while (meshBytes_ > kMeshBudgetBytes && meshCaches_.size() > 1) {
+        auto victim = meshCaches_.end();
+        for (auto it = meshCaches_.begin(); it != meshCaches_.end(); ++it) {
+            if (victim == meshCaches_.end() || it->second.lastUse < victim->second.lastUse) {
+                victim = it;
+            }
+        }
+        if (victim == meshCaches_.end()) break;
+        if (victim->second.layer) {
+            meshBytes_ -= static_cast<qint64>(victim->second.layer->bytes());
+        }
+        meshCaches_.erase(victim);
+    }
+}
+
 void VectorMapItem::onMeshBuilt(const std::string& key, const VectorMeshBuilder::LayerPtr& built) {
     {
         QMutexLocker locker(&meshCacheMutex_);
-        meshCaches_[key] = built;
+        const auto it = meshCaches_.find(key);
+        if (it == meshCaches_.end()) {
+            if (built) meshBytes_ += static_cast<qint64>(built->bytes());
+            meshCaches_.emplace(key, MeshEntry{built, ++useCounter_});
+        } else {
+            it->second.lastUse = ++useCounter_;
+        }
         meshInFlight_.erase(key);
+        evictMeshesLocked();
     }
     // 网格就绪后必须主动请求一帧。
     //
@@ -734,15 +770,16 @@ VectorMeshBuilder::LayerPtr VectorMapItem::resolveMesh(const std::string& layer,
         QMutexLocker locker(&meshCacheMutex_);
         const auto found = meshCaches_.find(key);
         if (found != meshCaches_.end()) {
+            found->second.lastUse = ++useCounter_;
             {
                 QMutexLocker meshLock(&meshMutex_);
-                mesh_ = found->second;
+                mesh_ = found->second.layer;
                 meshKey_ = key;
                 // kFullTier（不简化）记 0，与 CPU 路径 lodToleranceForTest 的语义一致；
             // 否则测试无法区分「全精度」与「最细档」。
             meshTolRef_ = (tier >= kFullTier) ? 0.0 : std::pow(2.0, -double(tier));
             }
-            return found->second;
+            return found->second.layer;
         }
         if (meshInFlight_.find(key) == meshInFlight_.end()) {
             meshInFlight_.emplace(key, 1);

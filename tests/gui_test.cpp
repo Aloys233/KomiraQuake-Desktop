@@ -2510,10 +2510,10 @@ private slots:
         // 推进到波前已淡出的时刻：pOpacity 落到 0.25（<=0.25 即 faded）。
         now += 60'000;
         controller.updateWaveRadii();
-        const auto wr = controller.property("waveRadii").toMap();
-        QVERIFY2(wr.value("pOpacity").toDouble() <= 0.25,
+        const double wavePOpacity = controller.property("wavePOpacity").toDouble();
+        QVERIFY2(wavePOpacity <= 0.25,
                  qPrintable(QStringLiteral("前置条件失败：波前未淡出 opacity=%1")
-                                .arg(wr.value("pOpacity").toDouble())));
+                                .arg(wavePOpacity)));
 
         // 用户手动拖远并退出跟随。
         map->setProperty("following", false);

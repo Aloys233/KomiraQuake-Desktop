@@ -4,65 +4,124 @@
 
 namespace komira {
 
+bool EventListModel::Row::operator==(const Row& other) const {
+    // 逐字段比较：只要 delegate 读到的内容一致就不发 dataChanged。
+    // focused 单独走 setFocusedId()，这里也参与比较是安全的（它确实影响绘制）。
+    return id == other.id && location == other.location && source == other.source
+           && magnitudeText == other.magnitudeText && depthText == other.depthText
+           && timeText == other.timeText && sourceTag == other.sourceTag
+           && intensity == other.intensity && intensityLabel == other.intensityLabel
+           && intensityColor == other.intensityColor && levelTag == other.levelTag
+           && timestamp == other.timestamp && magnitude == other.magnitude
+           && distance == other.distance && hasDistance == other.hasDistance
+           && isActive == other.isActive && focused == other.focused;
+}
+
 int EventListModel::rowCount(const QModelIndex& parent) const {
-    return parent.isValid() ? 0 : events_.size();
+    return parent.isValid() ? 0 : static_cast<int>(rows_.size());
+}
+
+const EventListModel::Row* EventListModel::rowAt(int row) const {
+    if (row < 0 || row >= static_cast<int>(rows_.size())) return nullptr;
+    return &rows_[static_cast<std::size_t>(row)];
 }
 
 QVariant EventListModel::data(const QModelIndex& index, int role) const {
-    if (!index.isValid() || index.row() < 0 || index.row() >= events_.size()) return {};
-    if (role == EventRole) return events_.at(index.row());
-    return {};
+    const Row* row = rowAt(index.row());
+    if (!index.isValid() || !row) return {};
+    switch (role) {
+    case EventIdRole: return row->id;
+    case EventLocationRole: return row->location;
+    case EventMagnitudeTextRole: return row->magnitudeText;
+    case EventDepthTextRole: return row->depthText;
+    case EventTimeTextRole: return row->timeText;
+    case EventSourceTagRole: return row->sourceTag;
+    case EventIntensityRole: return row->intensity;
+    case EventIntensityLabelRole: return row->intensityLabel;
+    case EventIntensityColorRole: return row->intensityColor;
+    case EventActiveRole: return row->isActive;
+    case EventFocusedRole: return row->focused;
+    default: return {};
+    }
 }
 
 QHash<int, QByteArray> EventListModel::roleNames() const {
-    return {{EventRole, QByteArrayLiteral("event")}};
+    return {
+        {EventIdRole, QByteArrayLiteral("eventId")},
+        {EventLocationRole, QByteArrayLiteral("eventLocation")},
+        {EventMagnitudeTextRole, QByteArrayLiteral("eventMagnitudeText")},
+        {EventDepthTextRole, QByteArrayLiteral("eventDepthText")},
+        {EventTimeTextRole, QByteArrayLiteral("eventTimeText")},
+        {EventSourceTagRole, QByteArrayLiteral("eventSourceTag")},
+        {EventIntensityRole, QByteArrayLiteral("eventIntensity")},
+        {EventIntensityLabelRole, QByteArrayLiteral("eventIntensityLabel")},
+        {EventIntensityColorRole, QByteArrayLiteral("eventIntensityColor")},
+        {EventActiveRole, QByteArrayLiteral("eventActive")},
+        {EventFocusedRole, QByteArrayLiteral("eventFocused")},
+    };
 }
 
-void EventListModel::setEvents(const QVariantList& events) {
-    QList<QVariantMap> next;
-    next.reserve(events.size());
-    for (const QVariant& value : events) next.push_back(value.toMap());
+void EventListModel::setRows(std::vector<Row> rows) {
+    // 按 id 做最小增量：一次目录刷新里绝大多数行只是字段微调，
+    // 只有真正新增/删除/移动才走 beginInsertRows / beginRemoveRows / beginMoveRows。
+    // 行身份稳定，ListView 的 delegate 才能被复用（含滚动位置与悬停态）。
+    //
+    // 旧实现为每一行都向后线性扫一遍找同 id 行，200 条目录更新就是 4 万次 QString 比较；
+    // 这里先建一次 id -> 行号索引，查找退化成哈希，整体 O(n)。
+    QHash<QString, int> indexById;
+    indexById.reserve(static_cast<qsizetype>(rows_.size()));
+    const auto rebuildIndex = [this, &indexById]() {
+        indexById.clear();
+        for (int i = 0; i < static_cast<int>(rows_.size()); ++i) {
+            indexById.insert(rows_[static_cast<std::size_t>(i)].id, i);
+        }
+    };
+    rebuildIndex();
 
-    // Keep row identities stable where possible. This is deliberately incremental:
-    // a changed magnitude updates one delegate, while a new directory row inserts one.
-    for (int row = 0; row < next.size(); ++row) {
-        const QString wantedId = next.at(row).value(QStringLiteral("id")).toString();
-        if (row < events_.size()
-            && events_.at(row).value(QStringLiteral("id")).toString() == wantedId) {
-            if (events_.at(row) != next.at(row)) {
-                events_[row] = next.at(row);
-                emit dataChanged(index(row), index(row), {EventRole});
+    for (int row = 0; row < static_cast<int>(rows.size()); ++row) {
+        const QString& wantedId = rows[static_cast<std::size_t>(row)].id;
+        if (row < static_cast<int>(rows_.size())
+            && rows_.at(static_cast<std::size_t>(row)).id == wantedId) {
+            if (rows_.at(static_cast<std::size_t>(row)) != rows[static_cast<std::size_t>(row)]) {
+                rows_[static_cast<std::size_t>(row)] = rows[static_cast<std::size_t>(row)];
+                emit dataChanged(index(row), index(row), {});
             }
             continue;
         }
 
-        int existing = -1;
-        for (int candidate = row + 1; candidate < events_.size(); ++candidate) {
-            if (events_.at(candidate).value(QStringLiteral("id")).toString() == wantedId) {
-                existing = candidate;
-                break;
-            }
-        }
+        const auto found = indexById.constFind(wantedId);
+        const int existing = (found != indexById.constEnd() && found.value() > row) ? found.value() : -1;
         if (existing >= 0) {
             beginMoveRows({}, existing, existing, {}, row);
-            events_.move(existing, row);
+            rows_.erase(rows_.begin() + existing);
+            rows_.insert(rows_.begin() + row, rows[static_cast<std::size_t>(row)]);
             endMoveRows();
-            if (events_.at(row) != next.at(row)) {
-                events_[row] = next.at(row);
-                emit dataChanged(index(row), index(row), {EventRole});
-            }
         } else {
             beginInsertRows({}, row, row);
-            events_.insert(row, next.at(row));
+            rows_.insert(rows_.begin() + row, rows[static_cast<std::size_t>(row)]);
             endInsertRows();
         }
+        // 结构性变更（移动/插入）是低频路径：与其增量维护偏移，不如整体重建索引，
+        // 避免漏改导致某行被误判为「已存在」而静默丢失。
+        rebuildIndex();
     }
 
-    while (events_.size() > next.size()) {
-        const int last = events_.size() - 1;
-        beginRemoveRows({}, last, last);
-        events_.removeLast();
+    if (static_cast<int>(rows_.size()) > static_cast<int>(rows.size())) {
+        const int first = static_cast<int>(rows.size());
+        const int last = static_cast<int>(rows_.size()) - 1;
+        beginRemoveRows({}, first, last);
+        rows_.resize(rows.size());
         endRemoveRows();
+    }
+}
+
+void EventListModel::setFocusedId(const QString& id) {
+    for (int row = 0; row < static_cast<int>(rows_.size()); ++row) {
+        Row& current = rows_[static_cast<std::size_t>(row)];
+        const bool wanted = !id.isEmpty() && current.id == id;
+        if (current.focused == wanted) continue;
+        current.focused = wanted;
+        emit dataChanged(index(row), index(row), {EventFocusedRole});
     }
 }
 
@@ -80,23 +139,25 @@ void EventFilterModel::setFilter(const QString& filter, const QString& searchQue
 }
 
 bool EventFilterModel::filterAcceptsRow(int sourceRow, const QModelIndex& sourceParent) const {
-    const QModelIndex sourceIndex = sourceModel()->index(sourceRow, 0, sourceParent);
-    const QVariantMap event = sourceModel()->data(sourceIndex, EventListModel::EventRole).toMap();
+    const auto* model = qobject_cast<const EventListModel*>(sourceModel());
+    if (!model) return true;
+    const EventListModel::Row* row = model->rowAt(sourceRow);
+    if (!row) return false;
+    (void)sourceParent;
+
     if (filter_ == QLatin1String("WITHIN_500")
-        && !(event.value(QStringLiteral("hasDistance")).toBool()
-             && event.value(QStringLiteral("distance")).toDouble() <= 500.0))
+        && !(row->hasDistance && row->distance <= 500.0))
         return false;
-    if (filter_ == QLatin1String("M4_PLUS")
-        && event.value(QStringLiteral("magnitude")).toDouble() < 4.0)
-        return false;
+    if (filter_ == QLatin1String("M4_PLUS") && row->magnitude < 4.0) return false;
     if (filter_ == QLatin1String("RECENT_24H")
-        && QDateTime::currentMSecsSinceEpoch() - event.value(QStringLiteral("timestamp")).toLongLong()
-               > 24LL * 3600LL * 1000LL)
+        && QDateTime::currentMSecsSinceEpoch() - row->timestamp > 24LL * 3600LL * 1000LL)
         return false;
     if (!searchQuery_.isEmpty()) {
-        const QString location = event.value(QStringLiteral("location")).toString().toLower();
-        const QString source = event.value(QStringLiteral("source")).toString().toLower();
-        if (!location.contains(searchQuery_) && !source.contains(searchQuery_)) return false;
+        // 只在需要时做一次大小写折叠；预转换放进行构建期（见 EventListModel::Row::source）。
+        if (!row->location.contains(searchQuery_, Qt::CaseInsensitive)
+            && !row->source.contains(searchQuery_, Qt::CaseInsensitive)) {
+            return false;
+        }
     }
     return true;
 }

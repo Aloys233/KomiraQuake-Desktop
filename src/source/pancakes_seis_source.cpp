@@ -7,6 +7,7 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <utility>
 
 #include "source/pancakes_seis_protocol.h"
 
@@ -223,7 +224,8 @@ void PancakesSeisSource::expireStale() {
 
 double PancakesSeisSource::maxIntensity() const {
     double best = PancakesSeisProtocol::kMissingIntensity;
-    for (double value : intensity_) {
+    // std::as_const：这些访问器是只读的，非 const 迭代会让 QVector 触发 detach 检查。
+    for (double value : std::as_const(intensity_)) {
         if (value > best) best = value;
     }
     return best;

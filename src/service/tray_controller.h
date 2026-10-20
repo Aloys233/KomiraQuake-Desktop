@@ -32,9 +32,19 @@ private:
     /// 分级提醒：按 tier 读取对应的「通知 / 置顶」设置，同一事件只提醒一次。
     void announceTier(const QVariantMap& event, const QString& tier);
     static QIcon makeIcon(const QColor& color);
+    /// 仅在图标真的变化时才下发到托盘。
+    void applyIcon(const QIcon& icon);
 
     AppController* app_ = nullptr;
     QSystemTrayIcon tray_;
+    /// 缓存的图标（正常 / 预警两色 / 闪烁用的暗色）。旧实现每次 refresh() 都新建
+    /// 一张 64×64 QPixmap 并走一遍 QPainter —— 预警期间每 500 ms 一次，纯重复劳动。
+    QIcon normalIcon_;
+    QIcon criticalIcon_;
+    QIcon warningIcon_;
+    QIcon blinkDarkIcon_;
+    /// 当前已应用的图标；相同则不再 setIcon（避免托盘后端反复重绘）。
+    QIcon currentIcon_;
     QMenu* menu_ = nullptr;
     QTimer blinkTimer_;
     bool blinkOn_ = false;

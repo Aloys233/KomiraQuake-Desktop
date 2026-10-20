@@ -146,7 +146,7 @@ void StationMapItem::setSnapshot(QObject* object) {
     emit snapshotChanged();
 
     if (!snapshot_) {
-        stations_.clear();
+        stations_.reset();
         positions_.clear();
         projYRef_.clear();
         update();
@@ -159,20 +159,26 @@ void StationMapItem::setSnapshot(QObject* object) {
 
 void StationMapItem::applySnapshot() {
     if (!snapshot_) return;
-    const auto& source = snapshot_->entries();
-    std::vector<StationSnapshot::Entry> next(source.begin(), source.end());
+    // 直接接管快照的共享帧：**不再**把 2500 条 Entry 复制一份出来。
+    // 快照发放的是 shared_ptr<const vector>，渲染线程读到的这份在替换时自然保活。
+    const StationSnapshot::EntryList& next = snapshot_->entriesShared();
+    if (!next) return;
+    if (stations_ == next) return;   // 同一帧被重复通知（元数据路径）：无事可做
 
     // 纠偏只在数据变化时做一次；坐标未变的站按原下标复用上次结果。
-    std::vector<QPointF> nextPos(next.size());
-    for (std::size_t i = 0; i < next.size(); ++i) {
-        const bool unchanged = i < stations_.size() && next[i].lat == stations_[i].lat &&
-                               next[i].lon == stations_[i].lon && i < positions_.size();
+    const std::size_t count = next->size();
+    std::vector<QPointF> nextPos(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const StationSnapshot::Entry& e = (*next)[i];
+        const bool unchanged = stations_ && i < stations_->size()
+                               && e.lat == (*stations_)[i].lat && e.lon == (*stations_)[i].lon
+                               && i < positions_.size();
         if (unchanged && gcjShift_) {
             nextPos[i] = positions_[i];
             continue;
         }
-        double lat = next[i].lat;
-        double lon = next[i].lon;
+        double lat = e.lat;
+        double lon = e.lon;
         if (gcjShift_) {
             const auto shifted = CoordinateTransform::wgs84ToGcj02(lat, lon);
             lat = shifted.first;
@@ -181,9 +187,9 @@ void StationMapItem::applySnapshot() {
         nextPos[i] = QPointF(lon, lat);
     }
 
-    stations_ = std::move(next);
+    stations_ = next;
     positions_ = std::move(nextPos);
-    rebuildProjectedPositions();
+    rebuildProjectedY();
     update();
     emit stationsApplied();
 }
@@ -212,7 +218,8 @@ void StationMapItem::setZoom(double v) {
 void StationMapItem::setGcjShift(bool v) {
     if (gcjShift_ == v) return;
     gcjShift_ = v;
-    rebuildProjectedPositions();
+    reprojectPositions();
+    rebuildProjectedY();
     emit gcjShiftChanged();
     update();
 }
@@ -249,18 +256,23 @@ void StationMapItem::setKmaDotColors(const QVariantList& v) {
     update();
 }
 
-void StationMapItem::rebuildProjectedPositions() {
-    positions_.resize(stations_.size());
-    for (std::size_t i = 0; i < stations_.size(); ++i) {
-        double lat = stations_[i].lat;
-        double lon = stations_[i].lon;
+void StationMapItem::reprojectPositions() {
+    const std::size_t count = stations_ ? stations_->size() : 0;
+    positions_.resize(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        double lat = (*stations_)[i].lat;
+        double lon = (*stations_)[i].lon;
         if (gcjShift_) {
+            // GCJ-02 纠偏是逐站 8 次三角函数，只在开关切换/新帧到达时做。
             const auto shifted = CoordinateTransform::wgs84ToGcj02(lat, lon);
             lat = shifted.first;
             lon = shifted.second;
         }
         positions_[i] = QPointF(lon, lat);
     }
+}
+
+void StationMapItem::rebuildProjectedY() {
     const double refSize = worldSize(kRefZoom);
     projYRef_.resize(positions_.size());
     for (std::size_t i = 0; i < positions_.size(); ++i) {
@@ -272,7 +284,8 @@ void StationMapItem::invalidateRenderCache() { update(); }
 
 QSGNode* StationMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) {
     // 没有内容时必须返回 nullptr（Qt 会销毁旧节点）。
-    if (stations_.empty() || positions_.empty() || width() <= 0 || height() <= 0) {
+    if (!stations_ || stations_->empty() || positions_.empty() || width() <= 0
+        || height() <= 0) {
         return nullptr;
     }
 
@@ -337,7 +350,8 @@ QSGNode* StationMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
     const double centerRefY = projY(lat, refSize);
 
     vertices_.clear();
-    vertices_.reserve(stations_.size() * 6);
+    const std::size_t stationCount = stations_->size();
+    vertices_.reserve(stationCount * 6);
 
     const double csisSize = csisPx;
     const double dotSize = dotPx;
@@ -359,8 +373,9 @@ QSGNode* StationMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
         vertices_.push_back({fx - half, fy + half, u0, v1});
     };
 
-    for (std::size_t i = 0; i < stations_.size(); ++i) {
-        const StationSnapshot::Entry& s = stations_[i];
+    const std::size_t softwareCount = stations_ ? stations_->size() : 0;
+    for (std::size_t i = 0; i < softwareCount; ++i) {
+        const StationSnapshot::Entry& s = (*stations_)[i];
         const QPointF& pos = positions_[i];
         const double dx = wrapLonDelta(pos.x() - lon);
         const double x = w / 2.0 + dx / 360.0 * world;
@@ -376,12 +391,12 @@ QSGNode* StationMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
                     if (x < -csisSize || y < -csisSize || x > w + csisSize || y > h + csisSize) {
                         continue;
                     }
-                    addQuad(x, y, csisSize, kmaMarkerUv_[mmi - 2]);
+                    addQuad(x, y, csisSize, kmaMarkerUv_.at(mmi - 2));
                 } else {
                     if (x < -dotSize || y < -dotSize || x > w + dotSize || y > h + dotSize) {
                         continue;
                     }
-                    addQuad(x, y, dotSize, kmaDotUv_[mmi]);
+                    addQuad(x, y, dotSize, kmaDotUv_.at(mmi));
                 }
             } else {
                 if (x < -idleSize || y < -idleSize || x > w + idleSize || y > h + idleSize) {
@@ -398,7 +413,7 @@ QSGNode* StationMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
                     continue;
                 }
                 const int level = qBound(0, static_cast<int>(std::lround(s.raw)), 12);
-                addQuad(x, y, csisSize, csisUv_[level]);
+                addQuad(x, y, csisSize, csisUv_.at(level));
             } else {
                 if (x < -idleSize || y < -idleSize || x > w + idleSize || y > h + idleSize) {
                     continue;
@@ -411,7 +426,7 @@ QSGNode* StationMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
         if (x < -dotSize || y < -dotSize || x > w + dotSize || y > h + dotSize) continue;
         const double raw = (s.raw <= -3.0) ? -3.0 : s.raw;
         const int idx = qBound(0, static_cast<int>(std::lround((raw + 3.0) * 2.0)), 20);
-        addQuad(x, y, dotSize, niedUv_[idx]);
+        addQuad(x, y, dotSize, niedUv_.at(idx));
     }
 
     auto* geometry = node->geometry();
@@ -495,7 +510,7 @@ QVariantMap StationMapItem::stationAt(double sx, double sy) const {
     }
     if (best < 0) return out;
 
-    const StationSnapshot::Entry& e = stations_[static_cast<std::size_t>(best)];
+    const StationSnapshot::Entry& e = (*stations_)[static_cast<std::size_t>(best)];
     out[QStringLiteral("found")] = true;
     out[QStringLiteral("index")] = best;
     out[QStringLiteral("lat")] = e.lat;
@@ -617,8 +632,9 @@ QSGNode* StationMapItem::updateSoftwareNode(QSGNode* oldNode, double lat, double
         painter.drawImage(QRectF(x - size / 2.0, y - size / 2.0, size, size), atlas_, src);
     };
 
-    for (std::size_t i = 0; i < stations_.size(); ++i) {
-        const StationSnapshot::Entry& s = stations_[i];
+    const std::size_t softwareCount = stations_ ? stations_->size() : 0;
+    for (std::size_t i = 0; i < softwareCount; ++i) {
+        const StationSnapshot::Entry& s = (*stations_)[i];
         const QPointF& pos = positions_[i];
         const double dx = wrapLonDelta(pos.x() - lon);
         const double x = w / 2.0 + dx / 360.0 * world;
@@ -631,12 +647,12 @@ QSGNode* StationMapItem::updateSoftwareNode(QSGNode* oldNode, double lat, double
                     if (x < -csisSize || y < -csisSize || x > w + csisSize || y > h + csisSize) {
                         continue;
                     }
-                    drawTile(x, y, csisSize, kmaMarkerUv_[mmi - 2]);
+                    drawTile(x, y, csisSize, kmaMarkerUv_.at(mmi - 2));
                 } else {
                     if (x < -dotSize || y < -dotSize || x > w + dotSize || y > h + dotSize) {
                         continue;
                     }
-                    drawTile(x, y, dotSize, kmaDotUv_[mmi]);
+                    drawTile(x, y, dotSize, kmaDotUv_.at(mmi));
                 }
             } else {
                 if (x < -idleSize || y < -idleSize || x > w + idleSize || y > h + idleSize) {
@@ -653,7 +669,7 @@ QSGNode* StationMapItem::updateSoftwareNode(QSGNode* oldNode, double lat, double
                     continue;
                 }
                 const int level = qBound(0, static_cast<int>(std::lround(s.raw)), 12);
-                drawTile(x, y, csisSize, csisUv_[level]);
+                drawTile(x, y, csisSize, csisUv_.at(level));
             } else {
                 if (x < -idleSize || y < -idleSize || x > w + idleSize || y > h + idleSize) {
                     continue;
@@ -665,7 +681,7 @@ QSGNode* StationMapItem::updateSoftwareNode(QSGNode* oldNode, double lat, double
         if (x < -dotSize || y < -dotSize || x > w + dotSize || y > h + dotSize) continue;
         const double raw = (s.raw <= -3.0) ? -3.0 : s.raw;
         const int idx = qBound(0, static_cast<int>(std::lround((raw + 3.0) * 2.0)), 20);
-        drawTile(x, y, dotSize, niedUv_[idx]);
+        drawTile(x, y, dotSize, niedUv_.at(idx));
     }
     painter.end();
 

@@ -118,7 +118,11 @@ private:
 
     /// 快照内容变化后重建纠偏坐标。
     void applySnapshot();
-    void rebuildProjectedPositions();
+    /// 由 stations_ 重算纠偏后的 positions_（仅在 gcjShift 变化时用；常规帧里
+    /// applySnapshot 已顺带算好，避免逐帧重复做一次 GCJ 迭代换算）。
+    void reprojectPositions();
+    /// 由 positions_ 重算墨卡托 Y 缓存。
+    void rebuildProjectedY();
     void invalidateRenderCache();
 
     /// 图集：13 个 CSIS 方标 + 10 个 KMA 方标 + 14 档 KMA 圆点 + 21 档 NIED 圆点
@@ -146,7 +150,9 @@ private:
 
     QObject* snapshotObject_ = nullptr;
     QPointer<StationSnapshot> snapshot_;
-    std::vector<StationSnapshot::Entry> stations_;
+    /// 直接持有快照那一帧的 shared_ptr：不再逐帧把约 2500 条 Entry 复制一遍
+    /// （旧实现在 10 Hz 下每秒复制 2.5 万条，纯分配抖动）。
+    StationSnapshot::EntryList stations_;
     /// 纠偏后的坐标（lon, lat），与 stations_ 下标一一对应。
     std::vector<QPointF> positions_;
     /// 与 positions_ 一一对应的墨卡托投影 Y（固定参考层级 kRefZoom 下的世界像素）。

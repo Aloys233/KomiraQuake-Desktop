@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
+#include <utility>
 
 #include "core/coordinate_transform.h"
 #include "core/intensity_calculator.h"
@@ -59,6 +61,16 @@ namespace {
 
 /// 校时时钟固定显示时区：UTC+8。《NATIVE_PORT_SPEC》 §12。
 constexpr int kClockUtc8OffsetSeconds = 8 * 3600;
+/// 同一偏移的毫秒形式。格式化墙钟时用 `fromMSecsSinceEpoch(ts + 偏移, Qt::UTC)`：
+/// 与 `QTimeZone(28800)` 的渲染结果逐字相同，但**不必每行都构造一个 QTimeZone 对象**
+/// （QTimeZone 带堆上私有数据；目录刷新时这就是 200 次分配）。
+constexpr qint64 kClockUtc8OffsetMs = 8LL * 3600LL * 1000LL;
+
+/// 发震时刻的固定 UTC+8 文本（与设备时区无关）。列表/HUD 共用同一条格式化路径。
+QString utc8Text(long long epochMs) {
+    return QDateTime::fromMSecsSinceEpoch(epochMs + kClockUtc8OffsetMs, Qt::UTC)
+        .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+}
 
 /// 只比较会落库的字段：目录每次整表重发，字段没变就不必再写一次库。
 bool sameStoredEvent(const EarthquakeEvent& a, const EarthquakeEvent& b) {
@@ -86,8 +98,7 @@ QVariantMap toMap(const EarthquakeEvent& e, IntensityStandard standard = Intensi
     m["source"] = QString::fromStdString(e.source);
     m["timestamp"] = static_cast<qlonglong>(e.timestamp);
     // 发震时刻：与校时时钟一致，固定渲染为 UTC+8 的完整时刻。
-    m["timeText"] = QDateTime::fromMSecsSinceEpoch(e.timestamp, QTimeZone(kClockUtc8OffsetSeconds))
-                        .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    m["timeText"] = utc8Text(e.timestamp);
     // 来源标注：`<数据源提供方>·<报数机构>`，如 Wolfx·CENC；新增数据源沿用同一格式。
     const QString provider = QString::fromStdString(e.sourceProvider);
     const QString agency = QString::fromStdString(e.sourceAgency);
@@ -227,15 +238,19 @@ AppController::AppController(QObject* parent, bool startServices)
     systemDark_ = QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
     darkMode_ = resolveDarkMode();
     // themeMode 是唯一的用户意图来源；系统配色只在「跟随系统」时参与判定。
-    connect(settings_, &SettingsStore::changed, this, [this]() {
+    // 只听逐项信号：聚合的 changed() 在拖动音量滑块时每帧都发，若挂在这里会让
+    // 主题判定 + 区县重算跟着滑块抖动。
+    connect(settings_, &SettingsStore::themeModeChanged, this, [this]() {
         if (darkMode_ != resolveDarkMode()) {
             darkMode_ = resolveDarkMode();
             emit darkModeChanged();
         }
-        // 区县着色也由 SettingsStore::changed 驱动，确保关闭时清空旧结果、
-        // 开启时按当前地图事件立即重算。
-        scheduleDistrictRefresh();
     });
+    // 区县着色依赖「矢量叠加 / 底图」与事件本身：只在相关项变化时重算。
+    connect(settings_, &SettingsStore::vectorOverlayChanged, this,
+            [this]() { scheduleDistrictRefresh(); });
+    connect(settings_, &SettingsStore::basemapIdChanged, this,
+            [this]() { scheduleDistrictRefresh(); });
     if (QGuiApplication::styleHints()) {
         connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this](Qt::ColorScheme) {
             systemDark_ = QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
@@ -295,8 +310,10 @@ AppController::AppController(QObject* parent, bool startServices)
     stationIntensityRefreshTimer_.setInterval(100);
     connect(&stationIntensityRefreshTimer_, &QTimer::timeout, this, [this]() {
         refreshStationSnapshot();
-        // 卡片（stationSources）仍走属性通知；地图图层走快照的 changed()。
-        emit stationIntensityChanged();
+        // 卡片数据只在**内容真变了**时才重建并通知：10 Hz 下数值多数帧是不动的
+        // （静稳台网亦然），旧实现每帧都为五路源重算文本并强制 QML 重绑。
+        // 地图图层另走 StationSnapshot::changed()，与这里解耦。
+        if (rebuildStationCards()) emit stationIntensityChanged();
     });
 
     // 波前圆按显示帧率重算，只在焦点事件"还年轻"时跑（见 updateWaveTimer）。
@@ -306,6 +323,9 @@ AppController::AppController(QObject* parent, bool startServices)
     historyFlushTimer_.setInterval(80);
     connect(&historyFlushTimer_, &QTimer::timeout, this, &AppController::flushHistoryWrites);
 
+    // 16 ms 的粗定时器在负载下会被合并到 100+ ms，波前圆看起来一卡一卡；
+    // 显式要求精确定时器（内核高精度唤醒），代价只在它活跃的那几十秒。
+    waveTimer_.setTimerType(Qt::PreciseTimer);
     waveTimer_.setInterval(16);
     connect(&waveTimer_, &QTimer::timeout, this, &AppController::updateWaveRadii);
 
@@ -319,11 +339,24 @@ AppController::AppController(QObject* parent, bool startServices)
         emit hudEventChanged();
     });
 
+    // 数据源状态：250 ms 合并窗口。状态徽章与设置页只需人眼可辨的刷新率，
+    // 而 WS 心跳/延迟更新是每帧一条。
+    statusRefreshTimer_.setSingleShot(true);
+    statusRefreshTimer_.setInterval(250);
+    connect(&statusRefreshTimer_, &QTimer::timeout, this, [this]() {
+        if (rebuildSources()) emit statusChanged();
+    });
+
     // 区县烈度着色：单次定时器合并连发事件，只算最后一次；计算本体派给 worker 线程。
     districtTimer_.setSingleShot(true);
     connect(&districtTimer_, &QTimer::timeout, this, &AppController::recomputeDistrictIntensity);
     connect(&districtWatcher_, &QFutureWatcher<QVariantMap>::finished, this,
             &AppController::onDistrictComputed);
+
+    // 属性缓存打底：QML 在首帧就会读 `app.sources` / `app.stationSources`。
+    // 若等到第一条网络帧才填充，界面会先闪一下「空列表」再长出卡片。
+    rebuildSources();
+    rebuildStationCards();
 }
 
 void AppController::scheduleStationIntensityRefresh() {
@@ -350,14 +383,17 @@ void AppController::wire() {
     // 校时：数据源与告警编排都走 clock_ 的时间基准。《NATIVE_PORT_SPEC》 §13。
     connect(clock_, &NtpClock::changed, this, &AppController::clockChanged);
     // 逐源接线：校时注入、事件与状态回调；新增源无需改这里。
-    for (EarthquakeSource* source : sources_) {
+    for (EarthquakeSource* source : std::as_const(sources_)) {
         source->setNowProvider([this]() { return nowMs(); });
         source->setMonoProvider([this]() { return clock_->elapsedMs(); });
         connect(source, &EarthquakeSource::eventReceived, this,
                 [this, source](const EarthquakeEvent& e, SourceEventKind kind) {
                     handleEvent(e, false, kind == SourceEventKind::Directory, source);
                 });
-        connect(source, &EarthquakeSource::infoChanged, this, &AppController::statusChanged);
+        // 高频状态（每条 WS 报文都会 infoChanged）合并到 250 ms 一次：
+        // 见 scheduleStatusRefresh 的说明。
+        connect(source, &EarthquakeSource::infoChanged, this,
+                &AppController::scheduleStatusRefresh);
     }
 
     // Jian 需登录令牌：启动注入已持久化的 rt_；登录成功后持久化新 rt_ 并立即重新鉴权。
@@ -377,7 +413,7 @@ void AppController::wire() {
     // 定位只影响"本地烈度/倒计时/全屏预警"，不影响数据源连接。
     connect(location_, &LocationService::changed, this, [this]() {
         emit locationChanged();
-        for (EarthquakeSource* source : sources_) {
+        for (EarthquakeSource* source : std::as_const(sources_)) {
             if (location_->hasLocation())
                 source->setUserLocation(location_->latitude(), location_->longitude());
             else
@@ -386,44 +422,7 @@ void AppController::wire() {
         recomputeEvents();
     });
 
-    connect(settings_, &SettingsStore::changed, this, [this]() {
-        const IntensityStandard standard = settings_->intensityStandard() == 1
-            ? IntensityStandard::Jma : IntensityStandard::Csis;
-        // 开发者模式与地址须先于启停生效：否则刚开启开发者模式要等下次启动才连上。
-        simulated_->setDevMode(settings_->developerMode());
-        simulated_->setUrl(settings_->simulatedUrl());
-        for (EarthquakeSource* source : sources_) {
-            source->setStandard(standard);
-            // 未配置凭据的源不启动：不建立任何连接。
-            if (startServices_ && settings_->isSourceEnabled(source->id()) && source->isConfigured())
-                source->start();
-            else source->stop();
-        }
-        // 测站显示源独立于事件源门控：关闭后立即断开连接并清空图层数据。
-        const auto syncStation = [this](bool enabled, auto* source) {
-            if (startServices_ && enabled) source->start(); else source->stop();
-        };
-        syncStation(settings_->isStationSourceEnabled(StationSourceIds::kKmoni), stationSource_);
-        syncStation(settings_->isStationSourceEnabled(StationSourceIds::kSnet), snetSource_);
-        syncStation(settings_->isStationSourceEnabled(StationSourceIds::kKma), kmaSource_);
-        syncStation(settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis), seisSource_);
-        syncStation(settings_->isStationSourceEnabled(StationSourceIds::kWolfxSeis), wolfxSeisSource_);
-        // 启用/停用会改变合并后测站表的构成：悬停元数据必须整表重建一次。
-        noteStationTablesChanged();
-        // 震源推算的门槛/负证据/开关变化：作废旧解，按新判据重新起算。
-        sourceEstimation_->reloadSettings();
-        // 地图标记的显示开关只影响呈现，但该属性没有别的通知源：不发这一下，
-        // QML 会一直停在关闭时那份 `{ visible: false }` 上，重新打开也不恢复。
-        emit sourceEstimateChanged();
-        sound_->setEnabled(settings_->enableSoundAlert());
-        sound_->setVolume(settings_->alertVolume());
-        clock_->setCustomServer(settings_->customNtpServer());
-        clock_->setEnabled(startServices_ && settings_->enableNtpSync());
-        announcer_->onMuteChanged();
-        recomputeEvents();
-        emit statusChanged();
-        maybeAutoCheckUpdates();
-    });
+    wireSettings();
 
     // 启动时应用一次设置
     sound_->setEnabled(settings_->enableSoundAlert());
@@ -443,7 +442,7 @@ void AppController::wire() {
     // 数据源与定位解耦：先连数据源，定位并行获取；校时并行后台进行。
     const IntensityStandard startStandard =
         settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis;
-    for (EarthquakeSource* source : sources_) {
+    for (EarthquakeSource* source : std::as_const(sources_)) {
         source->setStandard(startStandard);
         source->setDirectoryPollingEnabled(directoryRefreshEnabled_);
         if (startServices_ && settings_->isSourceEnabled(source->id()) && source->isConfigured())
@@ -494,6 +493,110 @@ void AppController::wire() {
     maybeAutoCheckUpdates();
 }
 
+void AppController::wireSettings() {
+    // 逐项接线：每段只在**真正相关**的设置项变化时才跑。
+    //
+    // 旧实现把 41 个设置项全挂在聚合的 SettingsStore::changed 上：拖动一次音量滑块
+    // （每帧一次 setAlertVolume）就会重推五路数据源的启停、重算全部事件的烈度、
+    // 发 statusChanged、甚至触发一次自动检查更新 —— 滑块拖动期间 GUI 线程被反复占满。
+    // 现在拆成下面几条独立的连接：写哪个键就只跑哪一段。
+
+    // ---- 1. 数据源门控：只随「启用集合 / 凭据 / 开发者模式 / 强度标准」变化 ----
+    const auto applySources = [this]() { applySourceSettings(); };
+    connect(settings_, &SettingsStore::disabledSourcesChanged, this, applySources);
+    connect(settings_, &SettingsStore::disabledStationSourcesChanged, this, applySources);
+    connect(settings_, &SettingsStore::jianRefreshTokenChanged, this, applySources);
+    connect(settings_, &SettingsStore::whewsTokenChanged, this, applySources);
+    connect(settings_, &SettingsStore::developerModeChanged, this, applySources);
+    connect(settings_, &SettingsStore::simulatedUrlChanged, this, applySources);
+    connect(settings_, &SettingsStore::intensityStandardChanged, this, applySources);
+
+    // ---- 2. 测站图层显隐 ----
+    // showStationLayer 只影响 QML 的 visible 绑定（StationMapItem.visible 直接绑设置），
+    // 不改变台站表，故**不**触发 noteStationTablesChanged()：旧实现每次改任意设置都
+    // 强制重建约 2500 条悬停元数据，是设置页拖动时的主要浪费之一。
+
+    // ---- 3. 震源推算：只有它的参数/开关会作废旧解 ----
+    const auto reloadEstimation = [this]() { sourceEstimation_->reloadSettings(); };
+    connect(settings_, &SettingsStore::sourceEstimationEnabledChanged, this, reloadEstimation);
+    connect(settings_, &SettingsStore::sourceEstimationRegionParamsChanged, this, reloadEstimation);
+    connect(settings_, &SettingsStore::enabledSourceEstimationRegionsChanged, this, reloadEstimation);
+    connect(settings_, &SettingsStore::sourceEstimationHoldSecondsChanged, this, reloadEstimation);
+    // 地图标记的显示开关只影响呈现，但该属性没有别的通知源：不发这一下，
+    // QML 会一直停在关闭时那份 `{ visible: false }` 上，重新打开也不恢复。
+    connect(settings_, &SettingsStore::showEstimatedEpicenterChanged, this,
+            [this]() { emit sourceEstimateChanged(); });
+
+    // ---- 4. 声音：音量滑块只改音量，不碰别的 ----
+    connect(settings_, &SettingsStore::enableSoundAlertChanged, this, [this]() {
+        sound_->setEnabled(settings_->enableSoundAlert());
+    });
+    connect(settings_, &SettingsStore::alertVolumeChanged, this, [this]() {
+        sound_->setVolume(settings_->alertVolume());
+    });
+    connect(settings_, &SettingsStore::isMutedChanged, this,
+            [this]() { announcer_->onMuteChanged(); });
+
+    // ---- 5. 校时 ----
+    connect(settings_, &SettingsStore::customNtpServerChanged, this, [this]() {
+        clock_->setCustomServer(settings_->customNtpServer());
+    });
+    connect(settings_, &SettingsStore::enableNtpSyncChanged, this, [this]() {
+        clock_->setEnabled(startServices_ && settings_->enableNtpSync());
+    });
+
+    // ---- 6. 告警门控相关：过滤阈值/总开关/定位变化会改变已收事件的“是否需要提醒”，
+    //         但不改变事件本身的距离与烈度 —— 走轻量的 syncWarning，不重算全表。 ----
+    connect(settings_, &SettingsStore::enableWarningsChanged, this, [this]() {
+        syncWarning();
+        emit statusChanged();
+    });
+    connect(settings_, &SettingsStore::localIntensityFilterChanged, this, [this]() {
+        syncWarning();
+        emit statusChanged();
+    });
+
+    // ---- 7. 自动检查更新 ----
+    connect(settings_, &SettingsStore::autoCheckUpdatesChanged, this,
+            [this]() { maybeAutoCheckUpdates(); });
+}
+
+void AppController::applySourceSettings() {
+    const IntensityStandard standard = settings_->intensityStandard() == 1
+        ? IntensityStandard::Jma : IntensityStandard::Csis;
+    // 开发者模式与地址须先于启停生效：否则刚开启开发者模式要等下次启动才连上。
+    simulated_->setDevMode(settings_->developerMode());
+    simulated_->setUrl(settings_->simulatedUrl());
+    // 凭据可能刚被写入：先推给需要的源，再按门控启停。
+    jian_->setRefreshToken(settings_->jianRefreshToken());
+    whews_->setToken(settings_->whewsToken());
+    for (EarthquakeSource* source : std::as_const(sources_)) {
+        source->setStandard(standard);
+        // 未配置凭据的源不启动：不建立任何连接。
+        if (startServices_ && settings_->isSourceEnabled(source->id()) && source->isConfigured())
+            source->start();
+        else source->stop();
+    }
+    // 测站显示源独立于事件源门控：关闭后立即断开连接并清空图层数据。
+    const auto syncStation = [this](bool enabled, auto* source) {
+        if (startServices_ && enabled) source->start(); else source->stop();
+    };
+    syncStation(settings_->isStationSourceEnabled(StationSourceIds::kKmoni), stationSource_);
+    syncStation(settings_->isStationSourceEnabled(StationSourceIds::kSnet), snetSource_);
+    syncStation(settings_->isStationSourceEnabled(StationSourceIds::kKma), kmaSource_);
+    syncStation(settings_->isStationSourceEnabled(StationSourceIds::kPancakesSeis), seisSource_);
+    syncStation(settings_->isStationSourceEnabled(StationSourceIds::kWolfxSeis), wolfxSeisSource_);
+    // 启用/停用会改变合并后测站表的构成：悬停元数据必须整表重建一次。
+    noteStationTablesChanged();
+    // 右上角的测站源小卡只列出「已启用」的源：启停后要刷新一次属性通知。
+    if (rebuildStationCards()) emit stationIntensityChanged();
+    // 左下角徽章只显示 enabled && configured，启停/凭据变化后必须同步刷新。
+    if (rebuildSources()) emit statusChanged();
+    // 强度标准变了：已收事件的“显示烈度”需要按新口径重算一次。
+    recomputeEvents();
+    emit statusChanged();
+}
+
 bool AppController::startHidden() const {
     return settings_ && settings_->silentStart();
 }
@@ -515,7 +618,7 @@ double AppController::userLatitude() const { return location_->latitude(); }
 double AppController::userLongitude() const { return location_->longitude(); }
 QString AppController::locationStatusText() const { return location_->statusText(); }
 
-QVariantList AppController::sources() const {
+bool AppController::rebuildSources() {
     auto describe = [](const DataSourceInfo& info, bool enabled, bool configured) {
         QVariantMap m;
         m["id"] = info.id;
@@ -541,87 +644,142 @@ QVariantList AppController::sources() const {
         return m;
     };
     QVariantList list;
-    for (EarthquakeSource* source : sources_)
+    list.reserve(sources_.size());
+    for (EarthquakeSource* source : std::as_const(sources_))
         list.push_back(describe(source->info(), settings_->isSourceEnabled(source->id()),
                                 source->isConfigured()));
-    return list;
+    if (list == sourcesCache_) return false;
+    sourcesCache_ = std::move(list);
+    return true;
+}
+
+void AppController::scheduleStatusRefresh() {
+    if (!statusRefreshTimer_.isActive()) statusRefreshTimer_.start();
 }
 
 QVariantMap AppController::clockInfo() const { return clock_->info(); }
 
 QString AppController::clockTextUtc8() const {
     // 固定 +08:00 时区渲染，与设备时区无关。
-    const QDateTime stamp =
-        QDateTime::fromMSecsSinceEpoch(nowMs(), QTimeZone(kClockUtc8OffsetSeconds));
-    return stamp.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    return utc8Text(nowMs());
 }
 
 QVariantList AppController::history() const {
+    // 懒构造 + 缓存：属性只在真正被读（或首次 emit 后 QML 重新求值）时才付这
+    // 200 × 全字段 map 的代价。目录刷新期间不再无条件重建。
+    if (!historyDirty_) return historyCache_;
     QVariantList list;
-    for (const auto& e : history_) list.push_back(toMap(e));
-    return list;
+    list.reserve(history_.size());
+    for (const auto& e : std::as_const(history_)) list.push_back(toMap(e));
+    historyCache_ = std::move(list);
+    historyDirty_ = false;
+    return historyCache_;
 }
 
-QVariantList AppController::eventList() const {
+std::vector<std::pair<EarthquakeEvent, bool>> AppController::mergedEvents() const {
     // 目录条目用权威数据；同一物理地震（发震时刻 + 震中）只保留一条，实时预警命中目录时
     // 用目录数据并标记 isActive，未命中目录的实时预警另行补上。
-    QList<EarthquakeEvent> catalog;
-    for (const auto& e : history_) {
+    //
+    // 旧实现对每条历史都线性扫一遍已合并列表、再加一次「是否已发出」的线性扫描：
+    // 200 条目录 × 各自几十次 haversine，最坏上万次三角函数。这里改为一次性分桶：
+    // 两个列表都只有几十~两百条，用「发震时刻 / 30 s」做桶键，桶内再按距离判定。
+    constexpr long long kBucketMs = QuakeCalculator::kSameQuakeWindowMs;
+
+    std::vector<EarthquakeEvent> catalog;
+    catalog.reserve(history_.size());
+    std::unordered_map<long long, std::vector<int>> buckets;
+    for (const auto& e : std::as_const(history_)) {
+        const long long bucket = e.timestamp / kBucketMs;
         int found = -1;
-        for (int i = 0; i < catalog.size(); ++i) {
-            if (samePhysicalEvent(catalog[i], e)) { found = i; break; }
+        // 同震窗口是 30 s，只可能落在本桶或相邻桶里。
+        for (long long b = bucket - 1; b <= bucket + 1 && found < 0; ++b) {
+            const auto it = buckets.find(b);
+            if (it == buckets.end()) continue;
+            for (const int index : it->second) {
+                if (samePhysicalEvent(catalog[static_cast<std::size_t>(index)], e)) {
+                    found = index;
+                    break;
+                }
+            }
         }
-        if (found < 0) { catalog.push_back(e); continue; }
+        if (found < 0) {
+            buckets[bucket].push_back(static_cast<int>(catalog.size()));
+            catalog.push_back(e);
+            continue;
+        }
         // 同一地震若有自动/正式两条，取推送时间较晚（通常为正式）的一条。
-        const long long prev = catalog[found].reportTime > 0 ? catalog[found].reportTime
-                                                             : catalog[found].timestamp;
+        EarthquakeEvent& slot = catalog[static_cast<std::size_t>(found)];
+        const long long prev = slot.reportTime > 0 ? slot.reportTime : slot.timestamp;
         const long long next = e.reportTime > 0 ? e.reportTime : e.timestamp;
-        if (next > prev) catalog[found] = e;
+        if (next > prev) slot = e;
     }
 
-    QList<EarthquakeEvent> emitted;
-    auto alreadyEmitted = [&emitted](const EarthquakeEvent& e) {
-        for (const auto& p : emitted) {
-            if (samePhysicalEvent(p, e)) return true;
+    // 实时会话与目录对齐：一个会话最多消耗一条目录条目（catalogUsed）。
+    std::vector<char> catalogUsed(catalog.size(), 0);
+    std::vector<std::pair<EarthquakeEvent, bool>> out;
+    out.reserve(catalog.size() + sessions_.active.size());
+    std::unordered_map<long long, std::vector<int>> emittedBuckets;
+    const auto alreadyEmitted = [&emittedBuckets, &out](const EarthquakeEvent& e) {
+        const long long bucket = e.timestamp / kBucketMs;
+        for (long long b = bucket - 1; b <= bucket + 1; ++b) {
+            const auto it = emittedBuckets.find(b);
+            if (it == emittedBuckets.end()) continue;
+            for (const int index : it->second) {
+                if (samePhysicalEvent(out[static_cast<std::size_t>(index)].first, e)) return true;
+            }
         }
         return false;
     };
-    QVariantList out;
-    const IntensityStandard standard =
-        settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis;
-    auto push = [&out, standard](const EarthquakeEvent& e, bool active) {
-        QVariantMap m = toMap(e, standard);
-        m["isActive"] = active;
-        out.push_back(m);
+    const auto markEmitted = [&emittedBuckets](const EarthquakeEvent& e, int index) {
+        emittedBuckets[e.timestamp / kBucketMs].push_back(index);
     };
 
-    QList<bool> catalogUsed(catalog.size(), false);
     for (const auto& [key, state] : sessions_.active) {
+        Q_UNUSED(key);
         const EarthquakeEvent& live = state.event;
         if (alreadyEmitted(live)) continue;
         int found = -1;
-        for (int i = 0; i < catalog.size(); ++i) {
-            if (!catalogUsed[i] && samePhysicalEvent(catalog[i], live)) { found = i; break; }
+        for (int i = 0; i < static_cast<int>(catalog.size()); ++i) {
+            if (!catalogUsed[static_cast<std::size_t>(i)] && samePhysicalEvent(catalog[static_cast<std::size_t>(i)], live)) {
+                found = i;
+                break;
+            }
         }
         if (found >= 0) {
-            catalogUsed[found] = true;
-            push(catalog[found], true);
-            emitted.push_back(catalog[found]);
+            catalogUsed[static_cast<std::size_t>(found)] = 1;
+            markEmitted(catalog[static_cast<std::size_t>(found)], static_cast<int>(out.size()));
+            out.emplace_back(catalog[static_cast<std::size_t>(found)], true);
         } else {
-            push(live, true);
-            emitted.push_back(live);
+            markEmitted(live, static_cast<int>(out.size()));
+            out.emplace_back(live, true);
         }
     }
-    for (int i = 0; i < catalog.size(); ++i) {
-        if (catalogUsed[i] || alreadyEmitted(catalog[i])) continue;
-        push(catalog[i], false);
-        emitted.push_back(catalog[i]);
+    for (int i = 0; i < static_cast<int>(catalog.size()); ++i) {
+        const EarthquakeEvent& e = catalog[static_cast<std::size_t>(i)];
+        if (catalogUsed[static_cast<std::size_t>(i)] || alreadyEmitted(e)) continue;
+        out.emplace_back(e, false);
     }
 
-    std::sort(out.begin(), out.end(), [](const QVariant& a, const QVariant& b) {
-        return a.toMap().value(QStringLiteral("timestamp")).toLongLong() >
-               b.toMap().value(QStringLiteral("timestamp")).toLongLong();
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        return a.first.timestamp > b.first.timestamp;
     });
+    return out;
+}
+
+QVariantList AppController::eventList() const {
+    // 兼容入口：完整字段的 QVariantMap 数组。QML 已改用 eventModel 的逐列 role，
+    // 这里仅供 C++ 测试/调试使用，故不再随刷新 emit 信号（那曾让每次目录更新
+    // 都重建一整份约 200×40 项的 QVariant 树，即使 QML 根本没人读）。
+    const auto merged = mergedEvents();
+    QVariantList out;
+    out.reserve(static_cast<qsizetype>(merged.size()));
+    const IntensityStandard standard =
+        settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis;
+    for (const auto& [event, active] : merged) {
+        QVariantMap m = toMap(event, standard);
+        m["isActive"] = active;
+        out.push_back(m);
+    }
     return out;
 }
 
@@ -724,16 +882,6 @@ void AppController::scheduleHudRefresh() {
     const long long remaining = reference + kHudWindowMs - nowMs();
     if (remaining <= 0 || remaining > 2'147'483'647LL) return;
     hudRefreshTimer_.start(static_cast<int>(remaining));
-}
-
-QVariantMap AppController::waveRadii() const {
-    QVariantMap m;
-    m["pKm"] = wavePKm_;
-    m["sKm"] = waveSKm_;
-    m["pOpacity"] = wavePOpacity_;
-    m["sOpacity"] = waveSOpacity_;
-    m["sFillOpacity"] = waveSFillOpacity_;
-    return m;
 }
 
 void AppController::refreshStationSnapshot() {
@@ -861,24 +1009,30 @@ void AppController::refreshStationSnapshot() {
     }
 
     if (withMeta) {
-        stationMetas_ = std::move(metas);
+        auto metaList = std::make_shared<const std::vector<StationSnapshot::StationMeta>>(
+            std::move(metas));
+        stationMetas_ = metaList;
         stationMetaDirty_ = false;
-        if (entries.size() != stationMetas_.size()) {
+        if (entries.size() != metaList->size()) {
             // 不该发生：条目与元数据同序生成。留一条日志便于定位，随后照样下发。
             qWarning() << "[station] meta/entry size mismatch" << entries.size()
-                       << stationMetas_.size();
+                       << metaList->size();
         }
-        if (sourceEstimation_) sourceEstimation_->ingestObservations(entries);
-        stationSnapshot_->setEntries(std::move(entries), stationMetas_);
+        // 一帧只构造一次：快照与震源推算共享同一份只读数据，不再各自复制一遍
+        // （约 2500 条，10 Hz 下等于每秒几 MB 的纯分配抖动）。
+        auto frame = std::make_shared<const std::vector<StationSnapshot::Entry>>(std::move(entries));
+        if (sourceEstimation_) sourceEstimation_->ingestObservations(frame);
+        stationSnapshot_->setSharedEntries(std::move(frame), std::move(metaList));
         return;
     }
-    if (stationMetas_.size() != entries.size()) {
+    if (!stationMetas_ || stationMetas_->size() != entries.size()) {
         // 启用/停用了某个测站源却漏标脏：下一帧补一次完整重建（悬停先没有元数据）。
         stationMetaDirty_ = true;
         scheduleStationIntensityRefresh();
     }
-    if (sourceEstimation_) sourceEstimation_->ingestObservations(entries);
-    stationSnapshot_->setEntries(std::move(entries));
+    auto frame = std::make_shared<const std::vector<StationSnapshot::Entry>>(std::move(entries));
+    if (sourceEstimation_) sourceEstimation_->ingestObservations(frame);
+    stationSnapshot_->setSharedEntries(std::move(frame));
 }
 
 QVariantMap AppController::sourceEstimateInfo() const {
@@ -895,6 +1049,12 @@ QVariantMap AppController::sourceEstimateMarker() const {
 }
 
 QVariantList AppController::stationSources() const {
+    // 属性 getter 直接返回缓存：QML 里每个 delegate 都会读一次它，旧实现每次都为
+    // 五路源重算文本/时间格式/颜色并新建 5 张 QVariantMap。
+    return stationSourcesCache_;
+}
+
+bool AppController::rebuildStationCards() {
     // 每个测站源一张卡片：NIED / S-Net 用 JMA 計測震度，Pancakes / Wolfx 用中国地震烈度
     // （CSIS），KMA 用韩国 MMI。
     QVariantList list;
@@ -927,11 +1087,12 @@ QVariantList AppController::stationSources() const {
         const double raw = seisSource_->maxIntensity();
         const bool hasData =
             seisSource_->hasData() && raw > PancakesSeisProtocol::kMissingIntensity;
-        const QString frameTime = seisSource_->lastTimestamp() > 0
-            ? QDateTime::fromMSecsSinceEpoch(seisSource_->lastTimestamp(),
-                                             QTimeZone(kClockUtc8OffsetSeconds))
-                  .toString(QStringLiteral("yyyyMMddHHmmss"))
-            : QString();
+        const QString frameTime =
+            seisSource_->lastTimestamp() > 0
+                ? QDateTime::fromMSecsSinceEpoch(seisSource_->lastTimestamp() + kClockUtc8OffsetMs,
+                                                 Qt::UTC)
+                      .toString(QStringLiteral("yyyyMMddHHmmss"))
+                : QString();
         list.push_back(stationCard(QStringLiteral("pancakes_seis"), QStringLiteral("PancakesSeis"),
                                    hasData, raw, QStringLiteral("csis"),
                                    seisSource_->stations().size(), frameTime));
@@ -945,7 +1106,9 @@ QVariantList AppController::stationSources() const {
                                    QStringLiteral("csis"), wolfxSeisSource_->stations().size(),
                                    wolfxSeisSource_->frameTime()));
     }
-    return list;
+    if (list == stationSourcesCache_) return false;
+    stationSourcesCache_ = std::move(list);
+    return true;
 }
 
 bool AppController::isMapFocused(const QString& id) const {
@@ -980,7 +1143,7 @@ void AppController::toggleMapFocus(const QString& id) {
         setMapFocus(activeWarning_, true);
         return;
     }
-    for (const EarthquakeEvent& event : history_) {
+    for (const EarthquakeEvent& event : std::as_const(history_)) {
         if (QString::fromStdString(event.identity()) == id || QString::fromStdString(event.id) == id) {
             // 如果该历史条目正是当前正在活跃的预警（同一物理地震），优先切换到活跃预警会话
             for (const auto& [key, state] : sessions_.active) {
@@ -1005,6 +1168,8 @@ void AppController::setMapFocus(const EarthquakeEvent& event, bool manual) {
     updateWaveTimer();
     scheduleHudRefresh();
     scheduleDistrictRefresh();
+    // 焦点只影响侧栏两行（旧的、新的）：走定向 dataChanged，不重建整表。
+    syncEventModelFocus();
     emit mapEventChanged();
     emit mapFocusChanged();
     emit hudEventChanged();
@@ -1018,6 +1183,7 @@ void AppController::clearMapFocus() {
     updateWaveTimer();
     scheduleHudRefresh();
     scheduleDistrictRefresh();
+    syncEventModelFocus();
     emit mapEventChanged();
     emit mapFocusChanged();
     emit hudEventChanged();
@@ -1147,31 +1313,53 @@ void AppController::updateWaveRadii() {
     if (seconds < 0.0) return;
 
     // 反解走时表得到波前半径（km）。两张表在 2000 km 处拼接，切换是连续的。
+    // 表名用 static：旧实现每帧构造两个 QStringLiteral("jb")，60 Hz 下是纯分配噪声。
+    static const QString kJbTable = QStringLiteral("jb");
     TravelTimeService& travel = TravelTimeService::instance();
     double p = travel.distanceForTime(event->depth, seconds, true, TravelTimeService::kDefaultTable);
     double s = travel.distanceForTime(event->depth, seconds, false, TravelTimeService::kDefaultTable);
     // jma2001 到量程上限会 clamp 回 2000 km，`>` 永远触发不了，故用 `>=` 才能切到 jb 表；
     // 端点处 jb 返回值与 jma2001 连续，不会跳变。
-    if (p >= kWaveTableSwitchKm) p = travel.distanceForTime(event->depth, seconds, true, QStringLiteral("jb"));
-    if (s >= kWaveTableSwitchKm) s = travel.distanceForTime(event->depth, seconds, false, QStringLiteral("jb"));
+    if (p >= kWaveTableSwitchKm) p = travel.distanceForTime(event->depth, seconds, true, kJbTable);
+    if (s >= kWaveTableSwitchKm) s = travel.distanceForTime(event->depth, seconds, false, kJbTable);
 
     // jb 表上限 10000 km 同样会 clamp，到端点即视为超出量程不再画。
     double pKm = p >= kWaveMaxRadiusKm ? -1.0 : p;
     double sKm = s >= kWaveMaxRadiusKm ? -1.0 : s;
     // 波前"影响半径"：CSIS 降到可感下限（I）时的震中距。这是有意取代 kanameishi 的
     // 经验式 clamp(50·M²,200,2000)。震级未知（<=0）时无法反解，退回量程上限，保证波前仍可见。
-    const double fadeKm = event->magnitude > 0.0
-                              ? IntensityCalculator::distanceForCsis(event->magnitude, event->depth, kCsisFadeLevel)
-                              : kWaveMaxRadiusKm;
+    //
+    // 该值只取决于 (magnitude, depth)，而两者在事件生命周期内几乎不变 —— 旧实现每帧
+    // 都跑一次 40 次迭代的二分（40 次 rawCsis，含 pow/log）。按参数缓存，只在换事件时重算。
+    if (waveCacheMagnitude_ != event->magnitude || waveCacheDepth_ != event->depth) {
+        waveCacheMagnitude_ = event->magnitude;
+        waveCacheDepth_ = event->depth;
+        waveCacheFadeKm_ = event->magnitude > 0.0
+                               ? IntensityCalculator::distanceForCsis(event->magnitude, event->depth,
+                                                                      kCsisFadeLevel)
+                               : kWaveMaxRadiusKm;
+    }
+    const double fadeKm = waveCacheFadeKm_;
+
     // 透明度归零即视为隐藏：半径记 -1，取景与绘制都会跳过。
-    if (IntensityCalculator::waveOpacity(pKm, fadeKm, kWaveMaxRadiusKm) <= 0.0) pKm = -1.0;
-    if (IntensityCalculator::waveOpacity(sKm, fadeKm, kWaveMaxRadiusKm) <= 0.0) sKm = -1.0;
-    if (pKm == wavePKm_ && sKm == waveSKm_) return;
+    const double pOpacity =
+        pKm > 0.0 ? IntensityCalculator::waveOpacity(pKm, fadeKm, kWaveMaxRadiusKm) : 0.0;
+    const double sOpacity =
+        sKm > 0.0 ? IntensityCalculator::waveOpacity(sKm, fadeKm, kWaveMaxRadiusKm) : 0.0;
+    if (pOpacity <= 0.0) pKm = -1.0;
+    if (sOpacity <= 0.0) sKm = -1.0;
+    // 只有真正变化的字段才值得发通知：QML 侧的绑定（含 Behavior 动画）据此重算。
+    if (pKm == wavePKm_ && sKm == waveSKm_ && pOpacity == wavePOpacity_
+        && sOpacity == waveSOpacity_) {
+        if (wavePKm_ < 0.0 && waveSKm_ < 0.0) waveTimer_.stop();
+        return;
+    }
     wavePKm_ = pKm;
     waveSKm_ = sKm;
-    wavePOpacity_ = pKm > 0.0 ? IntensityCalculator::waveOpacity(pKm, fadeKm, kWaveMaxRadiusKm) : 0.0;
-    waveSOpacity_ = sKm > 0.0 ? IntensityCalculator::waveOpacity(sKm, fadeKm, kWaveMaxRadiusKm) : 0.0;
-    waveSFillOpacity_ = sKm > 0.0 ? IntensityCalculator::waveFillOpacity(sKm, fadeKm) : 0.0;
+    wavePOpacity_ = pKm > 0.0 ? pOpacity : 0.0;
+    waveSOpacity_ = sKm > 0.0 ? sOpacity : 0.0;
+    waveSFillOpacity_ =
+        sKm > 0.0 ? IntensityCalculator::waveFillOpacity(sKm, fadeKm) : 0.0;
     emit waveRadiiChanged();
     if (wavePKm_ < 0.0 && waveSKm_ < 0.0) waveTimer_.stop();
 }
@@ -1185,13 +1373,13 @@ void AppController::setManualLocation(double latitude, double longitude, const Q
 void AppController::setWindowVisible(bool visible) {
     if (directoryRefreshEnabled_ == visible) return;
     directoryRefreshEnabled_ = visible;
-    for (EarthquakeSource* source : sources_) source->setDirectoryPollingEnabled(visible);
+    for (EarthquakeSource* source : std::as_const(sources_)) source->setDirectoryPollingEnabled(visible);
     if (visible) refreshCatalog();
 }
 
 void AppController::refreshCatalog() {
     if (!directoryRefreshEnabled_) return;
-    for (EarthquakeSource* source : sources_)
+    for (EarthquakeSource* source : std::as_const(sources_))
         if (settings_->isSourceEnabled(source->id())) source->refreshDirectory();
 }
 
@@ -1245,7 +1433,7 @@ void AppController::stopWarning() {
     if (it == sessions_.active.end()) return;
     announcer_->finish(it->second.event, true);
     sessions_.finish(selectedWarning_, nowMs());
-    historyStore_->saveTombstone(QString::fromStdString(selectedWarning_), nowMs());
+    queueTombstoneWrite(QString::fromStdString(selectedWarning_), nowMs());
     syncWarning();
 }
 
@@ -1302,7 +1490,7 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         }
         // 同一物理地震可能已由实时预警或别的源先入库：新事件只通知一次。
         bool alreadyKnown = false;
-        for (const auto& h : history_) {
+        for (const auto& h : std::as_const(history_)) {
             if (samePhysicalEvent(h, event)) { alreadyKnown = true; break; }
         }
         if (!alreadyKnown) {
@@ -1347,7 +1535,7 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         return;
     }
     if (change == WarningSession::Change::Ended) {
-        historyStore_->saveTombstone(identityOf(event), nowMs());
+        queueTombstoneWrite(identityOf(event), nowMs());
         announcer_->finish(event, selectedWarning_ == event.identity());
         if (hasMapFocus_ && mapFocus_.identity() == event.identity()) {
             mapFocus_ = event;
@@ -1406,10 +1594,12 @@ bool AppController::upsertHistory(const EarthquakeEvent& event) {
         if (history_[i].id == event.id) {
             if (sameStoredEvent(history_[i], event)) return false;
             history_[i] = event;
+            historyDirty_ = true;
             return true;
         }
     }
     history_.push_back(event);
+    historyDirty_ = true;
     return true;
 }
 
@@ -1421,15 +1611,42 @@ void AppController::queueHistoryWrite(const EarthquakeEvent& event) {
 
 void AppController::flushHistoryWrites() {
     historyFlushTimer_.stop();
-    if (pendingHistoryWrites_.empty()) return;
-    QVector<EarthquakeEvent> batch;
-    batch.reserve(static_cast<int>(pendingHistoryWrites_.size()));
-    for (const auto& entry : pendingHistoryWrites_) batch.push_back(entry.second);
-    pendingHistoryWrites_.clear();
-    if (!historyStore_ || !historyStore_->isReady()) return;
-    // upsertAll 内部是一个事务；prune 每次同步最多跑一次。
-    historyStore_->upsertAll(batch);
-    historyStore_->prune(400);
+    // 先把待写的墓碑（预警结束的终态）落盘，再写事件：两者都在 GUI 线程的 SQLite 上，
+    // 每 80 ms 一次的合并写已经把事务数压到最低。
+    if (!historyStore_ || !historyStore_->isReady()) {
+        pendingHistoryWrites_.clear();
+        return;
+    }
+    if (!pendingHistoryWrites_.empty()) {
+        QVector<EarthquakeEvent> batch;
+        batch.reserve(static_cast<int>(pendingHistoryWrites_.size()));
+        for (const auto& entry : pendingHistoryWrites_) batch.push_back(entry.second);
+        pendingHistoryWrites_.clear();
+        // upsertAll 内部是一个事务；prune 每次同步最多跑一次。
+        historyStore_->upsertAll(batch);
+        historyStore_->prune(400);
+    }
+    flushTombstoneWrites();
+}
+
+void AppController::queueTombstoneWrite(const QString& identity, long long endedAt) {
+    if (!historyStore_ || !historyStore_->isReady() || identity.isEmpty()) return;
+    pendingTombstones_[identity.toStdString()] = endedAt;
+    if (!historyFlushTimer_.isActive()) historyFlushTimer_.start();
+}
+
+void AppController::flushTombstoneWrites() {
+    if (pendingTombstones_.empty()) return;
+    if (!historyStore_ || !historyStore_->isReady()) {
+        pendingTombstones_.clear();
+        return;
+    }
+    // 每个墓碑是一次独立事务（saveTombstone 内含 3 条语句）。旧实现在预警结束/取消的
+    // 瞬间同步调用，一次取消报就会在 GUI 线程上做 3 次 SQL —— 合并进同一条 80 ms 写回。
+    const auto batch = std::move(pendingTombstones_);
+    pendingTombstones_.clear();
+    for (const auto& [identity, endedAt] : batch)
+        historyStore_->saveTombstone(QString::fromStdString(identity), endedAt);
 }
 
 bool AppController::isProtectedAlert(const EarthquakeEvent& e, long long clockNow) const {
@@ -1479,8 +1696,9 @@ void AppController::syncWarning() {
     emit countdownChanged();
     emit warningOverlayChanged();
     emit hudEventChanged();
-    refreshEventModel();
-    emit eventListChanged();
+    // 侧栏一律走 0 ms 合并：一次预警更新里 syncWarning 可能被连调多次（accept→sync、
+    // tick→sync、rebuildHistory→refresh），旧实现每次都整表重建 200 行。
+    scheduleDirectoryUiRefresh();
 }
 
 void AppController::recomputeEvents() {
@@ -1511,7 +1729,7 @@ void AppController::onTick() {
     const auto old = activeWarning_;
     const auto ended = sessions_.tick(now);
     for (const auto& key : ended) {
-        historyStore_->saveTombstone(QString::fromStdString(key), now);
+        queueTombstoneWrite(QString::fromStdString(key), now);
         EarthquakeEvent e = old;
         // Only the selected event owns the shared audio output.
         if (key == old.identity()) announcer_->finish(e, true);
@@ -1542,16 +1760,72 @@ void AppController::rebuildHistory() {
                   return a.timestamp > b.timestamp;
               });
     while (history_.size() > 200) history_.removeLast();
-    refreshEventModel();
+    scheduleDirectoryUiRefresh();
     // 无焦点时地图画的就是 history_[0]，列表一变就要重画。
     updateWaveTimer();
     emit mapEventChanged();
+    historyDirty_ = true;
     emit historyChanged();
-    emit eventListChanged();
 }
 
 void AppController::refreshEventModel() {
-    if (eventListModel_) eventListModel_->setEvents(eventList());
+    if (!eventListModel_) return;
+    const auto merged = mergedEvents();
+    std::vector<EventListModel::Row> rows;
+    rows.reserve(merged.size());
+    for (const auto& [event, active] : merged) rows.push_back(makeRow(event, active));
+    eventListModel_->setRows(std::move(rows));
+    focusedEventId_ = hasMapFocus_ ? QString::fromStdString(mapFocus_.identity()) : QString();
+    eventListModel_->setFocusedId(focusedEventId_);
+}
+
+EventListModel::Row AppController::makeRow(const EarthquakeEvent& event, bool active) const {
+    // 只算 delegate 真正会读的字段：文本/颜色/标注在这里一次成型，QML 侧不再做格式化。
+    EventListModel::Row row;
+    row.id = QString::fromStdString(event.identity());
+    row.location = QString::fromStdString(event.location);
+    row.source = QString::fromStdString(event.source);
+    row.magnitudeText = QString::number(event.magnitude, 'f', 1);
+    row.depthText = QString::number(event.depth, 'f', 0);
+    row.timestamp = event.timestamp;
+    row.magnitude = event.magnitude;
+    row.isActive = active;
+    // 发震时刻：与校时时钟一致，固定渲染为 UTC+8（与 HUD/事件卡的 timeText 同源）。
+    row.timeText = utc8Text(event.timestamp);
+    const QString provider = QString::fromStdString(event.sourceProvider);
+    const QString agency = QString::fromStdString(event.sourceAgency);
+    row.sourceTag = agency.isEmpty() ? provider : provider + QStringLiteral("·") + agency;
+
+    const bool hasDistance = event.distanceKm >= 0.0;
+    row.hasDistance = hasDistance;
+    row.distance = hasDistance ? event.distanceKm : -1.0;
+
+    // 列表徽章：固定展示「震源最大烈度」（震中当地量），不随定位变化。
+    const QString maxText = QString::fromStdString(event.maxIntensityText);
+    const bool hasMaxIntensity = event.maxIntensityRaw > 0.0 || !maxText.isEmpty();
+    double listRaw = event.maxIntensityRaw;
+    QString listText = maxText;
+    if (!hasMaxIntensity) {
+        // 源报缺失时在震中（距离 0）按衰减关系估算，保证列表总有可读烈度。
+        listRaw = IntensityCalculator::rawCsis(event.magnitude, 0.0, event.depth);
+        listText = settings_->intensityStandard() == 1
+                       ? QString::fromStdString(
+                             IntensityCalculator::formatJma(event.magnitude, 0.0, event.depth))
+                       : QString::fromStdString(IntensityCalculator::formatCsis(listRaw));
+    }
+    row.intensity = listText.isEmpty() ? QStringLiteral("--") : listText;
+    row.intensityLabel = QStringLiteral("最大烈度");
+    row.intensityColor = SeismicColors::intensityColor(listRaw).name();
+    row.levelTag = QString::fromLatin1(warningTag(event.warningLevel));
+    return row;
+}
+
+void AppController::syncEventModelFocus() {
+    if (!eventListModel_) return;
+    const QString focused = hasMapFocus_ ? QString::fromStdString(mapFocus_.identity()) : QString();
+    if (focused == focusedEventId_) return;
+    focusedEventId_ = focused;
+    eventListModel_->setFocusedId(focused);
 }
 
 void AppController::scheduleDirectoryUiRefresh() {

@@ -84,7 +84,7 @@ Item {
                 reuseItems: true
                 model: app.eventModel
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                delegate: EventTile { width: ListView.view.width; theme: root.theme; event: model.event }
+                delegate: EventTile { width: ListView.view.width; theme: root.theme }
                 Column {
                     anchors.centerIn: parent
                     width: parent.width - 32

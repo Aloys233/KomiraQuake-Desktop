@@ -230,10 +230,12 @@ Item {
     // 没必要再补一段收缩动画，也不必担心残值被下一个事件继承。
     // 不按 hasFocus 门控：切换焦点时半径已是当前值，重新聚焦不会出现"从0 涨出来"的动画。
     readonly property bool waveSmoothing: !theme.reduceMotion && root.visible
-    readonly property bool wavePActive: (app.waveRadii.pKm || 0) > 0
-    readonly property bool waveSActive: (app.waveRadii.sKm || 0) > 0
-    property real wavePKmShown: Math.max(0, app.waveRadii.pKm || 0)
-    property real waveSKmShown: Math.max(0, app.waveRadii.sKm || 0)
+    // 半径来自 5 个独立标量属性（app.wavePKm 等），不是一张每次 tick 重建的
+    // QVariantMap：旧写法让这 4 个绑定 + 3 个圆/渐变的属性在每帧都整体重绑。
+    readonly property bool wavePActive: app.wavePKm > 0
+    readonly property bool waveSActive: app.waveSKm > 0
+    property real wavePKmShown: Math.max(0, app.wavePKm)
+    property real waveSKmShown: Math.max(0, app.waveSKm)
     Behavior on wavePKmShown {
         enabled: root.waveSmoothing && root.wavePActive
         NumberAnimation { duration: root.followSmoothMs; easing.type: Easing.Linear }
@@ -353,7 +355,7 @@ Item {
         const x = projX(shiftedHypo.lon, 0);
         const y = projY(shiftedHypo.lat, 0);
         // 取景必须读**平滑后**的半径（wavePKmShown），与实际画出来的圆同源。
-        // 读 app.waveRadii 的原始值会让镜头永远比看到的圆宽一圈，zoom 曲线也自带噪声。
+        // 读 app.wavePKm 的原始值会让镜头永远比看到的圆宽一圈，zoom 曲线也自带噪声。
         // 波前很小（t≈0）时保底 100 km；P/S 全部隐藏（历史事件/已淡出）时固定 300 km。
         const pKm = root.wavePKmShown;
         const sKm = root.waveSKmShown;
@@ -416,7 +418,7 @@ Item {
     Connections {
         target: app
         function onWaveRadiiChanged() {
-            const hasWaves = (app.waveRadii.pKm || 0) > 0 || (app.waveRadii.sKm || 0) > 0;
+            const hasWaves = app.wavePKm > 0 || app.waveSKm > 0;
             if (hasWaves) {
                 root.cancelEventEndReset();
                 if (!root.wavesShown) {
@@ -960,10 +962,10 @@ Item {
     Rectangle {
         id: pWaveRing
         objectName: "pWaveRing"
-        readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.pKm : -1
+        readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.wavePKm : -1
         z: 2
         visible: radiusKm > 0 && app.settings.showWavefront
-        opacity: app.waveRadii.pOpacity === undefined ? 0 : app.waveRadii.pOpacity
+        opacity: app.wavePOpacity
         x: root.hypocenterX - width / 2
         y: root.hypocenterY - height / 2
         width: Math.max(2, 2 * root.wavePKmShown * root.pxPerKmValue)
@@ -979,8 +981,8 @@ Item {
     Shape {
         id: sWaveFill
         objectName: "sWaveFill"
-        readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.sKm : -1
-        readonly property real fillOpacity: app.waveRadii.sFillOpacity === undefined ? 0 : app.waveRadii.sFillOpacity
+        readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveSKm : -1
+        readonly property real fillOpacity: app.waveSFillOpacity
         z: 2
         visible: radiusKm > 0 && fillOpacity > 0 && app.settings.showWavefront
         opacity: fillOpacity
@@ -1015,10 +1017,10 @@ Item {
     Rectangle {
         id: sWaveRing
         objectName: "sWaveRing"
-        readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveRadii.sKm : -1
+        readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveSKm : -1
         z: 2
         visible: radiusKm > 0 && app.settings.showWavefront
-        opacity: app.waveRadii.sOpacity === undefined ? 0 : app.waveRadii.sOpacity
+        opacity: app.waveSOpacity
         x: root.hypocenterX - width / 2
         y: root.hypocenterY - height / 2
         width: Math.max(2, 2 * root.waveSKmShown * root.pxPerKmValue)
@@ -1117,6 +1119,21 @@ Item {
         const marker = app.sourceEstimateMarker;
         return marker && marker.markers && marker.markers.length ? marker.markers : [];
     }
+    /// 四个推定震中的**纠偏后坐标**，一次算好按 id 索引。
+    ///
+    /// 旧写法在每个标记的 x/y 绑定里各调一次 `root.shiftCoord(lat, lon)`（共 8 次/更新），
+    /// 而 shiftCoord 在国内会跨 C++ 边界做一次 GCJ-02 迭代换算 —— 每秒刷新一次载荷时
+    /// 就是 8 次多余的边界调用 + 8 个临时对象。
+    readonly property var estimateShifted: {
+        const list = estimateMarkers;
+        const out = ({});
+        for (let i = 0; i < list.length; ++i) {
+            const m = list[i];
+            if (!m || m.latitude === undefined) continue;
+            out[m.id] = root.shiftCoord(m.latitude, m.longitude);
+        }
+        return out;
+    }
     function estimateMarker(regionId) {
         const list = estimateMarkers;
         for (let i = 0; i < list.length; ++i) {
@@ -1136,8 +1153,8 @@ Item {
         kmPerPixel: root.pxPerKmValue
         visible: active && !!app.settings.showEstimatedEpicenter
         z: 4
-        x: root.screenX(root.shiftCoord(lat, lon).lon) - width / 2
-        y: root.screenY(root.shiftCoord(lat, lon).lat) - height / 2
+        // 纠偏结果由 estimateShifted 统一算一次（见那里的注释），不再每个绑定各调一次。
+        shifted: root.estimateShifted["china"] || ({ lat: 0, lon: 0 })
     }
     EstimateMarker {
         info: root.estimateMarker("japan")
@@ -1147,8 +1164,7 @@ Item {
         kmPerPixel: root.pxPerKmValue
         visible: active && !!app.settings.showEstimatedEpicenter
         z: 4
-        x: root.screenX(root.shiftCoord(lat, lon).lon) - width / 2
-        y: root.screenY(root.shiftCoord(lat, lon).lat) - height / 2
+        shifted: root.estimateShifted["japan"] || ({ lat: 0, lon: 0 })
     }
     EstimateMarker {
         info: root.estimateMarker("korea")
@@ -1158,8 +1174,7 @@ Item {
         kmPerPixel: root.pxPerKmValue
         visible: active && !!app.settings.showEstimatedEpicenter
         z: 4
-        x: root.screenX(root.shiftCoord(lat, lon).lon) - width / 2
-        y: root.screenY(root.shiftCoord(lat, lon).lat) - height / 2
+        shifted: root.estimateShifted["korea"] || ({ lat: 0, lon: 0 })
     }
     EstimateMarker {
         info: root.estimateMarker("taiwan")
@@ -1169,8 +1184,7 @@ Item {
         kmPerPixel: root.pxPerKmValue
         visible: active && !!app.settings.showEstimatedEpicenter
         z: 4
-        x: root.screenX(root.shiftCoord(lat, lon).lon) - width / 2
-        y: root.screenY(root.shiftCoord(lat, lon).lat) - height / 2
+        shifted: root.estimateShifted["taiwan"] || ({ lat: 0, lon: 0 })
     }
 
     // ---- 测站悬停浮层 ----------------------------------------------------
