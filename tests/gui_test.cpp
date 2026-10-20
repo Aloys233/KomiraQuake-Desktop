@@ -448,6 +448,77 @@ private slots:
             QVERIFY2(!warning.contains("recursive rearrange"), qPrintable(warning));
     }
 
+    // 启动瞬间必须可交互：冷启动路径也要像托盘恢复那样把焦点拿过来。
+    //
+    // 缺陷原状：窗口由 QML 的 `visible: !app.startHidden` 自己显示，Qt 不会替我们
+    // requestActivate()。在 click-to-focus 的 WM 下，点一个未聚焦窗口的第一次点击
+    // 会被 WM 吃掉用于抬起窗口，应用收不到，表现为「刚出来的一瞬间点不动」。
+    // main.cpp 的 presentWindow（托盘/预警）一直是 show+raise+requestActivate，
+    // 冷启动这条一直漏着。
+    //
+    // 这条用例锁两件事：
+    //  1. Main.qml 里确实存在启动期的 raise + requestActivate（按源码断言，因为
+    //     offscreen 平台会自动激活窗口，行为断言测不出差别 —— 见下一条注释）。
+    //  2. 「等就绪再显示窗口」这条错误修法不会被误引入：从未 show 过的窗口
+    //     contentItem 恒为 0x0，Qt 不给隐藏窗口派发布局，那样会永久等待。
+    void startupClaimsFocusAndWindowMustBeShownToLayOut() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("StartupFocusTest");
+        AppController controller(nullptr, false);
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        // 1) 启动期拿焦点的那两下必须写在 QML 里，且真的被 Component.onCompleted 调用。
+        //    只查「字符串存在」是不够的：函数定义本身也含 claimFocus()，会把
+        //    「定义了但没人调」当成通过（这条断言自己就踩过，见提交记录）。
+        QFile mainQml(QStringLiteral(KOMIRA_SOURCE_DIR "/qml/Main.qml"));
+        QVERIFY2(mainQml.open(QIODevice::ReadOnly), "读不到 qml/Main.qml");
+        const QString source = QString::fromUtf8(mainQml.readAll());
+        QVERIFY2(source.contains(QStringLiteral("requestActivate()")),
+                 "Main.qml 缺少启动期的 requestActivate()：未聚焦窗口的第一次点击"
+                 "会被窗口管理器吃掉，表现为启动瞬间点不动");
+        QVERIFY2(source.contains(QStringLiteral("window.raise()")),
+                 "Main.qml 缺少启动期的 raise()");
+        // 取 Component.onCompleted 的**函数体**，要求 claimFocus() 出现在这段花括号里。
+        // 必须带冒号：正文注释里也写着「在 Component.onCompleted 里 resize …」，
+        // 只按 `Component.onCompleted` 找会命中那句注释，然后取到相邻函数的函数体，
+        // 断言就永远为假（这条断言自己踩过这个坑）。
+        const int completedAt = source.indexOf(QStringLiteral("Component.onCompleted:"));
+        QVERIFY(completedAt >= 0);
+        const int bodyOpen = source.indexOf(QLatin1Char('{'), completedAt);
+        QVERIFY(bodyOpen > completedAt);
+        int depth = 0, bodyEnd = -1;
+        for (int i = bodyOpen; i < source.size(); ++i) {
+            if (source.at(i) == QLatin1Char('{')) ++depth;
+            else if (source.at(i) == QLatin1Char('}') && --depth == 0) { bodyEnd = i; break; }
+        }
+        QVERIFY(bodyEnd > bodyOpen);
+        const QString completedBody = source.mid(bodyOpen, bodyEnd - bodyOpen);
+        QVERIFY2(completedBody.contains(QStringLiteral("claimFocus()")),
+                 "claimFocus() 定义了但 Component.onCompleted 没有调用它 —— "
+                 "冷启动仍然拿不到焦点");
+
+        // 2) 反证：从未 show 过的窗口不会布局，所以不能改成「等就绪再 show」。
+        QQuickWindow neverShown;
+        neverShown.setColor(Qt::transparent);
+        neverShown.resize(400, 300);
+        QTest::qWait(80);
+        QVERIFY2(!neverShown.isVisible(), "前提失效：窗口不该是可见的");
+        QCOMPARE(neverShown.contentItem()->width(), 0.0);
+        QCOMPARE(neverShown.contentItem()->height(), 0.0);
+    }
+
     // 托盘闪烁必须与通知 / 音效 / HUD 同门槛：未达本地烈度过滤的预警级事件
     // 只展示、不闪托盘（曾只按 levelTag 判断，导致全球任意 M4.5+ 都闪红）。
     void trayBlinkRespectsLocalIntensityFilter() {

@@ -97,7 +97,29 @@ ApplicationWindow {
         window.x = Math.round(Math.max(Screen.virtualX, Screen.virtualX + (screenW - window.width) / 2))
         window.y = Math.round(Math.max(Screen.virtualY, Screen.virtualY + (screenH - window.height) / 2))
     }
-    Component.onCompleted: { centerOnScreen(); applyDefaultView(); app.setWindowVisible(window.visible) }
+    // 启动瞬间必须可交互：窗口一出现就拿焦点。
+    //
+    // 冷启动时窗口是 QML 自己 visible 出来的（见文件开头的 visible 绑定），Qt 不会
+    // 替我们 requestActivate()。在 click-to-focus 的窗口管理器下，点一个**未聚焦**
+    // 窗口的第一次点击会被 WM 吃掉，用于抬起并聚焦该窗口，应用收不到那次 click ——
+    // 用户感受就是「窗口刚出来的一瞬间点不动，再点一下才正常」。
+    // 托盘点恢复与预警置顶那条路径（main.cpp 的 presentWindow）一直是
+    // show + raise + requestActivate，冷启动这条一直漏着。
+    //
+    // 不要改成「等首帧/等布局完成再显示窗口」：实测从未 show 过的窗口 contentItem
+    // 恒为 0x0（Qt 不给隐藏窗口派发布局），而 mapLoader 又绑在 window.visible 上，
+    // 等就绪是死路。窗口必须照常立刻显示，只是要顺手把焦点拿过来。
+    function claimFocus() {
+        if (!visible) return
+        window.raise()
+        window.requestActivate()
+    }
+    Component.onCompleted: {
+        centerOnScreen()
+        applyDefaultView()
+        app.setWindowVisible(window.visible)
+        claimFocus()
+    }
     Connections {
         target: app
         function onLocationChanged() { window.applyDefaultView(); }
