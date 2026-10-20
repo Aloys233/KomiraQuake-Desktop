@@ -15,10 +15,13 @@ Item {
     property bool live: true
     /// 模糊核半径。0 表示退化为「只做半透明底衬」。
     ///
-    /// 拖动/缩放时是 11 张玻璃卡同时挂 ShaderEffectSource + MultiEffect 采样整块地图，
-    /// 模糊成本随 blurMax 线性上升；而相机移动中背景本身在飞，用户分辨不出模糊质量。
-    /// 因此移动时降到 32（看起来仍是磨砂玻璃），静止后回到 64。
-    readonly property int blurRadius: root.live ? 32 : 64
+    /// 恒为 64（全模糊），**不要**再按 `live` 降档。e0d8262（2026-10-19）曾把相机
+    /// 移动时的 blurMax 降到 32、静止才回 64；用户实测反馈「拖动时模糊会关掉一会」——
+    /// 且这不只是 32/64 的观感差异：blurRadius 同时决定 padding，padding 又参与
+    /// sourceRect/textureSize，每次起停拖动都要重建采样纹理，重新分配的那几帧读不到
+    /// 背景，看起来就是模糊被短暂关掉。后续 GPU 矢量层把拖动帧时从 81 ms 压到 22 ms，
+    /// 这里已经没有省的必要。移动与静止的唯一区别只剩 `live`：是否逐帧重采样。
+    readonly property int blurRadius: 64
     // Keep the sample margin at least as wide as the full blur kernel.
     readonly property real padding: blurRadius
     clip: true
