@@ -36,10 +36,19 @@ Column {
     SettingsSection {
         width: parent.width; theme: root.theme; title: "开发者"; iconName: "sliders-horizontal"
         GlassSwitch {
+            id: devModeToggle
             objectName: "devModeSwitch"
             width: parent.width; theme: root.theme; text: "开发者模式"
-            description: "显示模拟数据源。"
-            checked: app.settings.developerMode
+            description: "显示模拟数据源与尚未标定的推算区域。"
+            checked: false
+            // 与「震源推算」分区同一条纪律：用户点按会断开字面 `checked:` 绑定，
+            // 之后设置再变开关就不动了。Binding + RestoreBindingOrValue 保证反向同步。
+            Binding {
+                target: devModeToggle
+                property: "checked"
+                value: app.settings.developerMode
+                restoreMode: Binding.RestoreBindingOrValue
+            }
             onToggled: app.settings.developerMode = checked
         }
     }

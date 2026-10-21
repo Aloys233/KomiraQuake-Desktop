@@ -100,6 +100,34 @@ QString SettingsStore::sourceEstimationRegionLabel(const QString& region) const 
     return QString::fromUtf8(sourceRegionLabel(resolved));
 }
 
+bool SettingsStore::isSourceEstimationRegionAvailable(const QString& region) const {
+    SourceRegion resolved;
+    if (!resolveRegion(region, &resolved)) return false;
+    // 只有日本区的算法在真实台网上标定过（§17.6 到时反演）；中国 / 韩国 / 台湾 的
+    // 强度场路径仍是待标定状态，默认不开放，开发者模式才放出来。
+    return resolved == SourceRegion::Japan || developerMode();
+}
+
+QVariantMap SettingsStore::sourceEstimationRegionParams() const {
+    QVariantMap out;
+    for (const SourceRegion region : sourceRegions()) {
+        const QString id = QString::fromLatin1(sourceRegionId(region));
+        QVariantMap row;
+        row["label"] = sourceEstimationRegionLabel(id);
+        row["trigger"] = sourceEstimationTriggerFor(id);
+        row["minStations"] = sourceEstimationMinStationsFor(id);
+        row["quietEvidence"] = sourceEstimationQuietEvidenceFor(id);
+        row["clusterRadius"] = sourceEstimationClusterRadiusFor(id);
+        // 生效开关：不可用区域（非开发者模式下的中国 / 韩国 / 台湾）恒为关，
+        // 与签名、服务层口径一致。
+        row["enabled"] = isSourceEstimationRegionEnabled(id)
+                         && isSourceEstimationRegionAvailable(id);
+        row["available"] = isSourceEstimationRegionAvailable(id);
+        out[id] = row;
+    }
+    return out;
+}
+
 double SettingsStore::sourceEstimationTriggerFor(const QString& region) const {
     SourceRegion resolved;
     if (!resolveRegion(region, &resolved)) return sourceRegionDefaults(SourceRegion::China).trigger;
@@ -195,6 +223,7 @@ void SettingsStore::resetSourceEstimationRegion(const QString& region) {
     if (touched) {
         emit changed();
         emit sourceEstimationRegionParamsChanged();
+        emit sourceEstimationRegionStateChanged();
     }
 }
 
@@ -261,12 +290,19 @@ void SettingsStore::emitKeyChanged(const QString& key) {
     // 区域参数是复合键（`sourceEstimation.<region>.<field>`），统一走一个信号。
     if (isRegionParamKey(key)) {
         emit sourceEstimationRegionParamsChanged();
+        emit sourceEstimationRegionStateChanged();
         return;
     }
     const auto& entries = keySignals();
     for (const auto& entry : entries) {
         if (key == QLatin1String(entry.key)) {
             (this->*entry.signal)();
+            // 区域状态快照同时覆盖区域参数、启用集合与可用性（开发者模式），
+            // 三者的变化都要让 QML 的逐区绑定重算。
+            if (key == QLatin1String("enabledSourceEstimationRegions")
+                || key == QLatin1String("developerMode")) {
+                emit sourceEstimationRegionStateChanged();
+            }
             return;
         }
     }
@@ -276,5 +312,6 @@ void SettingsStore::emitKeyChanged(const QString& key) {
 void SettingsStore::emitAllChanged() {
     for (const auto& entry : keySignals()) (this->*entry.signal)();
     emit sourceEstimationRegionParamsChanged();
+    emit sourceEstimationRegionStateChanged();
 }
 } // namespace komira

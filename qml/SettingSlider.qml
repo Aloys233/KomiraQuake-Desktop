@@ -34,6 +34,7 @@ Item {
                 elide: Text.ElideRight
             }
             Text {
+                objectName: root.objectName.length > 0 ? root.objectName + "-value" : ""
                 text: root.valueText
                 color: root.theme.textPrimary
                 font.family: root.theme.numberFamily
@@ -42,19 +43,36 @@ Item {
         }
 
         GlassSlider {
+            id: control
+            objectName: root.objectName.length > 0 ? root.objectName + "-control" : ""
             Layout.fillWidth: true
             theme: root.theme
             enabled: root.active
             from: root.from
             to: root.to
             stepSize: root.stepSize
-            value: root.value
             Accessible.name: root.title
             // 拖动时逐帧提交，但**每次只写这一个键**：AppController 现在按项接线
             // （见 wireSettings()），音量滑块只改 QAudioOutput 音量，不再连带重推
             // 数据源、重算全表烈度、重建测站元数据。SettingsStore::set() 自身
             // 对「值没变」也会早退，因此同一档位重复拖动不产生任何写入。
-            onMoved: root.moved(value)
+            //
+            // `moved()` 是无参信号（见 QtQuick.Controls 的 Slider），所以这里不能写成
+            // `onMoved: value => ...`：那个参数名会**遮蔽** Slider 自己的 `value` 属性，
+            // 处理器体里读到的就是被遮蔽的那个（恒为 undefined）。
+            onMoved: root.moved(control.value)
+        }
+
+        // 滑块值**单向**由 root.value（即设置项）驱动。必须用 Binding 而不是字面
+        // `value: root.value`：用户拖动会向 control.value 写值，QML 的破坏性绑定语义
+        // 会**断开**字面绑定，此后设置再变滑块也不动（表现为「拖完滑块，数值文本不变」
+        // 「恢复默认后滑块停在上次手拖的位置」）。RestoreBindingOrValue 让 root.value
+        // 一变就重新夺回控制权。
+        Binding {
+            target: control
+            property: "value"
+            value: root.value
+            restoreMode: Binding.RestoreBindingOrValue
         }
 
         Text {
@@ -71,7 +89,9 @@ Item {
     property real from: 0
     property real to: 1
     property real stepSize: 0.05
-    /// 由 GlassSlider 的 onMoved 回写，避免与 `value` 形成绑定环。
+    /// 当前值，由调用方绑定到设置项。拖动只经 `moved` 回报、**不回写本属性**：
+    /// 回写会断开调用方的绑定，设置项就不再是唯一真值（同一个值存在两份、还可能与
+    /// 设置里的实际值不同）。
     property real value: 0
     signal moved(real value)
 }

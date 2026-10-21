@@ -2043,7 +2043,9 @@ private slots:
         controller.settings()->setLocalIntensityFilter(0.0);
         // 震源推算默认关闭（Beta），本用例专门验证它，显式打开。
         // 逐区域开关同样默认关闭：本用例要验证「中国 + 日本同屏」，两个区都打开。
+        // 中国区默认只对开发者模式开放（只有日本区在真实台网上标定过），故先开开发者模式。
         controller.settings()->setSourceEstimationEnabled(true);
+        controller.settings()->setDeveloperMode(true);
         controller.settings()->setSourceEstimationRegionEnabled("china", true);
         controller.settings()->setSourceEstimationRegionEnabled("japan", true);
         controller.setManualLocation(35.0, 139.0, "测试定位");
@@ -2318,6 +2320,10 @@ private slots:
 
         // 6. 设置页新增的「震源推算」分区可导航、控件可点击并即时落盘。
         //    此时总开关是默认的「关」，正好从关到开点一次。
+        //    中国区卡只在开发者模式显示（默认开放的只有日本区），resetToDefaults()
+        //    刚把开发者模式也清回了默认关，这里重新打开；完整的「开发者模式 → 三区显隐」
+        //    验证见 sourceEstimationSettingsControlsTakeEffect()。
+        controller.settings()->setDeveloperMode(true);
         window->setProperty("showSettings", true);
         QTRY_VERIFY(window->findChild<QQuickItem*>("settingsPage"));
         QVERIFY(clickByName(window, "settingsNav-sourceEstimation"));
@@ -2369,6 +2375,236 @@ private slots:
         controller.settings()->resetToDefaults();
         QVERIFY(!controller.settings()->sourceEstimationEnabled());
         QVERIFY(controller.settings()->showEstimatedEpicenter());
+    }
+
+    /// 回归：震源推算设置页的开关与滑块必须**真的**生效。
+    ///
+    /// 用户报的两个现象：①「开关点按有反应，但没作用 —— 打开开关，下面滑动条依然是灰的；
+    /// 拖动滑动条，数值不变」；②「中国 / 韩国 / 台湾区域只有开发者模式才显示」。
+    ///
+    /// ① 有两个独立根因，本用例各钉一条：
+    ///   · **依赖**：逐区数值原先直接绑在 Q_INVOKABLE 上（`sourceEstimationTriggerFor(region)`
+    ///     等），QML 只跟踪属性读取、不跟踪函数调用，函数返回值变了绑定也不会重算 ——
+    ///     于是「开关点开了，滑块还是灰的、数值文本停在旧值」。现在统一读
+    ///     `sourceEstimationRegionParams` 快照（Q_PROPERTY）。
+    ///   · **破坏性绑定**：`SettingSlider` 里 `value: root.value` 是字面绑定，用户拖动会向
+    ///     滑块写值、从而断开它，之后设置再变滑块也不动。改用
+    ///     `Binding { restoreMode: RestoreBindingOrValue }`。
+    ///   另外 `Slider.moved()` 是**无参**信号，原先的 `onMoved: value => …` 里那个参数名
+    ///   遮蔽了 Slider 自己的 `value` 属性。
+    ///
+    /// ② 由 `SettingsStore::isSourceEstimationRegionAvailable` 统一判定（服务层同一判据）：
+    /// 只有日本区在真实台网上标定过，其余三区默认不开放、开发者模式才放出来。
+    void sourceEstimationSettingsControlsTakeEffect() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("SourceEstimationSettingsTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setEnableSoundAlert(false);
+        QQmlApplicationEngine engine;
+        QStringList qmlWarnings;
+        connect(&engine, &QQmlEngine::warnings, this, [&](const QList<QQmlError>& warnings) {
+            for (const auto& warning : warnings) qmlWarnings.append(warning.toString());
+        });
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        const QString evidence = evidenceDirectory(window);
+        auto screenshot = [&](const QString& name) {
+            QTest::qWait(150);
+            return window->grabWindow().save(evidence + "/" + name + ".png");
+        };
+        window->setProperty("showSettings", true);
+        auto* page = window->findChild<QQuickItem*>("settingsPage");
+        QVERIFY(page);
+        QTRY_VERIFY(clickByName(window, "settingsNav-sourceEstimation"));
+        QTRY_COMPARE(page->property("currentSection").toInt(), 5);
+
+        auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
+        QVERIFY(scroll);
+        // 把控件滚到视口内再操作：命中判定与用户视角一致（裁剪之外的点不点）。
+        const auto scrollTo = [&](QQuickItem* item) {
+            QVERIFY(item);
+            const QPointF inFlick =
+                item->mapToItem(scroll, QPointF(item->width() / 2, item->height() / 2));
+            const qreal desired = scroll->height() * 0.45;
+            scroll->setProperty("contentY",
+                                scroll->property("contentY").toReal() + inFlick.y() - desired);
+            QTest::qWait(120);
+        };
+
+        // ---- ② 默认只显示日本区，其余三区要开发者模式 ----
+        auto* chinaCard = findVisualItem(window, "chinaRegionCard");
+        auto* japanCard = findVisualItem(window, "japanRegionCard");
+        auto* koreaCard = findVisualItem(window, "koreaRegionCard");
+        auto* taiwanCard = findVisualItem(window, "taiwanRegionCard");
+        QVERIFY(chinaCard && japanCard && koreaCard && taiwanCard);
+        QVERIFY(!controller.settings()->developerMode());
+        QVERIFY2(!chinaCard->isVisible(), "中国区默认不该出现");
+        QVERIFY2(!koreaCard->isVisible(), "韩国区默认不该出现");
+        QVERIFY2(!taiwanCard->isVisible(), "台湾区默认不该出现");
+        QVERIFY2(japanCard->isVisible(), "日本区必须始终可见");
+        // 快照里同样要标出「不开放」：服务层与 UI 用同一份判据。
+        {
+            const QVariantMap params =
+                controller.settings()->sourceEstimationRegionParams();
+            QCOMPARE(params.value("china").toMap().value("available").toBool(), false);
+            QCOMPARE(params.value("korea").toMap().value("available").toBool(), false);
+            QCOMPARE(params.value("taiwan").toMap().value("available").toBool(), false);
+            QCOMPARE(params.value("japan").toMap().value("available").toBool(), true);
+        }
+        QVERIFY(screenshot("43c-settings-source-estimation-default-regions"));
+
+        // 打开开发者模式（走真实开关：它自己也是「点按后绑定断掉」的同类隐患）。
+        QVERIFY(clickByName(window, "settingsNav-about"));
+        QTRY_COMPARE(page->property("currentSection").toInt(), 8);
+        auto* devSwitch = findVisualItem(window, "devModeSwitch");
+        QVERIFY(devSwitch);
+        scrollTo(devSwitch);
+        QVERIFY(clickByName(window, "devModeSwitch"));
+        QTRY_VERIFY(controller.settings()->developerMode());
+        QVERIFY(devSwitch->property("checked").toBool());
+        QVERIFY(clickByName(window, "settingsNav-sourceEstimation"));
+        QTRY_COMPARE(page->property("currentSection").toInt(), 5);
+        QTRY_VERIFY(chinaCard->isVisible());
+        QTRY_VERIFY(koreaCard->isVisible());
+        QTRY_VERIFY(taiwanCard->isVisible());
+        QVERIFY(screenshot("43d-settings-source-estimation-dev-regions"));
+
+        // ---- ① 开关与滑块 ----
+        // 总开关：开着的时候，没启用的区域开关仍然要能点（它自己不受本区开关门控）。
+        auto* masterSwitch = findVisualItem(window, "sourceEstimationSwitch");
+        QVERIFY(masterSwitch);
+        scrollTo(masterSwitch);
+        QVERIFY(!controller.settings()->sourceEstimationEnabled());
+        QVERIFY(clickByName(window, "sourceEstimationSwitch"));
+        QTRY_VERIFY(controller.settings()->sourceEstimationEnabled());
+        QVERIFY(masterSwitch->property("checked").toBool());
+
+        auto* triggerControl = findVisualItem(window, "chinaTriggerSlider-control");
+        auto* triggerValue = findVisualItem(window, "chinaTriggerSlider-value");
+        QVERIFY(triggerControl && triggerValue);
+        // 本区还没启用：滑块必须是灰的（`active` 叠加了本区开关）。
+        QVERIFY2(!triggerControl->isEnabled(), "未启用的区域，参数控件必须是灰的");
+        QCOMPARE(triggerValue->property("text").toString(), QStringLiteral("3.0 度"));
+
+        auto* chinaSwitch = findVisualItem(window, "chinaRegionSwitch");
+        QVERIFY(chinaSwitch);
+        scrollTo(chinaSwitch);
+        QVERIFY(clickByName(window, "chinaRegionSwitch"));
+        QTRY_VERIFY(controller.settings()->isSourceEstimationRegionEnabled("china"));
+        // 这正是用户报的「打开开关，下面滑动条依然是灰色」：开关一开，整卡必须立刻可用。
+        QTRY_VERIFY2(triggerControl->isEnabled(), "区域开关打开后，参数控件必须立刻可用");
+        QVERIFY(chinaCard->property("opacity").toReal() > 0.99);
+
+        // 拖动滑块：设置必须跟着变，且数值文本跟着刷新。
+        const auto dragTrigger = [&](qreal fraction) {
+            auto* handle = triggerControl->property("handle").value<QQuickItem*>();
+            QVERIFY(handle);
+            const QPointF from = handle->mapToScene(QPointF(handle->width() / 2,
+                                                            handle->height() / 2));
+            const QPointF to = from + QPointF(triggerControl->width() * fraction, 0);
+            const QRectF bounds(0, 0, window->width(), window->height());
+            QVERIFY2(bounds.contains(from) && bounds.contains(to), "滑块必须完整落在视口内");
+            QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, from.toPoint());
+            QTest::mouseMove(window, to.toPoint());
+            QTest::qWait(30);
+            QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, to.toPoint());
+        };
+        const double before = controller.settings()->sourceEstimationTriggerFor("china");
+        scrollTo(triggerControl);
+        dragTrigger(0.35);
+        QTRY_VERIFY(controller.settings()->sourceEstimationTriggerFor("china") > before);
+        const double after = controller.settings()->sourceEstimationTriggerFor("china");
+        QCOMPARE(triggerValue->property("text").toString(),
+                 QString::number(after, 'f', 1) + QStringLiteral(" 度"));
+        // 滑块自己的值也要回到设置项上（Binding 而不是被拖断的字面绑定）。
+        QTRY_COMPARE(triggerControl->property("value").toDouble(), after);
+        // 反向：改设置（例如「恢复本区默认参数」）必须把滑块拉回去。
+        QVERIFY(clickByName(window, "chinaResetButton"));
+        QTRY_COMPARE(controller.settings()->sourceEstimationTriggerFor("china"), 3.0);
+        QTRY_COMPARE(triggerControl->property("value").toDouble(), 3.0);
+        QTRY_COMPARE(triggerValue->property("text").toString(), QStringLiteral("3.0 度"));
+
+        // 其余两个滑块同样要能拖动（「最少触发测站」「触发区合并距离」）。
+        auto* minControl = findVisualItem(window, "chinaMinStationsSlider-control");
+        auto* radiusControl = findVisualItem(window, "chinaClusterRadiusSlider-control");
+        QVERIFY(minControl && radiusControl);
+        scrollTo(minControl);
+        QVERIFY(minControl->isEnabled());
+        {
+            const QPointF from = minControl->mapToScene(QPointF(minControl->width() / 2,
+                                                               minControl->height() / 2));
+            QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, from.toPoint());
+            QTest::mouseMove(window, (from + QPointF(minControl->width() * 0.3, 0)).toPoint());
+            QTest::qWait(30);
+            QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier,
+                                (from + QPointF(minControl->width() * 0.3, 0)).toPoint());
+        }
+        QTRY_VERIFY(controller.settings()->sourceEstimationMinStationsFor("china") != 6);
+        scrollTo(radiusControl);
+        QVERIFY(radiusControl->isEnabled());
+        {
+            const QPointF from = radiusControl->mapToScene(QPointF(radiusControl->width() / 2,
+                                                                   radiusControl->height() / 2));
+            QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, from.toPoint());
+            QTest::mouseMove(window, (from + QPointF(radiusControl->width() * 0.3, 0)).toPoint());
+            QTest::qWait(30);
+            QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier,
+                                (from + QPointF(radiusControl->width() * 0.3, 0)).toPoint());
+        }
+        QTRY_VERIFY(controller.settings()->sourceEstimationClusterRadiusFor("china") != 250);
+
+        // 「结果保留时长」滑块只受总开关门控（与区域无关），也要能动。
+        auto* holdControl = findVisualItem(window, "holdSecondsSlider-control");
+        QVERIFY(holdControl);
+        scrollTo(holdControl);
+        QVERIFY(holdControl->isEnabled());
+        {
+            const QPointF from = holdControl->mapToScene(QPointF(holdControl->width() / 2,
+                                                                 holdControl->height() / 2));
+            QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, from.toPoint());
+            QTest::mouseMove(window, (from + QPointF(holdControl->width() * 0.25, 0)).toPoint());
+            QTest::qWait(30);
+            QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier,
+                                (from + QPointF(holdControl->width() * 0.25, 0)).toPoint());
+        }
+        QTRY_VERIFY(controller.settings()->sourceEstimationHoldSeconds() != 60);
+        QVERIFY(screenshot("43e-settings-source-estimation-sliders"));
+
+        // 关掉总开关：整卡参数控件一起变灰（依赖链要真的传下去）。
+        scrollTo(masterSwitch);
+        QVERIFY(clickByName(window, "sourceEstimationSwitch"));
+        QTRY_VERIFY(!controller.settings()->sourceEstimationEnabled());
+        QTRY_VERIFY(!triggerControl->isEnabled());
+
+        // 退出开发者模式：中国 / 韩国 / 台湾三张卡必须重新隐藏，且**不再生效**。
+        QVERIFY(clickByName(window, "settingsNav-about"));
+        QTRY_COMPARE(page->property("currentSection").toInt(), 8);
+        scrollTo(devSwitch);
+        QVERIFY(clickByName(window, "devModeSwitch"));
+        QTRY_VERIFY(!controller.settings()->developerMode());
+        QVERIFY(clickByName(window, "settingsNav-sourceEstimation"));
+        QTRY_COMPARE(page->property("currentSection").toInt(), 5);
+        QTRY_VERIFY(!chinaCard->isVisible());
+        QTRY_VERIFY(!koreaCard->isVisible());
+        QTRY_VERIFY(!taiwanCard->isVisible());
+        QVERIFY(japanCard->isVisible());
+        // 可用性变化必须让服务层也停掉那三区：签名只含生效区域。
+        QCOMPARE(controller.settings()->sourceEstimationRegionSignature(), QString());
+        QVERIFY(!controller.settings()->sourceEstimationRegionActive());
+        controller.settings()->setSourceEstimationRegionEnabled("japan", true);
+        QCOMPARE(controller.settings()->sourceEstimationRegionSignature(),
+                 QStringLiteral("japan"));
+        QVERIFY(controller.settings()->sourceEstimationRegionActive());
+        QVERIFY2(qmlWarnings.isEmpty(), qPrintable(qmlWarnings.join('\n')));
     }
 
     /// 回归：CSIS/KMA 方标里的烈度数字必须画在**视觉中心**。

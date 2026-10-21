@@ -95,9 +95,11 @@ SourceEstimationService::SourceEstimationService(SettingsStore* settings, QObjec
         region.quietEvidence = defaults.quietEvidence;
         region.clusterRadiusKm = defaults.clusterRadiusKm;
         // 逐区开关默认关闭：由 syncConfig() 从设置里读，未启用就一直停摆。
-        region.enabled = settings_ ? settings_->isSourceEstimationRegionEnabled(
-                                         QString::fromLatin1(sourceRegionId(region.region)))
-                                   : false;
+        // 生效开关叠加可用性（非开发者模式只有日本区开放），见 syncConfig()。
+        const QString id = QString::fromLatin1(sourceRegionId(region.region));
+        region.enabled = settings_
+                         && settings_->isSourceEstimationRegionEnabled(id)
+                         && settings_->isSourceEstimationRegionAvailable(id);
         if (!region.enabled) region.state = QStringLiteral("disabled");
     }
     ticker_.setInterval(1000);
@@ -203,8 +205,11 @@ bool SourceEstimationService::syncConfig() {
             std::max(1, std::min(40, settings_->sourceEstimationMinStationsFor(id)));
         const bool quiet = settings_->sourceEstimationQuietEvidenceFor(id);
         const int cluster = std::max(50, std::min(3000, settings_->sourceEstimationClusterRadiusFor(id)));
-        // 逐区开关：关掉的区整区停摆（不记账、不算、不发布）。
-        const bool regionEnabled = settings_->isSourceEstimationRegionEnabled(id);
+        // 逐区开关：关掉的区整区停摆（不记账、不算、不发布）。**生效**开关还要叠加
+        // 可用性：中国 / 韩国 / 台湾 默认不开放（只有日本区的算法在真实台网上标定过），
+        // 开发者模式才放出来 —— 与设置页隐藏那三张卡是同一份判据。
+        const bool regionEnabled = settings_->isSourceEstimationRegionEnabled(id)
+                                   && settings_->isSourceEstimationRegionAvailable(id);
         const bool regionToggled = regionEnabled != region.enabled;
         region.enabled = regionEnabled;
         if (!regionToggled && trigger == region.trigger && minStations == region.minStations

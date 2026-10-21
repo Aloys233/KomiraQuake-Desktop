@@ -522,6 +522,9 @@ void AppController::wireSettings() {
     connect(settings_, &SettingsStore::sourceEstimationRegionParamsChanged, this, reloadEstimation);
     connect(settings_, &SettingsStore::enabledSourceEstimationRegionsChanged, this, reloadEstimation);
     connect(settings_, &SettingsStore::sourceEstimationHoldSecondsChanged, this, reloadEstimation);
+    // 开发者模式决定「中国 / 韩国 / 台湾」是否可用（可用才生效），因此它也会改变
+    // 各区的生效开关，必须同样作废旧解 —— 否则退出开发者模式后那三区仍在算。
+    connect(settings_, &SettingsStore::developerModeChanged, this, reloadEstimation);
     // 地图标记的显示开关只影响呈现，但该属性没有别的通知源：不发这一下，
     // QML 会一直停在关闭时那份 `{ visible: false }` 上，重新打开也不恢复。
     connect(settings_, &SettingsStore::showEstimatedEpicenterChanged, this,

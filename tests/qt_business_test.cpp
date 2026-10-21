@@ -779,6 +779,8 @@ private slots:
         SettingsStore settings;
         settings.setSourceEstimationEnabled(true);
         // 逐区开关默认关闭：本用例只验中国区，显式打开它。
+        // 中国区默认只对开发者模式开放（只有日本区在真实台网上标定过）。
+        settings.setDeveloperMode(true);
         settings.setSourceEstimationRegionEnabled("china", true);
         settings.setSourceEstimationMinStations(6);
         settings.setSourceEstimationTrigger(3.0);
@@ -1005,6 +1007,9 @@ private slots:
         QSettings().clear();
         SettingsStore settings;
         settings.setSourceEstimationEnabled(true);
+        // 中国 / 韩国 / 台湾三区默认只对开发者模式开放（只有日本区在真实台网上标定过），
+        // 本用例要四区同跑，先开开发者模式。
+        settings.setDeveloperMode(true);
         // 四个区都显式打开（逐区开关默认关闭）。
         for (const char* region : {"china", "japan", "korea", "taiwan"}) {
             settings.setSourceEstimationRegionEnabled(region, true);
@@ -1153,6 +1158,8 @@ private slots:
     void sourceEstimationRegionToggles() {
         QSettings().clear();
         SettingsStore settings;
+        // 本用例末尾要「重新打开中国区」，而中国区默认只对开发者模式开放。
+        settings.setDeveloperMode(true);
         QVERIFY(!settings.isSourceEstimationRegionEnabled("china"));
         QVERIFY(!settings.isSourceEstimationRegionEnabled("japan"));
         QVERIFY(!settings.hasAnySourceEstimationRegion());
@@ -1259,6 +1266,112 @@ private slots:
         QVERIFY(service.regionState(SourceRegion::China).estimate.valid);
     }
 
+    /// 区域可用性门控：中国 / 韩国 / 台湾 只有开发者模式才「可配置且生效」。
+    ///
+    /// 需求原话是「只有开启了开发者模式才显示」——显示只是表象，真正的契约是
+    /// **生效**：关掉开发者模式后，即使设置里仍留着中国区的开启标记，服务层也
+    /// 必须把它当关处理，签名里不能出现它。可用性由
+    /// `SettingsStore::isSourceEstimationRegionAvailable` 一处判定，四处共用
+    /// （QML 卡片显隐、快照 enabled/available、签名、服务层 syncConfig）。
+    void sourceEstimationRegionAvailabilityFollowsDeveloperMode() {
+        QSettings().clear();
+        SettingsStore settings;
+        settings.setSourceEstimationEnabled(true);
+
+        // 日本区永远可用；其余三区默认不可用。
+        QVERIFY(settings.isSourceEstimationRegionAvailable("japan"));
+        QVERIFY(!settings.isSourceEstimationRegionAvailable("china"));
+        QVERIFY(!settings.isSourceEstimationRegionAvailable("korea"));
+        QVERIFY(!settings.isSourceEstimationRegionAvailable("taiwan"));
+
+        // 用户在开发者模式下打开三区。
+        settings.setDeveloperMode(true);
+        QVERIFY(settings.isSourceEstimationRegionAvailable("china"));
+        QVERIFY(settings.isSourceEstimationRegionAvailable("korea"));
+        QVERIFY(settings.isSourceEstimationRegionAvailable("taiwan"));
+        for (const char* region : {"china", "korea", "taiwan"}) {
+            settings.setSourceEstimationRegionEnabled(region, true);
+        }
+        settings.setSourceEstimationRegionEnabled("japan", true);
+        // 原始启用集合保留用户的选择（不因可用性被改写）。列表是插入序，比较前排序。
+        {
+            QStringList raw = settings.enabledSourceEstimationRegions();
+            raw.sort();
+            QCOMPARE(raw, QStringList({"china", "japan", "korea", "taiwan"}));
+        }
+        // 签名只含「可用且已启用」的区域。
+        QCOMPARE(settings.sourceEstimationRegionSignature(),
+                 QStringLiteral("china,japan,korea,taiwan"));
+        QVERIFY(settings.sourceEstimationRegionActive());
+
+        // 关掉开发者模式：三区立刻从「生效」里消失，日本区不受影响。
+        settings.setDeveloperMode(false);
+        QCOMPARE(settings.sourceEstimationRegionSignature(), QStringLiteral("japan"));
+        QVERIFY(settings.sourceEstimationRegionActive());
+        // 用户的选择还在（开发者模式是开关，不是清空）。
+        {
+            QStringList raw = settings.enabledSourceEstimationRegions();
+            raw.sort();
+            QCOMPARE(raw, QStringList({"china", "japan", "korea", "taiwan"}));
+        }
+
+        // 快照与签名同口径：三区 available=false 且 enabled=false，日本区可用。
+        {
+            const QVariantMap params = settings.sourceEstimationRegionParams();
+            for (const char* region : {"china", "korea", "taiwan"}) {
+                const QVariantMap row = params.value(region).toMap();
+                QCOMPARE(row.value("available").toBool(), false);
+                QCOMPARE(row.value("enabled").toBool(), false);
+            }
+            const QVariantMap japan = params.value("japan").toMap();
+            QCOMPARE(japan.value("available").toBool(), true);
+            QCOMPARE(japan.value("enabled").toBool(), true);
+        }
+
+        // 只有日本区时，签名非空（这正是 QML 用来判断「有区域在跑」的属性）。
+        settings.setSourceEstimationRegionEnabled("japan", false);
+        QVERIFY(settings.sourceEstimationRegionSignature().isEmpty());
+        QVERIFY(!settings.sourceEstimationRegionActive());
+
+        // 服务层同一判据：开发者模式关掉后，中国区即使标记为启用也不记账、不出解。
+        settings.setDeveloperMode(true);
+        settings.setSourceEstimationRegionEnabled("china", true);
+        SourceEstimationService service(&settings);
+        long long now = origin;
+        service.setNowProvider([&] { return now; });
+        service.ticker_.stop();
+        settings.setDeveloperMode(false);
+        service.reloadSettings();
+        std::vector<StationSnapshot::Entry> frame;
+        for (double lat = 28.4; lat <= 31.6 + 1e-9; lat += 0.2) {
+            for (double lon = 102.4; lon <= 105.6 + 1e-9; lon += 0.2) {
+                StationSnapshot::Entry e;
+                e.lat = lat;
+                e.lon = lon;
+                e.csis = true;
+                e.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Csis, 5.8,
+                    QuakeCalculator::haversineDistance(30.0, 104.0, lat, lon), 10.0);
+                frame.push_back(e);
+            }
+        }
+        service.ingestObservations(frame);
+        service.runEstimation();
+        QCoreApplication::processEvents();
+        QCOMPARE(service.regionState(SourceRegion::China).triggeredCount, 0);
+        QVERIFY(!service.regionState(SourceRegion::China).estimate.valid);
+        QCOMPARE(service.info().value("anyRegionEnabled").toBool(), false);
+        QCOMPARE(service.info().value("state").toString(), QStringLiteral("disabled"));
+
+        // 开发者模式一开，同一片台网立刻能算（关着的时候那些观测根本没记账，
+        // 所以这里要重新喂一帧，和 sourceEstimationRegionToggles 里的口径一致）。
+        settings.setDeveloperMode(true);
+        service.reloadSettings();
+        now += 5000;
+        service.ingestObservations(frame);
+        QVERIFY(service.regionState(SourceRegion::China).triggeredCount >= 6);
+    }
+
     void settingsChangedIsIdempotentAndPersistent() {
         QSettings().clear();
         SettingsStore settings;
@@ -1321,6 +1434,23 @@ private slots:
         QCOMPARE(regionParams.count(), 1);
         settings.setSourceEstimationClusterRadius(QStringLiteral("china"), 300);
         QCOMPARE(regionParams.count(), 2);
+
+        // 区域**可用性**是另一条依赖：快照 / 签名 / sourceEstimationRegionActive 都挂在
+        // `sourceEstimationRegionStateChanged` 上，开发者模式一变就必须发，否则 QML 里
+        // 「开关点开了，下面滑块还是灰的」会原样复现（绑定不重算）。
+        {
+            QSignalSpy regionState(&settings, &SettingsStore::sourceEstimationRegionStateChanged);
+            QVERIFY(regionState.isValid());
+            settings.setDeveloperMode(true);
+            QVERIFY2(regionState.count() >= 1, "开发者模式必须惊动区域状态绑定");
+            const int afterDevMode = regionState.count();
+            settings.setSourceEstimationRegionEnabled(QStringLiteral("china"), true);
+            QVERIFY2(regionState.count() > afterDevMode, "逐区开关必须惊动区域状态绑定");
+            // 聚合信号与区域信号是两回事：改开发者模式不该让主题绑定重算。
+            QCOMPARE(theme.count(), 1);
+            QCOMPARE(blur.count(), 1);
+            settings.setDeveloperMode(false);
+        }
 
         // 恢复默认：所有逐项信号都要发出去。
         const int beforeTheme = theme.count();

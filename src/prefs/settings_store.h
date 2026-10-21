@@ -4,6 +4,9 @@
 #include <QSettings>
 #include <QString>
 #include <QTimer>
+#include <QVariantMap>
+
+#include "core/source_estimator.h"
 
 namespace komira {
 
@@ -114,8 +117,31 @@ public:
                    WRITE setEnabledSourceEstimationRegions NOTIFY enabledSourceEstimationRegionsChanged)
     /// 与 `enabledSourceEstimationRegions` 同源，但拼成逗号串并带 `sourceEstimationRegions`
     /// 前缀：QML 里列表属性变化不一定触发所有绑定重算，字符串拼接是可靠的依赖来源。
+    /// 返回的是**生效**集合（已按 `isSourceEstimationRegionAvailable` 过滤），
+    /// 因此开发者模式开关也会改变它，NOTIFY 用 `sourceEstimationRegionStateChanged`。
     Q_PROPERTY(QString sourceEstimationRegionSignature READ sourceEstimationRegionSignature
-                   NOTIFY enabledSourceEstimationRegionsChanged)
+                   NOTIFY sourceEstimationRegionStateChanged)
+    /// 生效启用集合是否非空（QML 用它决定是否提示「总开关开了但没选区域」）。
+    /// 必须是 Q_PROPERTY：`hasAnySourceEstimationRegion()` 是 Q_INVOKABLE，
+    /// QML 不跟踪函数调用的依赖，绑在函数上的提示永远不会跟着变。
+    Q_PROPERTY(bool sourceEstimationRegionActive READ sourceEstimationRegionActive
+                   NOTIFY sourceEstimationRegionStateChanged)
+    /// 四个区域的**参数与状态快照**：`{ "<id>": { label, trigger, minStations,
+    /// quietEvidence, clusterRadius, enabled, available } }`。
+    ///
+    /// QML 侧的逐区绑定必须依赖它，不能直接调逐区读取接口。那些接口是 Q_INVOKABLE
+    /// （`sourceEstimationTriggerFor(region)` 等），而 QML 只跟踪**属性读取**、不跟踪
+    /// 函数调用：把 `value:` / `valueText:` / `active:` 直接绑在函数调用上，函数返回值
+    /// 再变也不会重算绑定 —— 表现就是「总开关/区域开关点开了，滑块还是灰的；
+    /// 拖动滑块数值文本不变」。快照是 Q_PROPERTY，任一区域参数、启用集合或开发者模式
+    /// 变化都会发 `sourceEstimationRegionStateChanged`，绑定因此可靠地重算。
+    Q_PROPERTY(QVariantMap sourceEstimationRegionParams READ sourceEstimationRegionParams
+                   NOTIFY sourceEstimationRegionStateChanged)
+
+    /// 该区域当前是否**可用**（可配置、可生效）。默认只开放日本区：它是唯一经到时
+    /// 反演（§17.6）验证过的台网，中国 / 韩国 / 台湾 的强度场路径与默认参数仍在标定中，
+    /// 只对开发者模式开放（设置页也据此隐藏这三张卡）。
+    Q_INVOKABLE bool isSourceEstimationRegionAvailable(const QString& region) const;
 
     Q_INVOKABLE double sourceEstimationTriggerFor(const QString& region) const;
     Q_INVOKABLE void setSourceEstimationTrigger(const QString& region, double v);
@@ -135,15 +161,31 @@ public:
         set("enabledSourceEstimationRegions", v);
     }
     /// 启用集合的稳定签名（排序后逗号拼接）。QML 用它做依赖，避免直接依赖列表属性。
+    /// **只含生效的区域**：不可用区域（非开发者模式下的中国 / 韩国 / 台湾）即使残留在
+    /// 启用集合里也不进签名，这样服务层与 UI 看到的是同一份集合。
     QString sourceEstimationRegionSignature() const {
-        QStringList list = enabledSourceEstimationRegions();
+        QStringList list;
+        for (const SourceRegion region : sourceRegions()) {
+            const QString id = QString::fromLatin1(sourceRegionId(region));
+            if (isSourceEstimationRegionAvailable(id)
+                && enabledSourceEstimationRegions().contains(id)) {
+                list << id;
+            }
+        }
         list.sort();
         return list.join(QLatin1Char(','));
     }
-    /// 是否有任何区域被启用（UI 用它决定是否提示「总开关开了但没选区域」）。
+    /// 生效启用集合是否非空。QML 用它决定是否提示「总开关开了但没选区域」。
+    bool sourceEstimationRegionActive() const {
+        return !sourceEstimationRegionSignature().isEmpty();
+    }
+    /// 是否有任何区域被启用（C++ 侧接口；QML 请用 `sourceEstimationRegionActive`）。
     Q_INVOKABLE bool hasAnySourceEstimationRegion() const {
         return !enabledSourceEstimationRegions().isEmpty();
     }
+
+    /// 四个区域的参数与状态快照（QML 的逐区绑定依赖它，见上面的 Q_PROPERTY 说明）。
+    QVariantMap sourceEstimationRegionParams() const;
 
     QString basemapId() const { return s_.value("basemapId", "petal").toString(); }
     void setBasemapId(const QString& v) { set("basemapId", v); }
@@ -412,6 +454,10 @@ signals:
     void enabledSourceEstimationRegionsChanged();
     /// 四个区域的推算参数（触发烈度 / 最少站数 / 反证 / 合并半径）任一变化。
     void sourceEstimationRegionParamsChanged();
+    /// 区域**状态快照**变化：区域参数、启用集合、开发者模式（决定可用区域）任一变化。
+    /// QML 的逐区绑定（`sourceEstimationRegionParams` / 签名 / `sourceEstimationRegionActive`）
+    /// 都挂在这一个信号上 —— 逐区读取接口是 Q_INVOKABLE，绑在函数调用上的绑定不会自动重算。
+    void sourceEstimationRegionStateChanged();
     void intensityStandardChanged();
     void isMutedChanged();
     void jianRefreshTokenChanged();
