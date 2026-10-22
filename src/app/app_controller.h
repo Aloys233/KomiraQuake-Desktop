@@ -76,9 +76,15 @@ class AppController : public QObject {
     /// 只读——切换主题请写 settings.themeMode。
     Q_PROPERTY(bool darkMode READ darkMode NOTIFY darkModeChanged)
     /// 地图上要画的那一个事件：有焦点用焦点，否则退化为最近一次（`history[0]`）。
+    /// 推算焦点期间为空 —— 此时地图只画推定震中（见 focusEstimate）。
     Q_PROPERTY(QVariant mapEvent READ mapEvent NOTIFY mapEventChanged)
     /// 当前是否有地图焦点：地图仅在有关注事件时自动取景，避免默认被「最近事件」抢镜。
     Q_PROPERTY(bool hasMapFocus READ hasMapFocus NOTIFY mapFocusChanged)
+    /// 本地震源推算的焦点（空 QVariant = 事件焦点 / 无焦点）。
+    ///
+    /// 非空时地图只画推定震中：`mapEvent` 为空（不画事件十字、不算波前），HUD 收起，
+    /// 镜头由 MapView 按不确定度取景。用户要求推算优先于 USGS/GQ。
+    Q_PROPERTY(QVariant focusEstimate READ focusEstimate NOTIFY mapFocusChanged)
     /// 左下角 HUD 要显示的那一个事件：用户主动点击的焦点最优先，其次实时预警，
     /// 再次是仍在 10 分钟窗口内的自动焦点；否则无效（HUD 默认隐藏，点击后才显示）。
     Q_PROPERTY(QVariant hudEvent READ hudEvent NOTIFY hudEventChanged)
@@ -158,6 +164,7 @@ public:
     }
     QVariant mapEvent() const;
     bool hasMapFocus() const { return hasMapFocus_; }
+    QVariant focusEstimate() const;
     QVariant hudEvent() const;
     int hudIndex() const;
     int hudCount() const;
@@ -250,7 +257,13 @@ private:
     void flushTombstoneWrites();
     void onTick();
     void recomputeEvents();
-    void syncWarning();
+    /// 复核当前选中的预警会话。
+    ///
+    /// `keepSelection` = 调用方刚刚做了**显式选择**（HUD 翻页）：此时不再按
+    /// 「机构优先级 > 受保护 > 发震时刻」重挑，否则会把用户刚翻到的页立刻顶回
+    /// 最高优先级那条 —— 现象就是翻页只在前两条之间跳、页码卡在「1 / N」。
+    /// 选中项已不在活动会话里时仍然会兜底重选。
+    void syncWarning(bool keepSelection = false);
     WarningSession sessions_;
     std::string selectedWarning_;
     void rebuildHistory();
@@ -259,6 +272,14 @@ private:
     /// manual=true 表示用户主动点击选中；false 表示实时预警自动接管。
     void setMapFocus(const EarthquakeEvent& event, bool manual);
     void clearMapFocus();
+    /// 把焦点交给本地震源推算的某一区（推定震中）。会清掉事件焦点与波前。
+    void setEstimateFocus(const QVariantMap& estimate);
+    /// 只清空推算焦点，不重置镜头（调用方决定是否发 resetMapRequested）。
+    void dropEstimateFocus();
+    /// 最强的一区可见推算标记；没有任何可见解时返回空 map。
+    QVariantMap bestEstimateMarker() const;
+    /// 推算服务发布变化：刷新焦点载荷，或在「低优先级事件占着镜头」时让推算接管。
+    void onSourceEstimateChanged();
     /// 自动焦点事件在最后一报推送后 10 分钟内仍显示 HUD，超出即视为历史事件。
     bool hudWindowOpen(const EarthquakeEvent& event, long long now) const;
     /// 安排一次 HUD 可见性重算（跨过 10 分钟窗口时隐藏自动焦点的 HUD）。
@@ -289,6 +310,8 @@ private:
     /// 焦点事件"还年轻"（发震时刻在窗口内）时跑 100ms 波前定时器，否则停。
     void updateWaveTimer();
     void updateWaveRadii();
+    /// 隐藏并清零波前（半径 -1 + 透明度 0），只在确有变化时发通知。
+    void clearWaveRadii();
     /// 安排一次区县烈度重算：合并 80 ms 内的多次事件变更，只算最后一��。
     void scheduleDistrictRefresh();
     /// 在当前焦点事件下派发一次区县烈度重算。计算本体跑在 worker 线程；已有任务在跑时
@@ -399,6 +422,9 @@ private:
     /// 地图焦点：用户从列表选中，或被实时 EEW 自动接管。
     EarthquakeEvent mapFocus_;
     bool hasMapFocus_ = false;
+    /// 非空表示焦点是「本地震源推算的推定震中」而不是事件（见 focusEstimate 属性）。
+    /// 此时 hasMapFocus_ 恒为 false：波前、十字、区县着色都不跟事件走。
+    QVariantMap focusEstimate_;
     /// 焦点是否来自用户主动点击（true 时 HUD 不受 10 分钟窗口限制）。
     bool mapFocusManual_ = false;
     QTimer waveTimer_;

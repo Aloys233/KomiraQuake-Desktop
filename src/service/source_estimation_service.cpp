@@ -678,6 +678,13 @@ void SourceEstimationService::publish() {
             mark["grade"] = QString::fromStdString(estimate.grade);
             mark["magnitude"] = estimate.magnitude;
             mark["depthKm"] = estimate.depthKm;
+            // 地图常驻标签要这两项：站数是「证据有多硬」的直接线索，报数说明解是否在刷新。
+            // 卡片早就有它们，标记载荷此前只给了几何量与震级深度。
+            mark["stationCount"] = estimate.stationCount;
+            mark["reportNum"] = std::max(1, region.reportNum);
+            // 波前（S/P 圆）要用发震时刻反解走时；推算卡本身只印时刻文本，标记载荷
+            // 之前没有这个字段，地图侧只能拿到 0 而画不出推算波前。
+            mark["originEpochMs"] = static_cast<qint64>(region.originEpochMs);
             mark["confidence"] = estimate.confidence;
             mark["provisional"] = estimate.provisional;
             mark["clusterCount"] = estimate.clusterCount;

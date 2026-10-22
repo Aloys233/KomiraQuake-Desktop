@@ -88,6 +88,8 @@ public:
     Q_PROPERTY(int sourceEstimationClusterRadius READ sourceEstimationClusterRadius WRITE setSourceEstimationClusterRadius NOTIFY sourceEstimationRegionParamsChanged)
     /// 在地图上画出推定震中（十字 + 不确定度圈）。
     Q_PROPERTY(bool showEstimatedEpicenter READ showEstimatedEpicenter WRITE setShowEstimatedEpicenter NOTIFY showEstimatedEpicenterChanged)
+    /// 在推定震中旁常驻显示文字标签（区域 / 精度 / 报数 / M / 深度 / 站数）。
+    Q_PROPERTY(bool showEstimateLabel READ showEstimateLabel WRITE setShowEstimateLabel NOTIFY showEstimateLabelChanged)
 
 public:
     explicit SettingsStore(QObject* parent = nullptr);
@@ -421,6 +423,11 @@ public:
     }
     void setShowEstimatedEpicenter(bool v) { set("showEstimatedEpicenter", v); }
 
+    /// 推定震中旁常驻的文字标签。默认开启：标记本身只有形状，没有文字时无法区分
+    /// 「哪个区域的解、多强、多深」，而这个能力本来就是低置信度的 Beta 结果。
+    bool showEstimateLabel() const { return s_.value("showEstimateLabel", true).toBool(); }
+    void setShowEstimateLabel(bool v) { set("showEstimateLabel", v); }
+
     Q_INVOKABLE void resetToDefaults();
 
 signals:
@@ -470,6 +477,7 @@ signals:
     void raiseInfoChanged();
     void reduceMotionChanged();
     void showEstimatedEpicenterChanged();
+    void showEstimateLabelChanged();
     void showProvinceBordersChanged();
     void showStationLayerChanged();
     void showWavefrontChanged();

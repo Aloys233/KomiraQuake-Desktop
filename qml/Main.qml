@@ -58,6 +58,7 @@ ApplicationWindow {
             userLat: app.userLatitude; userLon: app.userLongitude
             event: window.mapEvent
             hasFocus: app.hasMapFocus
+            focusEstimate: app.focusEstimate
             warningActive: !!app.activeWarning
             hudWidth: hud.visible ? hud.width : 0
             // 取景用的顶部/底部遮挡：左列（HUD + 震源推算卡）实际占用的最低点，
@@ -77,7 +78,8 @@ ApplicationWindow {
     function applyDefaultView() {
         if (!map) return;
         // 用户若已手动控制过镜头，定位到达时不再抢镜头。
-        if (!initialLocationApplied && !hudEvent && app.hasLocation && !map.userMovedCamera) {
+        if (!initialLocationApplied && !hudEvent && app.hasLocation && !map.userMovedCamera
+                && !map.estimateFocused) {
             const pt = map.shiftCoord(app.userLatitude, app.userLongitude);
             // 固定缩放到用户周边；不再沿用 map.zoom —— 无定位时地图会先按全国范围取景，
             // 那个缩放级别不适合作为"聚焦我的位置"的默认值。
@@ -127,7 +129,9 @@ ApplicationWindow {
             // 显式聚焦/选中（含再次选中同一事件）应恢复 HUD。
             window.wavesDoneId = "";
             // 显式聚焦：波前一淡出也要把镜头带过去（见 MapView.focusEvent）。
-            if (map) Qt.callLater(map.focusEvent);
+            // 必须同步启动：事件切换会同时改变 HUD 尺寸，布局重取景的 Qt.callLater
+            // 排在入场补间之前，会把镜头先硬切到新震中，补间就只剩零距离。
+            if (map) map.focusEvent();
         }
         function onResetMapRequested() { if (map) map.resetView(); }
     }

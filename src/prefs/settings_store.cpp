@@ -260,6 +260,7 @@ const QList<SettingsStore::KeySignal>& SettingsStore::keySignals() {
         {"raiseInfo", &SettingsStore::raiseInfoChanged},
         {"reduceMotion", &SettingsStore::reduceMotionChanged},
         {"showEstimatedEpicenter", &SettingsStore::showEstimatedEpicenterChanged},
+        {"showEstimateLabel", &SettingsStore::showEstimateLabelChanged},
         {"showProvinceBorders", &SettingsStore::showProvinceBordersChanged},
         {"showStationLayer", &SettingsStore::showStationLayerChanged},
         {"showWavefront", &SettingsStore::showWavefrontChanged},

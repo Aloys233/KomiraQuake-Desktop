@@ -61,15 +61,48 @@ namespace {
 
 /// 校时时钟固定显示时区：UTC+8。《NATIVE_PORT_SPEC》 §12。
 constexpr int kClockUtc8OffsetSeconds = 8 * 3600;
-/// 同一偏移的毫秒形式。格式化墙钟时用 `fromMSecsSinceEpoch(ts + 偏移, Qt::UTC)`：
-/// 与 `QTimeZone(28800)` 的渲染结果逐字相同，但**不必每行都构造一个 QTimeZone 对象**
-/// （QTimeZone 带堆上私有数据；目录刷新时这就是 200 次分配）。
+/// 同一偏移的毫秒形式。格式化墙钟时用 `fromMSecsSinceEpoch(ts + 偏移, QTimeZone::utc())`：
+/// 先把时间戳平移到 UTC+8 再按 UTC 渲染，不必每行构造带偏移的 QTimeZone。
+/// （`Qt::UTC` 版重载在 Qt 6.9 起已弃用，会报 -Wdeprecated-declarations。）
 constexpr qint64 kClockUtc8OffsetMs = 8LL * 3600LL * 1000LL;
 
 /// 发震时刻的固定 UTC+8 文本（与设备时区无关）。列表/HUD 共用同一条格式化路径。
 QString utc8Text(long long epochMs) {
-    return QDateTime::fromMSecsSinceEpoch(epochMs + kClockUtc8OffsetMs, Qt::UTC)
+    return QDateTime::fromMSecsSinceEpoch(epochMs + kClockUtc8OffsetMs, QTimeZone::utc())
         .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+}
+
+/// 本地震源推算在焦点竞争中的优先级。高于 USGS/GQ，低于权威地震机构。
+constexpr int kEstimateFocusRank = 2;
+
+/// 报数机构优先级（数值越大越优先）：
+///   3 = 权威地震机构（JMA / CEA / CENC / CWA / KMA / 省级地震局等）
+///   2 = 本地震源推算（`kEstimateFocusRank`，不是事件，故不经过本函数）
+///   1 = 其它机构（EMSC / GFZ / BMKG 等）
+///   0 = USGS / GQ
+///
+/// 用户要求「USGS 和 GQ 永远是最低的」：它们**不得**抢走更高优先级事件的焦点，
+/// 同优先级之间仍按发震时刻/受保护预警的既有规则裁决。
+int agencyPriority(const EarthquakeEvent& e) {
+    const QString raw = QString::fromStdString(e.sourceAgency).trimmed();
+    const QString agency = raw.toUpper();
+    if (agency == QLatin1String("USGS") || agency == QLatin1String("GQ")) return 0;
+    // 兼容旧库/旧数据源未写 sourceAgency 的条目：标题里带 GlobalQuake / USGS 也按最低档。
+    if (agency.isEmpty()) {
+        const QString source = QString::fromStdString(e.source);
+        if (source.contains(QLatin1String("GlobalQuake")) || source.contains(QLatin1String("USGS")))
+            return 0;
+    }
+    static const QStringList kAuthoritative = {
+        QStringLiteral("JMA"), QStringLiteral("CEA"), QStringLiteral("CENC"),
+        QStringLiteral("CWA"), QStringLiteral("KMA"), QStringLiteral("HKO"),
+        QStringLiteral("SC"), QStringLiteral("FJ"), QStringLiteral("CQ"),
+        QStringLiteral("SA"),
+    };
+    if (kAuthoritative.contains(agency)) return 3;
+    // 省级机构在 Whews 里是中文名（北京地震局 / 云南地震局 / 宁夏地震局），upper() 无效。
+    if (raw.contains(QStringLiteral("地震局"))) return 3;
+    return 1;
 }
 
 /// 只比较会落库的字段：目录每次整表重发，字段没变就不必再写一次库。
@@ -288,7 +321,7 @@ AppController::AppController(QObject* parent, bool startServices)
     sourceEstimation_ = new SourceEstimationService(settings_, this);
     sourceEstimation_->setNowProvider([this]() { return nowMs(); });
     connect(sourceEstimation_, &SourceEstimationService::changed, this,
-            &AppController::sourceEstimateChanged);
+            &AppController::onSourceEstimateChanged);
     clock_ = new NtpClock(this);
     autoStart_ = new AutoStartService(this);
     updater_ = new UpdateService(this);
@@ -527,8 +560,14 @@ void AppController::wireSettings() {
     connect(settings_, &SettingsStore::developerModeChanged, this, reloadEstimation);
     // 地图标记的显示开关只影响呈现，但该属性没有别的通知源：不发这一下，
     // QML 会一直停在关闭时那份 `{ visible: false }` 上，重新打开也不恢复。
-    connect(settings_, &SettingsStore::showEstimatedEpicenterChanged, this,
-            [this]() { emit sourceEstimateChanged(); });
+    // 同时：标记被隐藏时推算不能再把镜头拉到一个看不见的点上。
+    connect(settings_, &SettingsStore::showEstimatedEpicenterChanged, this, [this]() {
+        if (!settings_->showEstimatedEpicenter() && !focusEstimate_.isEmpty()) {
+            dropEstimateFocus();
+            emit resetMapRequested();
+        }
+        emit sourceEstimateChanged();
+    });
 
     // ---- 4. 声音：音量滑块只改音量，不碰别的 ----
     connect(settings_, &SettingsStore::enableSoundAlertChanged, this, [this]() {
@@ -710,11 +749,14 @@ std::vector<std::pair<EarthquakeEvent, bool>> AppController::mergedEvents() cons
             catalog.push_back(e);
             continue;
         }
-        // 同一地震若有自动/正式两条，取推送时间较晚（通常为正式）的一条。
+        // 同一地震若有自动/正式两条，先看报数机构：权威机构（JMA/CEA…）的条目
+        // 永远压过 USGS/GQ；同机构再取推送时间较晚（通常为正式）的一条。
         EarthquakeEvent& slot = catalog[static_cast<std::size_t>(found)];
         const long long prev = slot.reportTime > 0 ? slot.reportTime : slot.timestamp;
         const long long next = e.reportTime > 0 ? e.reportTime : e.timestamp;
-        if (next > prev) slot = e;
+        const int prevRank = agencyPriority(slot);
+        const int nextRank = agencyPriority(e);
+        if (nextRank > prevRank || (nextRank == prevRank && next > prev)) slot = e;
     }
 
     // 实时会话与目录对齐：一个会话最多消耗一条目录条目（catalogUsed）。
@@ -750,8 +792,13 @@ std::vector<std::pair<EarthquakeEvent, bool>> AppController::mergedEvents() cons
         }
         if (found >= 0) {
             catalogUsed[static_cast<std::size_t>(found)] = 1;
-            markEmitted(catalog[static_cast<std::size_t>(found)], static_cast<int>(out.size()));
-            out.emplace_back(catalog[static_cast<std::size_t>(found)], true);
+            // 目录一般更权威，但目录是 USGS/GQ、实时链路是 JMA/CEA 时不能反过来盖掉
+            // 权威机构的数据（同一场地震的两条记录只保留一条展示）。
+            const EarthquakeEvent& fromCatalog = catalog[static_cast<std::size_t>(found)];
+            const EarthquakeEvent& chosen =
+                agencyPriority(live) > agencyPriority(fromCatalog) ? live : fromCatalog;
+            markEmitted(chosen, static_cast<int>(out.size()));
+            out.emplace_back(chosen, true);
         } else {
             markEmitted(live, static_cast<int>(out.size()));
             out.emplace_back(live, true);
@@ -798,9 +845,17 @@ QVariant AppController::activeWarning() const {
 }
 
 const EarthquakeEvent* AppController::displayedEvent() const {
+    // 推算焦点期间不画任何事件：否则十字/波前会落在另一个位置，与镜头所指的推定震中
+    // 相互矛盾（用户会以为那就是同一场地震的震中）。
+    if (!focusEstimate_.isEmpty()) return nullptr;
     if (hasMapFocus_) return &mapFocus_;
     if (!history_.isEmpty()) return &history_.first();
     return nullptr;
+}
+
+QVariant AppController::focusEstimate() const {
+    if (focusEstimate_.isEmpty()) return QVariant();
+    return focusEstimate_;
 }
 
 QVariant AppController::mapEvent() const {
@@ -819,6 +874,9 @@ bool AppController::hudWindowOpen(const EarthquakeEvent& event, long long now) c
 }
 
 QVariant AppController::hudEvent() const {
+    // 推算焦点期间主 HUD 让位给震源推算卡（它才是此刻的主展示）；活动预警仍走
+    // 右侧的 WarningHud，不受影响。
+    if (!focusEstimate_.isEmpty()) return QVariant();
     // 用户主动点击的焦点最优先：点击后始终显示 HUD，不受 10 分钟窗口限制。
     if (hasMapFocus_ && mapFocusManual_) return toMap(mapFocus_);
     if (hasActiveWarning_) return toMap(activeWarning_);
@@ -831,18 +889,25 @@ QVariant AppController::hudEvent() const {
 }
 
 std::vector<std::string> AppController::orderedActiveKeys() const {
-    std::vector<std::pair<long long, std::string>> ordered;
+    struct Entry {
+        int rank = 1;
+        long long timestamp = 0;
+        std::string key;
+    };
+    std::vector<Entry> ordered;
     ordered.reserve(sessions_.active.size());
     for (const auto& [key, state] : sessions_.active)
-        ordered.emplace_back(state.event.timestamp, key);
-    // 发震时刻倒序（最新在前）；同一时刻按 identity 稳定排序。
-    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
-        if (a.first != b.first) return a.first > b.first;
-        return a.second < b.second;
+        ordered.push_back({agencyPriority(state.event), state.event.timestamp, key});
+    // 先按机构优先级（JMA/CEA > 其它 > USGS/GQ），同优先级按发震时刻倒序，最后按
+    // identity 稳定排序。HUD 的 `n/N` 跟随这个顺序，翻页时第一页就是最该看的事件。
+    std::sort(ordered.begin(), ordered.end(), [](const Entry& a, const Entry& b) {
+        if (a.rank != b.rank) return a.rank > b.rank;
+        if (a.timestamp != b.timestamp) return a.timestamp > b.timestamp;
+        return a.key < b.key;
     });
     std::vector<std::string> keys;
     keys.reserve(ordered.size());
-    for (const auto& entry : ordered) keys.push_back(entry.second);
+    for (const Entry& entry : ordered) keys.push_back(entry.key);
     return keys;
 }
 
@@ -871,9 +936,11 @@ void AppController::shiftHud(int delta) {
     const auto it = sessions_.active.find(selectedWarning_);
     if (it != sessions_.active.end()) {
         announcer_->stopOutput();
-        setMapFocus(it->second.event, false);
+        // 用户主动翻页 = 主动选中：按手动焦点处理，后续低优先级事件不得把它顶掉。
+        setMapFocus(it->second.event, true);
     }
-    syncWarning();
+    // 翻页是显式选择：本次复核必须保留它，不能让 syncWarning 的自动挑选把页码顶回去。
+    syncWarning(true);
 }
 
 void AppController::scheduleHudRefresh() {
@@ -1093,7 +1160,7 @@ bool AppController::rebuildStationCards() {
         const QString frameTime =
             seisSource_->lastTimestamp() > 0
                 ? QDateTime::fromMSecsSinceEpoch(seisSource_->lastTimestamp() + kClockUtc8OffsetMs,
-                                                 Qt::UTC)
+                                                 QTimeZone::utc())
                       .toString(QStringLiteral("yyyyMMddHHmmss"))
                 : QString();
         list.push_back(stationCard(QStringLiteral("pancakes_seis"), QStringLiteral("PancakesSeis"),
@@ -1165,6 +1232,8 @@ void AppController::toggleMapFocus(const QString& id) {
 }
 
 void AppController::setMapFocus(const EarthquakeEvent& event, bool manual) {
+    // 事件焦点接管（权威机构事件或用户点击）：推算焦点让位。
+    focusEstimate_.clear();
     mapFocus_ = event;
     hasMapFocus_ = true;
     mapFocusManual_ = manual;
@@ -1180,9 +1249,10 @@ void AppController::setMapFocus(const EarthquakeEvent& event, bool manual) {
 }
 
 void AppController::clearMapFocus() {
-    if (!hasMapFocus_) return;
+    if (!hasMapFocus_ && focusEstimate_.isEmpty()) return;
     hasMapFocus_ = false;
     mapFocusManual_ = false;
+    focusEstimate_.clear();
     updateWaveTimer();
     scheduleHudRefresh();
     scheduleDistrictRefresh();
@@ -1191,6 +1261,97 @@ void AppController::clearMapFocus() {
     emit mapFocusChanged();
     emit hudEventChanged();
     emit resetMapRequested();
+}
+
+QVariantMap AppController::bestEstimateMarker() const {
+    if (!sourceEstimation_) return {};
+    QVariantMap marker = sourceEstimation_->marker();
+    // 顶层载荷会带一份完整的 markers 数组；焦点只需单条，剥掉可避免每秒把整表
+    // 复制进 Q_PROPERTY，也让「载荷有没有变」的比较更稳定。
+    marker.remove(QStringLiteral("markers"));
+    // 只有可见的解才值得抢镜头；顶层就是置信度最高的那一区。
+    if (marker.value(QStringLiteral("visible")).toBool() &&
+        marker.contains(QStringLiteral("latitude"))) {
+        return marker;
+    }
+    const QVariantList list = sourceEstimation_->marker().value(QStringLiteral("markers")).toList();
+    for (const QVariant& entry : list) {
+        const QVariantMap candidate = entry.toMap();
+        if (candidate.value(QStringLiteral("visible")).toBool() &&
+            candidate.contains(QStringLiteral("latitude"))) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+void AppController::setEstimateFocus(const QVariantMap& estimate) {
+    if (estimate.isEmpty()) {
+        clearMapFocus();
+        return;
+    }
+    focusEstimate_ = estimate;
+    hasMapFocus_ = false;
+    mapFocusManual_ = false;
+    // 事件波前必须停掉：它们属于另一个震源（或上一次事件）。
+    updateWaveTimer();
+    scheduleHudRefresh();
+    scheduleDistrictRefresh();
+    syncEventModelFocus();
+    emit mapEventChanged();
+    emit mapFocusChanged();
+    emit hudEventChanged();
+    emit centerMapRequested(estimate.value(QStringLiteral("latitude")).toDouble(),
+                            estimate.value(QStringLiteral("longitude")).toDouble());
+}
+
+void AppController::dropEstimateFocus() {
+    if (focusEstimate_.isEmpty()) return;
+    focusEstimate_.clear();
+    updateWaveTimer();
+    scheduleHudRefresh();
+    scheduleDistrictRefresh();
+    syncEventModelFocus();
+    emit mapEventChanged();
+    emit mapFocusChanged();
+    emit hudEventChanged();
+}
+
+void AppController::onSourceEstimateChanged() {
+    const QVariantMap best = bestEstimateMarker();
+    // 「显示推定震中」关掉时，推算不参与焦点：否则镜头会飞到一个用户看不到的点上。
+    const bool markerVisible = settings_ && settings_->showEstimatedEpicenter();
+    if (!focusEstimate_.isEmpty()) {
+        if (best.isEmpty() || !markerVisible) {
+            // 解消失了（保持窗口到期 / 关开关）：回到默认视野，别停在空地。
+            dropEstimateFocus();
+            emit resetMapRequested();
+        } else if (best != focusEstimate_) {
+            // 每秒刷新只更新载荷，不重新取景 —— 1 Hz 的镜头补间会持续抖动。
+            // 只有「换了一区」（比如中国区解过期、日本区接力）才把镜头带过去。
+            const QString previousId = focusEstimate_.value(QStringLiteral("id")).toString();
+            const QString nextId = best.value(QStringLiteral("id")).toString();
+            focusEstimate_ = best;
+            // 反推时刻/深度可能随新报修正，波前半径要跟着重算。
+            updateWaveTimer();
+            emit mapFocusChanged();
+            if (previousId != nextId) {
+                emit centerMapRequested(best.value(QStringLiteral("latitude")).toDouble(),
+                                        best.value(QStringLiteral("longitude")).toDouble());
+            }
+        }
+        emit sourceEstimateChanged();
+        return;
+    }
+    // 推算参与焦点竞争：只在「没有事件焦点」或「当前焦点是 USGS/GQ」时接管，
+    // 且用户手动选中的事件永远优先。权威机构（JMA/CEA…）的事件不会被推算顶掉。
+    const bool lowPriorityFocus = hasMapFocus_ && !mapFocusManual_ &&
+                                  agencyPriority(mapFocus_) == 0;
+    if (!best.isEmpty() && markerVisible && !mapFocusManual_ &&
+        (!hasMapFocus_ || lowPriorityFocus)) {
+        setEstimateFocus(best);
+    }
+    emit sourceEstimateChanged();
 }
 
 void AppController::scheduleDistrictRefresh() {
@@ -1285,46 +1446,83 @@ void AppController::applyDistrictIntensity(QVariantMap next) {
 }
 
 void AppController::updateWaveTimer() {
-    // 波前圆只服务于显式焦点事件：无焦点时地图只画"最近一次事件"的 X 标记，
-    // 不画波前圆（否则会给历史目录条目留下无意义的圆）。
-    const EarthquakeEvent* event = hasMapFocus_ ? &mapFocus_ : nullptr;
+    // 波前圆只服务于显式焦点：事件焦点（活动预警/用户点击）或本地推算焦点。
+    // 无焦点时地图只画"最近一次事件"的 X 标记，不画波前圆（否则会给历史目录条目
+    // 留下无意义的圆）。
     const long long now = nowMs();
-    // 目录里的历史地震早已超出量程，只有"还年轻"的焦点事件才需要按帧重算。
-    const bool young = event && !event->isCanceled && !sessions_.finished(event->identity()) &&
-                       event->timestamp > 0 && now - event->timestamp <= kWaveWindowMs;
+    bool young = false;
+    if (!focusEstimate_.isEmpty()) {
+        // 推算焦点：用反推的发震时刻。没有时刻（originEpochMs 为 0）就不画。
+        const long long origin = focusEstimate_.value(QStringLiteral("originEpochMs")).toLongLong();
+        young = origin > 0 && now - origin <= kWaveWindowMs;
+    } else if (hasMapFocus_) {
+        // 目录里的历史地震早已超出量程，只有"还年轻"的焦点事件才需要按帧重算。
+        const EarthquakeEvent& event = mapFocus_;
+        young = !event.isCanceled && !sessions_.finished(event.identity()) &&
+                event.timestamp > 0 && now - event.timestamp <= kWaveWindowMs;
+    }
     if (young) {
         updateWaveRadii();
         if (!waveTimer_.isActive()) waveTimer_.start();
         return;
     }
     waveTimer_.stop();
-    if (wavePKm_ != -1.0 || waveSKm_ != -1.0) {
-        wavePKm_ = -1.0;
-        waveSKm_ = -1.0;
-        wavePOpacity_ = 0.0;
-        waveSOpacity_ = 0.0;
-        waveSFillOpacity_ = 0.0;
-        emit waveRadiiChanged();
-    }
+    clearWaveRadii();
+}
+
+void AppController::clearWaveRadii() {
+    if (wavePKm_ == -1.0 && waveSKm_ == -1.0) return;
+    wavePKm_ = -1.0;
+    waveSKm_ = -1.0;
+    wavePOpacity_ = 0.0;
+    waveSOpacity_ = 0.0;
+    waveSFillOpacity_ = 0.0;
+    emit waveRadiiChanged();
 }
 
 void AppController::updateWaveRadii() {
-    if (!hasMapFocus_) return;
-    const EarthquakeEvent* event = &mapFocus_;
-    if (event->timestamp <= 0) return;
-    const double seconds = (nowMs() - event->timestamp) / 1000.0;
-    if (seconds < 0.0) return;
+    if (focusEstimate_.isEmpty() && !hasMapFocus_) {
+        clearWaveRadii();
+        return;
+    }
+
+    // 波前来源：推算焦点用推定震源的震级/深度/反推时刻；否则用焦点事件。
+    // 半径只依赖这三个量，地图侧只需知道画在哪里 —— 中心由 QML 的焦点标记决定。
+    long long origin = 0;
+    double depth = 10.0;
+    double magnitude = 0.0;
+    if (!focusEstimate_.isEmpty()) {
+        origin = focusEstimate_.value(QStringLiteral("originEpochMs")).toLongLong();
+        depth = focusEstimate_.value(QStringLiteral("depthKm")).toDouble();
+        magnitude = focusEstimate_.value(QStringLiteral("magnitude")).toDouble();
+        if (!(depth > 0.0)) depth = 10.0;
+    } else {
+        origin = mapFocus_.timestamp;
+        depth = mapFocus_.depth;
+        magnitude = mapFocus_.magnitude;
+    }
+    if (origin <= 0) {
+        // 没有可用的发震时刻（推算解尚缺反推时刻）：不能把上一个事件/上一个解的
+        // 波前留在屏幕上。
+        clearWaveRadii();
+        return;
+    }
+    const double seconds = (nowMs() - origin) / 1000.0;
+    if (seconds < 0.0) {
+        clearWaveRadii();
+        return;
+    }
 
     // 反解走时表得到波前半径（km）。两张表在 2000 km 处拼接，切换是连续的。
     // 表名用 static：旧实现每帧构造两个 QStringLiteral("jb")，60 Hz 下是纯分配噪声。
     static const QString kJbTable = QStringLiteral("jb");
     TravelTimeService& travel = TravelTimeService::instance();
-    double p = travel.distanceForTime(event->depth, seconds, true, TravelTimeService::kDefaultTable);
-    double s = travel.distanceForTime(event->depth, seconds, false, TravelTimeService::kDefaultTable);
+    double p = travel.distanceForTime(depth, seconds, true, TravelTimeService::kDefaultTable);
+    double s = travel.distanceForTime(depth, seconds, false, TravelTimeService::kDefaultTable);
     // jma2001 到量程上限会 clamp 回 2000 km，`>` 永远触发不了，故用 `>=` 才能切到 jb 表；
     // 端点处 jb 返回值与 jma2001 连续，不会跳变。
-    if (p >= kWaveTableSwitchKm) p = travel.distanceForTime(event->depth, seconds, true, kJbTable);
-    if (s >= kWaveTableSwitchKm) s = travel.distanceForTime(event->depth, seconds, false, kJbTable);
+    if (p >= kWaveTableSwitchKm) p = travel.distanceForTime(depth, seconds, true, kJbTable);
+    if (s >= kWaveTableSwitchKm) s = travel.distanceForTime(depth, seconds, false, kJbTable);
 
     // jb 表上限 10000 km 同样会 clamp，到端点即视为超出量程不再画。
     double pKm = p >= kWaveMaxRadiusKm ? -1.0 : p;
@@ -1334,11 +1532,11 @@ void AppController::updateWaveRadii() {
     //
     // 该值只取决于 (magnitude, depth)，而两者在事件生命周期内几乎不变 —— 旧实现每帧
     // 都跑一次 40 次迭代的二分（40 次 rawCsis，含 pow/log）。按参数缓存，只在换事件时重算。
-    if (waveCacheMagnitude_ != event->magnitude || waveCacheDepth_ != event->depth) {
-        waveCacheMagnitude_ = event->magnitude;
-        waveCacheDepth_ = event->depth;
-        waveCacheFadeKm_ = event->magnitude > 0.0
-                               ? IntensityCalculator::distanceForCsis(event->magnitude, event->depth,
+    if (waveCacheMagnitude_ != magnitude || waveCacheDepth_ != depth) {
+        waveCacheMagnitude_ = magnitude;
+        waveCacheDepth_ = depth;
+        waveCacheFadeKm_ = magnitude > 0.0
+                               ? IntensityCalculator::distanceForCsis(magnitude, depth,
                                                                       kCsisFadeLevel)
                                : kWaveMaxRadiusKm;
     }
@@ -1568,15 +1766,49 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
     }
 
     if (added) {
-        // 若当前正处于触发本地烈度限制且有倒计时的关键预警保护中，而新事件未达本地预警门槛（普通观测数据/情报/远震）：
-        // 允许新数据存入会话供观测切换，但绝不掐断当前警报声音、不抢走当前预警的主焦点和倒计时，避免遮挡。
-        if (currentIsProtected && !eventIsProtected) {
-            sessions_.active.at(event.identity()).hidden = replay;
-        } else {
+        const int newRank = agencyPriority(event);
+        // 当前焦点是谁：推算（kEstimateFocusRank）> 事件（按机构）。-1 = 没有焦点。
+        int currentRank = -1;
+        if (!focusEstimate_.isEmpty()) currentRank = kEstimateFocusRank;
+        else if (hasMapFocus_) currentRank = agencyPriority(mapFocus_);
+
+        // 新事件只有「不比当前焦点低」才抢镜头：
+        //   · USGS/GQ（0）永远抢不走 JMA/CEA（3）或推算（2）；
+        //   · 用户手动选中的焦点只在更高优先级事件到来时让位；
+        //   · 受保护的关键预警不被同/低级事件打断（原有语义），但权威机构事件仍可接管。
+        bool takeFocus = false;
+        if (currentRank < 0) takeFocus = true;
+        else if (mapFocusManual_) takeFocus = newRank > currentRank;
+        else if (currentIsProtected && !eventIsProtected) takeFocus = newRank > currentRank;
+        else takeFocus = newRank >= currentRank;
+
+        if (takeFocus) {
             announcer_->stopOutput();
-            selectedWarning_ = event.identity();
+            // 焦点目标不一定是刚到的那条：会话里若已有更高优先级事件（典型：JMA 已活跃、
+            // GQ 又报来一版），镜头必须给 JMA，而不是被这条低优先级新报牵走。
+            // 同优先级再比受保护预警与发震时刻，与 syncWarning 的选择口径一致。
+            const auto preferred = [&](const EarthquakeEvent& a, const EarthquakeEvent& b) {
+                const int rankA = agencyPriority(a);
+                const int rankB = agencyPriority(b);
+                if (rankA != rankB) return rankA > rankB;
+                const bool protectedA = isProtectedAlert(a, now);
+                const bool protectedB = isProtectedAlert(b, now);
+                if (protectedA != protectedB) return protectedA;
+                return a.timestamp > b.timestamp;
+            };
+            const EarthquakeEvent* target = &event;
+            for (const auto& [key, state] : sessions_.active) {
+                if (preferred(state.event, *target)) target = &state.event;
+            }
+            selectedWarning_ = target->identity();
             sessions_.active.at(selectedWarning_).hidden = replay;
-            setMapFocus(event, false);
+            // 推算优先于 USGS/GQ：低优先级事件即使接管会话，也把**镜头**交给可见的
+            // 推定震中（推算卡因此成为主展示，事件仍留在列表/会话里）。
+            const QVariantMap estimate =
+                (agencyPriority(*target) == 0 && settings_ && settings_->showEstimatedEpicenter())
+                    ? bestEstimateMarker() : QVariantMap();
+            if (!estimate.isEmpty()) setEstimateFocus(estimate);
+            else setMapFocus(*target, false);
         }
     } else if (hasMapFocus_ && mapFocus_.identity() == event.identity()) {
         mapFocus_ = event;
@@ -1656,27 +1888,37 @@ bool AppController::isProtectedAlert(const EarthquakeEvent& e, long long clockNo
     return !e.isCanceled && announcer_ && announcer_->eligible(e) && e.remainingSeconds(clockNow) >= 0;
 }
 
-void AppController::syncWarning() {
+void AppController::syncWarning(bool keepSelection) {
     const long long now = nowMs();
+    // 选择顺序（用户要求）：机构优先级 > 受保护预警 > 发震时刻。
+    //   · JMA/CEA 等权威机构的事件永远排在 USGS/GQ 前面 —— 即使后者正带着本地倒计时；
+    //   · 同机构下仍优先「达成本地烈度且有倒计时」的关键预警；
+    //   · 最后取较新的一报。
     auto selected = sessions_.active.find(selectedWarning_);
-    const bool currentIsProtected = (selected != sessions_.active.end() && isProtectedAlert(selected->second.event, now));
-
-    // 优选保障：如果有满足「触发本地烈度限制且有倒计时」的关键预警，
-    // 绝不能让非关键事件（如远方观测事件）作为 activeWarning 占据主焦点。
-    if (!currentIsProtected) {
+    const auto better = [&](const EarthquakeEvent& a, const EarthquakeEvent& b) {
+        const int rankA = agencyPriority(a);
+        const int rankB = agencyPriority(b);
+        if (rankA != rankB) return rankA > rankB;
+        const bool protectedA = isProtectedAlert(a, now);
+        const bool protectedB = isProtectedAlert(b, now);
+        if (protectedA != protectedB) return protectedA;
+        return a.timestamp > b.timestamp;
+    };
+    // 从当前选择出发、只在「严格更优」时替换：完全打平时保留用户翻页/系统上次的
+    // 选择，否则同一毫秒的两条事件会让 HUD 的「下一个」按了不动。
+    //
+    // keepSelection（用户刚翻页）时整段跳过：翻页本身已经决定了看哪一条，这里再按
+    // 优先级重挑会把选择改回最高优先级那条，而 mapFocus 已由 setMapFocus 换成新页 ——
+    // 结果是 HUD 内容在两条之间来回、页码却一直停在「1 / N」。选中项失效时仍走下面的
+    // 兜底循环（selected == end）。
+    if (!keepSelection || selected == sessions_.active.end()) {
         for (auto it = sessions_.active.begin(); it != sessions_.active.end(); ++it) {
-            if (isProtectedAlert(it->second.event, now)) {
+            if (it == selected) continue;
+            if (selected == sessions_.active.end() || better(it->second.event, selected->second.event))
                 selected = it;
-                selectedWarning_ = it->first;
-                break;
-            }
         }
     }
-
-    if (selected == sessions_.active.end() && !sessions_.active.empty()) {
-        selected = sessions_.active.begin();
-        selectedWarning_ = selected->first;
-    }
+    if (selected != sessions_.active.end()) selectedWarning_ = selected->first;
     hasActiveWarning_ = selected != sessions_.active.end();
     overlayVisible_ = false;
     countdown_ = -1;

@@ -192,6 +192,7 @@ set(KOMIRA_QML_FILES
     qml/StationIntensityCard.qml
     qml/SourceEstimateCard.qml
     qml/EstimateMarker.qml
+    qml/EpicenterInfo.qml
     qml/StationTooltip.qml
     qml/SettingsPage.qml
     qml/settings/AppearanceSection.qml

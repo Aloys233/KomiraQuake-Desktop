@@ -70,6 +70,25 @@ Column {
             onToggled: app.settings.showEstimatedEpicenter = checked
         }
 
+        GlassSwitch {
+            id: labelToggle
+            objectName: "showEstimateLabelSwitch"
+            width: parent.width; theme: root.theme
+            text: "显示推定震中标签"
+            description: "在标记旁常驻「区域 · 精度 · 报数」与震级深度，重叠时自动换边。"
+            checked: false
+            Binding {
+                target: labelToggle
+                property: "checked"
+                value: app.settings.showEstimateLabel
+                restoreMode: Binding.RestoreBindingOrValue
+            }
+            // 标记本身关掉时标签无处可挂：跟着灰掉，避免「开关开着却什么也看不见」。
+            enabled: app.settings.sourceEstimationEnabled
+                     && app.settings.showEstimatedEpicenter
+            onToggled: app.settings.showEstimateLabel = checked
+        }
+
         Text {
             width: parent.width
             // 依赖 `sourceEstimationRegionActive` 这个 Q_PROPERTY，而不是

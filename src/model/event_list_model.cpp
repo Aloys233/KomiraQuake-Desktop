@@ -1,6 +1,7 @@
 #include "model/event_list_model.h"
 
 #include <QDateTime>
+#include <QSet>
 
 namespace komira {
 
@@ -76,6 +77,41 @@ void EventListModel::setRows(std::vector<Row> rows) {
             indexById.insert(rows_[static_cast<std::size_t>(i)].id, i);
         }
     };
+    rebuildIndex();
+
+    // 目录合并会让同一场地震的「最佳来源」在 Wolfx / Pancakes 之间切换，行的 id 随之
+    // 变化，于是大量已有行需要挪位。逐行 beginMoveRows 在 QML 里每次都要重排 delegate：
+    // 实测一次启动刷新 51 次 move 就卡住 GUI 261 ms（窗口刚出来时表现为「点不动」）。
+    // 少量挪位仍走增量（保住滚动位置）；挪位很多时改成一次 reset：QML 只重建一次，
+    // 代价远低于几十次 move。
+    constexpr int kMaxIncrementalMoves = 8;
+    int lastIndex = -1;
+    int backwards = 0;
+    for (const Row& wanted : rows) {
+        const auto found = indexById.constFind(wanted.id);
+        if (found == indexById.constEnd()) continue;
+        if (found.value() < lastIndex) ++backwards;
+        else lastIndex = found.value();
+    }
+    if (backwards > kMaxIncrementalMoves) {
+        beginResetModel();
+        rows_ = std::move(rows);
+        endResetModel();
+        return;
+    }
+
+    // 先删掉新列表里已经不存在的行，再按位置匹配/插入。旧实现只在末尾裁剪，
+    // 一旦中间少了 1–2 行（换源导致 id 变化），后面每一行都会「找到更后面的同 id 行
+    // 并上移」，把 2 次删除放大成上百次 move —— 启动刷新的主要卡顿就来自这里。
+    QSet<QString> desiredIds;
+    desiredIds.reserve(static_cast<qsizetype>(rows.size()));
+    for (const Row& row : rows) desiredIds.insert(row.id);
+    for (int i = static_cast<int>(rows_.size()) - 1; i >= 0; --i) {
+        if (desiredIds.contains(rows_[static_cast<std::size_t>(i)].id)) continue;
+        beginRemoveRows({}, i, i);
+        rows_.erase(rows_.begin() + i);
+        endRemoveRows();
+    }
     rebuildIndex();
 
     for (int row = 0; row < static_cast<int>(rows.size()); ++row) {

@@ -25,6 +25,10 @@ Item {
     /// 是否有显式焦点（活动预警或用户点击）。仅此时才自动取景，
     /// 否则「最近一次事件」只画标记，不抢镜头。
     property bool hasFocus: false
+    /// 本地震源推算的焦点（`AppController::focusEstimate`）。非空时地图不画事件
+    /// 十字与波前，只把镜头锁到推定震中 —— 推算优先于 USGS/GQ 这类低优先级事件。
+    property var focusEstimate: null
+    readonly property bool estimateFocused: !!focusEstimate
     /// 相机是否在动（拖动 / 缩放动画 / 波前跟随）。玻璃卡片的背景模糊只在移动时逐帧
     /// 重采样：live 模糊源会让场景图永不空闲，窗口静止时也持续渲染地图子树。
     property bool cameraMoving: false
@@ -66,7 +70,10 @@ Item {
         gestureActive = false;
         if (pendingFocus) {
             pendingFocus = false;
-            frameEventImpl(undefined);
+            // 手势期间到达的焦点可能是推算（估算接管了低优先级事件）：必须走同一个
+            // 分支判断，否则 frameEventImpl 会因为没有事件而直接返回、镜头停在原地。
+            if (estimateFocused) frameEstimateImpl(undefined);
+            else frameEventImpl(undefined);
         }
         // 手势中窗口尺寸可能变过（minZoom 抬升），补做一次下界检查。
         if (root.zoom < root.minZoom) moveCamera(root.centerLat, root.centerLon, root.minZoom, 0);
@@ -250,15 +257,24 @@ Item {
     readonly property real minZoom: Math.max(1, Math.log2(Math.max(width, height) / tileSize))
     function clampZoom(z) { return Math.max(minZoom, Math.min(18, z)); }
 
-    /// 平滑移动镜头；duration 为 0 或开启"减少动态效果"时立即生效。
+    /// 平滑移动镜头；duration 为 0 或开启"减少动态效果"时立即生效
+    /// （补间进行中除外：此时零时长请求改为改航，见下）。
     /// 经度按最短路径插值，避免跨 ±180° 时绕行一整圈。
     function moveCamera(lat, lon, z, duration, mode) {
         const d = duration === undefined ? cameraDuration : duration;
-        cameraMove.stop();
-        cameraTweenMode = mode === undefined ? "flight" : mode;
         const targetLat = clampLat(lat);
+        // 经度按最短路径：相对当前位置取 ±180° 内的等价经度。
         const targetLon = centerLon + wrapLon(lon - centerLon);
         const targetZoom = clampZoom(z);
+        // 补间进行中收到"立即落位"（HUD 布局变化触发的重取景）：直接写属性会把飞行
+        // 硬切到终点，随后的入场补间起点就等于终点 —— 用户看到的就是"切换事件没有动画"。
+        // 改成从当前位置把剩余时长走完，落点仍是新目标。
+        if (d <= 0 && !theme.reduceMotion && cameraMove.running) {
+            retargetCamera(targetLat, targetLon, targetZoom);
+            return;
+        }
+        cameraMove.stop();
+        cameraTweenMode = mode === undefined ? "flight" : mode;
         if (theme.reduceMotion || d <= 0) {
             centerLat = targetLat;
             centerLon = wrapLon(targetLon);
@@ -272,6 +288,22 @@ Item {
         cameraTargetLon = targetLon;
         cameraTargetZoom = targetZoom;
         cameraMove.duration = d;
+        cameraMove.start();
+    }
+
+    /// 补间途中改航：不打断动画，从当前位置用剩余时长飞向新目标。
+    function retargetCamera(lat, lon, z) {
+        const remaining = Math.max(80, cameraMove.duration * (1 - cameraProgress));
+        cameraMove.stop();
+        cameraTweenMode = "flight";
+        cameraStartLat = centerLat;
+        cameraStartLon = centerLon;
+        cameraStartZoom = zoom;
+        cameraTargetLat = lat;
+        cameraTargetLon = centerLon + wrapLon(lon - centerLon);
+        cameraTargetZoom = clampZoom(z);
+        cameraProgress = 0;
+        cameraMove.duration = remaining;
         cameraMove.start();
     }
 
@@ -325,7 +357,7 @@ Item {
     property bool defaultOverviewDone: false
     function applyDefaultOverview() {
         if (defaultOverviewDone) return;
-        if (hasUser || hasFocus) { defaultOverviewDone = true; return; }
+        if (hasUser || hasFocus || estimateFocused) { defaultOverviewDone = true; return; }
         if (width <= 0 || height <= 0) return;
         defaultOverviewDone = true;
         following = false;
@@ -337,6 +369,12 @@ Item {
     function focusEvent() {
         if (gestureActive) {
             pendingFocus = true;
+            return;
+        }
+        // 推算焦点优先于事件焦点：Camera 跟到推定震中，事件十字与波前已由控制器隐藏
+        // （mapEvent 为空）。手势期间与事件聚焦共用 pendingFocus，松手后再飞。
+        if (estimateFocused) {
+            frameEstimateImpl(undefined);
             return;
         }
         frameEventImpl(undefined);
@@ -374,6 +412,46 @@ Item {
         const lat = unprojLat((minY + maxY) / 2 - (top - bottom) / (2 * scale), 0);
         const lon = unprojLon((minX + maxX) / 2 - (left - right) / (2 * scale), 0);
         moveCamera(lat, lon, z, animate === false ? 0 : cameraDuration);
+    }
+
+    /// 推定震中取景（见 focusEvent）。半径取「不确定度 × 2.5」，下限 120 km：
+    /// 推算解通常有 ±几十 km 的误差，贴太近会把不确定度圈裁出屏幕。
+    function frameEstimateImpl(animate) {
+        if (gestureActive) return;
+        following = false;
+        idleResetTimer.stop();
+        if (!estimateFocused || width <= 0 || height <= 0) return;
+        const lat = Number(focusEstimate.latitude);
+        const lon = Number(focusEstimate.longitude);
+        if (!isFinite(lat) || !isFinite(lon)) return;
+        const unc = Number(focusEstimate.uncertaintyKm);
+        const uncRadius = isFinite(unc) && unc > 0 ? unc * 2.5 : 200;
+        // 取景半径同时容纳不确定度圈与虚线波前：推算解常常只有几十 km 的误差，
+        // 但 P/S 波前很快会跑到几百 km，只按不确定度取景会让波前几秒就出屏。
+        const radiusKm = Math.max(120, uncRadius, root.wavePKmShown, root.waveSKmShown);
+        const x = projX(lon, 0);
+        const y = projY(lat, 0);
+        const r = radiusKm * 256 / (360 * 111.32 * Math.max(0.01, Math.cos(lat * Math.PI / 180)));
+        const minX = x - r, maxX = x + r, minY = y - r, maxY = y + r;
+        const left = Math.min(hudWidth + 24, width * 0.5);
+        const right = 76, top = hudHeight, bottom = bottomBadgeHeight;
+        const availableW = Math.max(80, width - left - right);
+        const availableH = Math.max(80, height - top - bottom);
+        const z = clampZoom(Math.log2(Math.min(availableW / (maxX - minX), availableH / (maxY - minY))));
+        const scale = Math.pow(2, z);
+        const centerLat = unprojLat((minY + maxY) / 2 - (top - bottom) / (2 * scale), 0);
+        const centerLon = unprojLon((minX + maxX) / 2 - (left - right) / (2 * scale), 0);
+        moveCamera(centerLat, centerLon, z, animate === false ? 0 : cameraDuration);
+    }
+    // 推算焦点可能在 MapView 创建**之前**就已存在（控制器先出解、窗口后加载）：
+    // 那条路径不会再有 centerMapRequested 可等，必须在属性到位后主动取一次景；
+    // 否则 applyDefaultOverview 只会按全国概览落位，镜头停在推定震中之外。
+    onEstimateFocusedChanged: {
+        if (!estimateFocused) return;
+        defaultOverviewDone = true;
+        Qt.callLater(function() {
+            if (estimateFocused && !gestureActive) frameEstimateImpl(undefined);
+        });
     }
 
     /// 波前（P/S）是否出现过。用于识别"波前消失"的瞬间并自动回到默认视野。
@@ -425,6 +503,13 @@ Item {
                     root.wavesShown = true;
                     root.wavesStarted();
                 }
+                // 推算焦点：相机跟着虚线波前走（与事件跟随同一节奏），否则波前几秒
+                // 就会跑出按不确定度取景的视野。
+                if (root.estimateFocused) {
+                    if (cameraMove.running || root.gestureActive) return;
+                    root.frameEstimateImpl(false);
+                    return;
+                }
                 if (!root.following || !root.hasFocus) return;
                 if (cameraMove.running) return;
                 // 用户正按住地图：推迟到松开后再重新取景，避免与拖拽抢镜头。
@@ -454,7 +539,7 @@ Item {
         id: idleResetTimer
         interval: root.idleResetMs
         onTriggered: {
-            if (root.pickingLocation || root.following) return;
+            if (root.pickingLocation || root.following || root.estimateFocused) return;
             // 用户仍按着地图：本轮作废，重新计时；松开后无操作自然再触发。
             if (root.gestureActive) { idleResetTimer.restart(); return; }
             // 有活动预警时归位到预警震中并重新跟随；否则回到我的位置（无定位则全国概览）。
@@ -471,6 +556,8 @@ Item {
         const currentId = root.eventIdentity();
         if (eventEndResetTimer.running && currentId !== "" &&
             currentId !== root.pendingEventEndId) root.cancelEventEndReset();
+        // 换了事件：悬停态不能跟着旧震中带过去（指针没动，热区却已挪到别处）。
+        epicenterHover = false;
     }
     /// 当前（或目标）整数缩放层级：相机动画进行中取动画目标，否则取当前值。
     /// 以目标为基准，快速连续滚动时每一格都实打实 ±1，不会被进行中的补间吞掉。
@@ -501,12 +588,14 @@ Item {
         applyDefaultOverview();
         if (root.gestureActive) return;
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
+        else if (estimateFocused) Qt.callLater(() => frameEstimateImpl(false));
         else if (!hasFocus && !hasUser && !userMovedCamera) Qt.callLater(() => frameChina(false));
     }
     onHeightChanged: {
         applyDefaultOverview();
         if (root.gestureActive) return;
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
+        else if (estimateFocused) Qt.callLater(() => frameEstimateImpl(false));
         else if (!hasFocus && !hasUser && !userMovedCamera) Qt.callLater(() => frameChina(false));
     }
     onHudWidthChanged: reframeForLayout()
@@ -516,6 +605,7 @@ Item {
         applyDefaultOverview();
         if (root.gestureActive) return;
         if (following && hasFocus) Qt.callLater(() => frameEvent(false));
+        else if (estimateFocused) Qt.callLater(() => frameEstimateImpl(false));
         else if (!hasFocus && !hasUser && !userMovedCamera) Qt.callLater(() => frameChina(false));
     }
     // 窗口尺寸变化后最小缩放随之变化：当前缩放若已低于新下界就抬上来，避免露出背景带。
@@ -742,8 +832,30 @@ Item {
     readonly property var shiftedHypo: hasEvent ? shiftCoord(event.latitude, event.longitude) : ({ lat: 0, lon: 0 })
     readonly property real hypocenterX: hasEvent ? screenX(shiftedHypo.lon) : 0
     readonly property real hypocenterY: hasEvent ? screenY(shiftedHypo.lat) : 0
+    /// 波前圆/填充的中心：事件焦点用事件震中，推算焦点用推定震中。
+    /// 只在地点或纠偏制式变化时重算一次（`shiftCoord` 在国内会跨 C++ 边界），
+    /// 不随镜头逐帧调用。
+    readonly property var waveCenter: {
+        if (estimateFocused) {
+            const lat = Number(focusEstimate.latitude);
+            const lon = Number(focusEstimate.longitude);
+            if (isFinite(lat) && isFinite(lon)) return shiftCoord(lat, lon);
+            return ({ lat: 0, lon: 0 });
+        }
+        return shiftedHypo;
+    }
+    readonly property real waveCenterX: (hasEvent || estimateFocused) ? screenX(waveCenter.lon) : 0
+    readonly property real waveCenterY: (hasEvent || estimateFocused) ? screenY(waveCenter.lat) : 0
     /// px per km。墨卡托保角，水平/垂直同尺度：worldPx/360° ÷ (111.32·cosφ) km/°。
-    readonly property real pxPerKmValue: hasEvent ? pxPerKm(shiftedHypo.lat) : 1.0
+    /// 推算焦点没有事件，必须用推定震中的纬度；否则 pxPerKm 恒为 1，波前与
+    /// 不确定度圈都会被画错尺寸。
+    readonly property real pxPerKmValue: {
+        if (estimateFocused) {
+            const lat = Number(focusEstimate.latitude);
+            if (isFinite(lat)) return pxPerKm(lat);
+        }
+        return hasEvent ? pxPerKm(shiftedHypo.lat) : 1.0;
+    }
 
     clip: true
 
@@ -959,21 +1071,39 @@ Item {
 
     // P/S 波前圆：半径由 AppController 反解走时表得到（km），-1 表示不画；
     // 透明度按烈度影响半径渐隐（对齐 kanameishi），归零即隐藏。
-    Rectangle {
+    // 普通事件用实线（原样）；只有**本地震源推算**的波前用虚线 —— 它是反推出来的
+    // 推定边界，实线会被误读成观测等时线。两者颜色相同（pWave / sWave）。
+    Shape {
         id: pWaveRing
         objectName: "pWaveRing"
-        readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.wavePKm : -1
+        readonly property real radiusKm:
+            (root.hasEvent && root.hasFocus) || root.estimateFocused ? app.wavePKm : -1
+        /// 虚线只属于推算焦点；普通事件仍是实线。
+        readonly property bool dashed: root.estimateFocused
         z: 2
         visible: radiusKm > 0 && app.settings.showWavefront
         opacity: app.wavePOpacity
-        x: root.hypocenterX - width / 2
-        y: root.hypocenterY - height / 2
+        x: root.waveCenterX - width / 2
+        y: root.waveCenterY - height / 2
         width: Math.max(2, 2 * root.wavePKmShown * root.pxPerKmValue)
         height: width
-        radius: width / 2
-        color: "transparent"
-        border.width: 2
-        border.color: root.theme.pWave
+        ShapePath {
+            strokeColor: root.theme.pWave
+            strokeWidth: 2
+            fillColor: "transparent"
+            strokeStyle: pWaveRing.dashed ? ShapePath.DashLine : ShapePath.SolidLine
+            dashPattern: [6, 4]
+            startX: pWaveRing.width / 2
+            startY: 0
+            PathAngleArc {
+                centerX: pWaveRing.width / 2
+                centerY: pWaveRing.height / 2
+                radiusX: pWaveRing.width / 2
+                radiusY: pWaveRing.height / 2
+                startAngle: -90
+                sweepAngle: 360
+            }
+        }
     }
 
     // S 波径向渐变填充（对齐 kanameishi 的 sWaveFill）：中心透明、边缘着色，
@@ -981,13 +1111,17 @@ Item {
     Shape {
         id: sWaveFill
         objectName: "sWaveFill"
-        readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveSKm : -1
+        readonly property real radiusKm:
+            (root.hasEvent && root.hasFocus) || root.estimateFocused ? app.waveSKm : -1
         readonly property real fillOpacity: app.waveSFillOpacity
         z: 2
+        // 推算焦点不画 S 波渐变填充：填充的边缘本身就是一圈实色，会把虚线 S 波
+        // 又"补"成实线；此时只留 P/S 两条虚线，边界才明确是推定值。
         visible: radiusKm > 0 && fillOpacity > 0 && app.settings.showWavefront
+                 && !root.estimateFocused
         opacity: fillOpacity
-        x: root.hypocenterX - width / 2
-        y: root.hypocenterY - height / 2
+        x: root.waveCenterX - width / 2
+        y: root.waveCenterY - height / 2
         width: Math.max(2, 2 * root.waveSKmShown * root.pxPerKmValue)
         height: width
         ShapePath {
@@ -1014,21 +1148,37 @@ Item {
         }
     }
 
-    Rectangle {
+    Shape {
         id: sWaveRing
         objectName: "sWaveRing"
-        readonly property real radiusKm: root.hasEvent && root.hasFocus ? app.waveSKm : -1
+        readonly property real radiusKm:
+            (root.hasEvent && root.hasFocus) || root.estimateFocused ? app.waveSKm : -1
+        /// 与 P 波同一规则：只有推算焦点用虚线。
+        readonly property bool dashed: root.estimateFocused
         z: 2
         visible: radiusKm > 0 && app.settings.showWavefront
         opacity: app.waveSOpacity
-        x: root.hypocenterX - width / 2
-        y: root.hypocenterY - height / 2
+        x: root.waveCenterX - width / 2
+        y: root.waveCenterY - height / 2
         width: Math.max(2, 2 * root.waveSKmShown * root.pxPerKmValue)
         height: width
-        radius: width / 2
-        color: "transparent"
-        border.width: 2
-        border.color: root.theme.sWave
+        ShapePath {
+            strokeColor: root.theme.sWave
+            strokeWidth: 2
+            fillColor: "transparent"
+            strokeStyle: sWaveRing.dashed ? ShapePath.DashLine : ShapePath.SolidLine
+            dashPattern: [6, 4]
+            startX: sWaveRing.width / 2
+            startY: 0
+            PathAngleArc {
+                centerX: sWaveRing.width / 2
+                centerY: sWaveRing.height / 2
+                radiusX: sWaveRing.width / 2
+                radiusY: sWaveRing.height / 2
+                startAngle: -90
+                sweepAngle: 360
+            }
+        }
     }
 
     // 震中 X 十字。参考 kanameishi eqlistCross.svg：10px 米黄描边打底 + 6px 红描边。
@@ -1081,6 +1231,44 @@ Item {
     }
 
     } // mapRenderLayer
+
+    // 震中下方的浮动信息（对齐 kanameishi）：震中地名 + M/深度/烈度 + 数据源。
+    // 放在 mapRenderLayer **之外**：它是可读性优先的文字，不该被自己的背景模糊
+    // 采样进去（地图内容会被模糊，文字不会）。
+    //
+    // 只在指针悬停震中十字时显示：地图上已有波前、测站、纠偏标记，常驻的文字标签
+    // 会一直压在它们上面。热区比十字略大（44px），方便贴近；不接收按键，拖动/滚轮
+    // 仍落到下面的地图 MouseArea。
+    property bool epicenterHover: false
+    MouseArea {
+        id: epicenterHoverArea
+        objectName: "epicenterHoverArea"
+        z: 3
+        visible: root.hasEvent && !root.gestureActive
+        x: root.hypocenterX - 22
+        y: root.hypocenterY - 22
+        width: 44
+        height: 44
+        acceptedButtons: Qt.NoButton
+        hoverEnabled: true
+        onContainsMouseChanged: root.epicenterHover = containsMouse
+        // 热区消失（事件清空/开始拖动）时把悬停态复位：否则新事件会带着旧的悬停态出现。
+        onVisibleChanged: if (!visible) root.epicenterHover = false
+    }
+
+    EpicenterInfo {
+        id: epicenterInfo
+        theme: root.theme
+        shown: root.epicenterHover
+        backdropSource: mapRenderLayer
+        backdropLive: root.cameraMoving
+        event: root.event
+        anchorX: root.hypocenterX
+        anchorY: root.hypocenterY
+        viewportWidth: root.width
+        viewportHeight: root.height
+        z: 3
+    }
 
     // ---- 测站强度层 ------------------------------------------------------
     // 上千个测站由 C++ 一次批量绘制（逐 Item 会拖垮场景图）。
@@ -1145,46 +1333,182 @@ Item {
         const top = app.sourceEstimateMarker;
         return !!top && top.id === regionId;
     }
+
+    /// 常驻标签开关。默认开（见 SettingsStore::showEstimateLabel）：标记只有形状时，
+    /// 两三区同屏分不清哪个是哪个台网，也看不出震级/深度。
+    readonly property bool estimateLabelsEnabled: !!app.settings.showEstimateLabel
+
+    /// 四个推定震中标签的统排结果：`id -> { dx, dy }`，即标签左上角相对标记中心的偏移。
+    /// 没有条目 = 这次不显示该标签。
+    ///
+    /// 逐个标记各自挂标签是不够的：区域解常常相邻（中国东部 / 韩国 / 台湾），固定朝下
+    /// 会互相压住；贴近视口边缘时还会被裁掉。这里对齐 kanameishi 的
+    /// `layoutInferredHypocenterLabels`（参考/kanameishi/.../NiedNet.vue）：四方向候选
+    /// → 视口夹取 → 与已放置矩形做碰撞检测，先给置信度最高的区域挑位置。
+    ///
+    /// 每次相机/载荷变化都会重算（绑定里读了 centerLon/zoom/width 等）：
+    /// 四个标签 × 四个候选是纯算术，代价远小于一次重绘。
+    readonly property var estimateLabelLayout: root.computeEstimateLabelLayout()
+
+    function computeEstimateLabelLayout() {
+        const out = ({});
+        if (!estimateLabelsEnabled || width <= 0 || height <= 0) return out;
+
+        // 相机依赖：screenX/screenY 在求值期间读到 centerLon/zoom/width/origin，绑定
+        // 因此会自动跟着镜头重算；这里再显式读一次，避免将来 screenX 改成常量后
+        // 布局悄悄停在旧位置。
+        const viewportW = width;
+        const viewportH = height;
+        const shiftedMap = estimateShifted;
+
+        const list = [
+            { id: "china", item: chinaEstimateMarker },
+            { id: "japan", item: japanEstimateMarker },
+            { id: "korea", item: koreaEstimateMarker },
+            { id: "taiwan", item: taiwanEstimateMarker }
+        ];
+        const pending = [];
+        for (let i = 0; i < list.length; ++i) {
+            const entry = list[i];
+            const item = entry.item;
+            if (!item || !item.active || !item.labelEnabled) continue;
+            const s = shiftedMap[entry.id];
+            if (!s) continue;
+            pending.push({
+                id: entry.id,
+                cx: root.screenX(s.lon),
+                cy: root.screenY(s.lat),
+                w: item.labelWidth,
+                h: item.labelHeight,
+                // 位置不够时先保证据最强的区域。
+                confidence: item.info && item.info.confidence !== undefined
+                    ? Number(item.info.confidence) : 0
+            });
+        }
+        return root.placeEstimateLabels(pending, viewportW, viewportH);
+    }
+
+    /// 纯几何：把一组已投影到屏幕的标签排开，返回 `id -> { dx, dy }`
+    /// （标签左上角相对标记中心的偏移）。
+    ///
+    /// 与数据采集分开是为了能直接测：GUI 回归喂几个重叠的点，就能验证换边、
+    /// 视口夹取与「视口外的震中不挂标签」，不需要真的造两次地震。
+    function placeEstimateLabels(points, viewportW, viewportH) {
+        const out = ({});
+        if (!points || points.length === 0 || viewportW <= 0 || viewportH <= 0) return out;
+
+        const sorted = points.slice(0);
+        // 同强度按 id 定序，保证同一份输入永远得到同一份布局（截图回归依赖它）。
+        sorted.sort((a, b) => (b.confidence - a.confidence)
+                               || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+        const pad = 8;      // 距视口边缘
+        const gap = 24;     // 标签到标记中心的距离（菱形边长 18，留出呼吸）
+        const collide = 4;  // 标签之间的最小间隙
+        const placed = [];
+        for (let i = 0; i < sorted.length; ++i) {
+            const p = sorted[i];
+            // 震中在视口外就不挂标签：夹到边缘会变成一条与震中脱节的浮字。
+            if (p.cx < 0 || p.cx > viewportW || p.cy < 0 || p.cy > viewportH) continue;
+            const candidates = [
+                { dx: -p.w / 2, dy: gap },             // 下
+                { dx: -p.w / 2, dy: -gap - p.h },      // 上
+                { dx: gap, dy: -p.h / 2 },             // 右
+                { dx: -gap - p.w, dy: -p.h / 2 }       // 左
+            ];
+            let chosen = null;
+            for (let c = 0; c < candidates.length; ++c) {
+                // 先夹进视口再判碰撞：贴边的震中不夹取就会被地图的 clip 裁掉半截。
+                const left = Math.max(pad, Math.min(viewportW - p.w - pad, p.cx + candidates[c].dx));
+                const top = Math.max(pad, Math.min(viewportH - p.h - pad, p.cy + candidates[c].dy));
+                const rect = {
+                    left: left,
+                    top: top,
+                    right: left + p.w,
+                    bottom: top + p.h,
+                    dx: left - p.cx,
+                    dy: top - p.cy
+                };
+                let overlaps = false;
+                for (let q = 0; q < placed.length; ++q) {
+                    const o = placed[q];
+                    if (!(rect.right + collide <= o.left || rect.left >= o.right + collide
+                          || rect.bottom + collide <= o.top || rect.top >= o.bottom + collide)) {
+                        overlaps = true;
+                        break;
+                    }
+                }
+                if (!overlaps) { chosen = rect; break; }
+                // 四个方向都冲突时仍用第一个（下方）：宁可叠一点也别让标签消失。
+                if (!chosen) chosen = rect;
+            }
+            out[p.id] = { dx: chosen.dx, dy: chosen.dy };
+            placed.push(chosen);
+        }
+        return out;
+    }
+
     EstimateMarker {
+        id: chinaEstimateMarker
         info: root.estimateMarker("china")
         regionId: "china"
         primary: root.estimateMarkerPrimary("china")
         theme: root.theme
         kmPerPixel: root.pxPerKmValue
+        labelEnabled: root.estimateLabelsEnabled
+        labelPlacement: root.estimateLabelLayout["china"] || null
         visible: active && !!app.settings.showEstimatedEpicenter
         z: 4
         // 纠偏结果由 estimateShifted 统一算一次（见那里的注释），不再每个绑定各调一次。
         shifted: root.estimateShifted["china"] || ({ lat: 0, lon: 0 })
+        // 标记必须跟着地图投影走；此前只注入了 shifted 却没有写 x/y，四个标记全叠在 (0,0)。
+        x: root.screenX(shifted.lon) - width / 2
+        y: root.screenY(shifted.lat) - height / 2
     }
     EstimateMarker {
+        id: japanEstimateMarker
         info: root.estimateMarker("japan")
         regionId: "japan"
         primary: root.estimateMarkerPrimary("japan")
         theme: root.theme
         kmPerPixel: root.pxPerKmValue
+        labelEnabled: root.estimateLabelsEnabled
+        labelPlacement: root.estimateLabelLayout["japan"] || null
         visible: active && !!app.settings.showEstimatedEpicenter
         z: 4
         shifted: root.estimateShifted["japan"] || ({ lat: 0, lon: 0 })
+        x: root.screenX(shifted.lon) - width / 2
+        y: root.screenY(shifted.lat) - height / 2
     }
     EstimateMarker {
+        id: koreaEstimateMarker
         info: root.estimateMarker("korea")
         regionId: "korea"
         primary: root.estimateMarkerPrimary("korea")
         theme: root.theme
         kmPerPixel: root.pxPerKmValue
+        labelEnabled: root.estimateLabelsEnabled
+        labelPlacement: root.estimateLabelLayout["korea"] || null
         visible: active && !!app.settings.showEstimatedEpicenter
         z: 4
         shifted: root.estimateShifted["korea"] || ({ lat: 0, lon: 0 })
+        x: root.screenX(shifted.lon) - width / 2
+        y: root.screenY(shifted.lat) - height / 2
     }
     EstimateMarker {
+        id: taiwanEstimateMarker
         info: root.estimateMarker("taiwan")
         regionId: "taiwan"
         primary: root.estimateMarkerPrimary("taiwan")
         theme: root.theme
         kmPerPixel: root.pxPerKmValue
+        labelEnabled: root.estimateLabelsEnabled
+        labelPlacement: root.estimateLabelLayout["taiwan"] || null
         visible: active && !!app.settings.showEstimatedEpicenter
         z: 4
         shifted: root.estimateShifted["taiwan"] || ({ lat: 0, lon: 0 })
+        x: root.screenX(shifted.lon) - width / 2
+        y: root.screenY(shifted.lat) - height / 2
     }
 
     // ---- 测站悬停浮层 ----------------------------------------------------

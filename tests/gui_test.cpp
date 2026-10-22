@@ -50,6 +50,33 @@ static QQuickItem* findVisualItem(QQuickWindow* window, const QString& name) {
     return nullptr;
 }
 
+// 波前圆的「蓝色命中率」：沿圆右半侧（避开左侧 HUD / 右侧工具条）在半径 ±3 px
+// 内找 P 波蓝，返回有蓝的采样格占比。实线接近 1；虚线会出现成片空缺。
+// 只断言 ShapePath 的属性抓不到「strokeStyle 写错退化成实线」，必须看像素。
+static double blueRingHitRatio(QQuickWindow* window, const QPointF& sceneCenter, double radiusPx) {
+    const QImage img = window->grabWindow();
+    if (img.isNull() || radiusPx <= 0.0 || window->width() <= 0) return -1.0;
+    const double scale = static_cast<double>(img.width()) / window->width();
+    const auto isWaveBlue = [&](int x, int y) {
+        if (x < 0 || y < 0 || x >= img.width() || y >= img.height()) return false;
+        const QColor c = img.pixelColor(x, y);
+        return c.blue() > 140 && c.blue() > c.red() + 25 && c.blue() > c.green() + 5;
+    };
+    int bins = 0;
+    int hits = 0;
+    for (double angle = -0.95; angle <= 0.95; angle += 0.005) {
+        ++bins;
+        bool hit = false;
+        for (int dr = -3; dr <= 3 && !hit; ++dr) {
+            const int x = qRound((sceneCenter.x() + std::cos(angle) * (radiusPx + dr)) * scale);
+            const int y = qRound((sceneCenter.y() + std::sin(angle) * (radiusPx + dr)) * scale);
+            hit = isWaveBlue(x, y);
+        }
+        if (hit) ++hits;
+    }
+    return bins > 0 ? static_cast<double>(hits) / bins : -1.0;
+}
+
 // 按 objectName 点击可见控件（命中判定与用户视角一致：滚动裁剪之外的点不点）。
 static bool clickByName(QQuickWindow* window, const QString& name) {
     auto* item = findVisualItem(window, name);
@@ -2335,6 +2362,11 @@ private slots:
         QVERIFY(toggle);
         QVERIFY(clickByName(window, "sourceEstimationSwitch"));
         QTRY_VERIFY(controller.settings()->sourceEstimationEnabled());
+        // 常驻标签开关：默认开，点一次落盘为关。必须在关掉「地图标记」之前点 ——
+        // 标记关掉后标签开关会跟着灰掉（标签无处可挂）。
+        QVERIFY(controller.settings()->showEstimateLabel());
+        QVERIFY(clickByName(window, "showEstimateLabelSwitch"));
+        QTRY_VERIFY(!controller.settings()->showEstimateLabel());
         QVERIFY(clickByName(window, "showEstimatedEpicenterSwitch"));
         QTRY_VERIFY(!controller.settings()->showEstimatedEpicenter());
 
@@ -2375,6 +2407,241 @@ private slots:
         controller.settings()->resetToDefaults();
         QVERIFY(!controller.settings()->sourceEstimationEnabled());
         QVERIFY(controller.settings()->showEstimatedEpicenter());
+        // 标签默认开：恢复默认后必须和标记一样回到「显示」。
+        QVERIFY(controller.settings()->showEstimateLabel());
+    }
+
+    /// 推定震中的常驻标签：文字必须贴着标记、贴边不裁切、两区同屏时不互相压住。
+    ///
+    /// 对齐 kanameishi 的「推定震源」浮层（参考/kanameishi 的 NiedNet.vue，
+    /// layoutInferredHypocenterLabels）：标签不是固定挂在标记下方 ——
+    /// 区域解常常相邻（中国东部 / 韩国 / 台湾），固定朝下会叠字；靠近视口边缘时
+    /// 还会被地图的 clip 裁掉。本用例分两层：
+    ///   · 纯几何：直接喂点给 `placeEstimateLabels()`，验证换边、视口夹取、
+    ///     视口外的震中不挂标签（不需要真的造两次地震）；
+    ///   · 集成：真实出解后标签真的渲染在标记旁，文本带精度/震级/深度/站数，
+    ///     设置开关一关就消失而标记仍在。
+    void estimateLabelsSitBesideMarkers() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EstimateLabelLayoutTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setSourceEstimationEnabled(true);
+        // 中国区默认只对开发者模式开放（只有日本区在真实台网上标定过）。
+        controller.settings()->setDeveloperMode(true);
+        controller.settings()->setSourceEstimationRegionEnabled("china", true);
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(map);
+
+        // ---- 1. 纯几何：两个几乎重合的标签必须换边，不能叠在一起 ----
+        auto layoutFor = [&](const QVariantList& points, double vw, double vh) {
+            QVariant out;
+            const bool ok = QMetaObject::invokeMethod(map, "placeEstimateLabels",
+                                                      Q_RETURN_ARG(QVariant, out),
+                                                      Q_ARG(QVariant, points),
+                                                      Q_ARG(QVariant, vw),
+                                                      Q_ARG(QVariant, vh));
+            return ok ? out.toMap() : QVariantMap();
+        };
+        auto labelPoint = [](const QString& id, double cx, double cy, double confidence) {
+            QVariantMap p;
+            p["id"] = id;
+            p["cx"] = cx;
+            p["cy"] = cy;
+            p["w"] = 176.0;
+            p["h"] = 30.0;
+            p["confidence"] = confidence;
+            return QVariant(p);
+        };
+        {
+            QVariantList points;
+            points << labelPoint("a", 400, 300, 0.9) << labelPoint("b", 420, 320, 0.5);
+            const QVariantMap layout = layoutFor(points, 800, 600);
+            QVERIFY2(layout.contains("a") && layout.contains("b"), "两个标签都必须有位置");
+            const QVariantMap a = layout.value("a").toMap();
+            const QVariantMap b = layout.value("b").toMap();
+            // 置信度高的先挑：第一个候选就是「下方」，偏移等于 gap（24）。
+            QCOMPARE(a.value("dy").toDouble(), 24.0);
+            const QRectF ra(400 + a.value("dx").toDouble(), 300 + a.value("dy").toDouble(),
+                            176, 30);
+            const QRectF rb(420 + b.value("dx").toDouble(), 320 + b.value("dy").toDouble(),
+                            176, 30);
+            QVERIFY2(!ra.intersects(rb),
+                     qPrintable(QStringLiteral("两个推定震中标签重叠: a=%1,%2 b=%3,%4")
+                                    .arg(ra.x()).arg(ra.y()).arg(rb.x()).arg(rb.y())));
+            // 第二个必须离开「下方」（会被 a 压住）。
+            QVERIFY2(b.value("dy").toDouble() != 24.0, "第二枚标签未换边");
+        }
+        // ---- 2. 贴边：夹进视口，不允许伸出边缘（伸出部分会被 clip 裁掉） ----
+        {
+            QVariantList points;
+            points << labelPoint("edge", 5, 5, 0.9);
+            const QVariantMap layout = layoutFor(points, 800, 600);
+            QVERIFY(layout.contains("edge"));
+            const QVariantMap edge = layout.value("edge").toMap();
+            const double left = 5 + edge.value("dx").toDouble();
+            const double top = 5 + edge.value("dy").toDouble();
+            QVERIFY2(left >= 7.5 && left + 176 <= 792.5,
+                     qPrintable(QStringLiteral("贴边标签水平越界: left=%1").arg(left)));
+            QVERIFY2(top >= 7.5 && top + 30 <= 592.5,
+                     qPrintable(QStringLiteral("贴边标签垂直越界: top=%1").arg(top)));
+        }
+        // ---- 3. 视口外的震中不挂标签（夹到边缘会变成与震中脱节的浮字） ----
+        {
+            QVariantList points;
+            points << labelPoint("outside", -80, 300, 0.9);
+            QVERIFY(!layoutFor(points, 800, 600).contains("outside"));
+        }
+
+        // ---- 4. 集成：真实出解后标签渲染在标记旁 ----
+        std::vector<StationSnapshot::Entry> frame;
+        std::vector<StationSnapshot::StationMeta> metas;
+        for (double lat = 28.4; lat <= 31.6 + 1e-9; lat += 0.2) {
+            for (double lon = 102.4; lon <= 105.6 + 1e-9; lon += 0.2) {
+                StationSnapshot::Entry e;
+                e.lat = lat;
+                e.lon = lon;
+                e.csis = true;
+                e.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Csis, 5.8,
+                    QuakeCalculator::haversineDistance(30.0, 104.0, lat, lon), 10.0);
+                e.meta = static_cast<int>(frame.size());
+                frame.push_back(e);
+                StationSnapshot::StationMeta m;
+                m.source = QStringLiteral("PancakesSeis");
+                metas.push_back(m);
+            }
+        }
+        controller.stationSnapshot_->setEntries(frame, metas);
+        controller.sourceEstimation_->ingestObservations(frame);
+        controller.sourceEstimation_->runEstimation();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            controller.sourceEstimation_->regionState(SourceRegion::China).estimate.valid, 5000);
+        if (controller.sourceEstimation_->watcher_.isRunning())
+            controller.sourceEstimation_->watcher_.waitForFinished();
+        QCoreApplication::processEvents();
+        // 标签只给视口内的震中挂：把镜头挪到推定震中上。
+        QVERIFY(QMetaObject::invokeMethod(map, "moveCamera",
+                                          Q_ARG(QVariant, 30.0), Q_ARG(QVariant, 104.0),
+                                          Q_ARG(QVariant, 7.0), Q_ARG(QVariant, 0.0),
+                                          Q_ARG(QVariant, QStringLiteral("flight"))));
+        QTest::qWait(250);
+
+        auto* marker = window->findChild<QQuickItem*>("sourceEstimateMarker");
+        auto* label = window->findChild<QQuickItem*>("sourceEstimateLabel-china");
+        auto* title = window->findChild<QQuickItem*>("sourceEstimateLabelTitle-china");
+        auto* meta = window->findChild<QQuickItem*>("sourceEstimateLabelMeta-china");
+        QVERIFY2(marker && label && title && meta, "缺少常驻标签");
+        QTRY_VERIFY2(label->isVisible(), "推定震中旁没有常驻标签");
+        // 文本契约：首行「区域 · 精度 X · 第 N 报」，次行「M x.x · 深 xx km · N 站」。
+        QVERIFY2(title->property("text").toString().contains(QStringLiteral("精度 ")),
+                 qPrintable(QStringLiteral("标签首行缺少精度: ")
+                                + title->property("text").toString()));
+        QVERIFY2(title->property("text").toString().contains(QStringLiteral("报")),
+                 qPrintable(QStringLiteral("标签首行缺少报数: ")
+                                + title->property("text").toString()));
+        const QString metaText = meta->property("text").toString();
+        QVERIFY2(metaText.contains(QStringLiteral("M ")) && metaText.contains(QStringLiteral("深 ")),
+                 qPrintable(QStringLiteral("标签次行缺少震级/深度: ") + metaText));
+        QVERIFY2(metaText.contains(QStringLiteral("站")),
+                 qPrintable(QStringLiteral("标签次行缺少站数: ") + metaText));
+
+        // 几何契约：标签完整落在视口内，且不压住震中标记本身。
+        const QPointF labelPos = label->mapToItem(map, QPointF(0, 0));
+        const QRectF labelRect(labelPos, QSizeF(label->width(), label->height()));
+        QVERIFY2(labelRect.left() >= 7.5 && labelRect.right() <= map->width() - 7.5,
+                 qPrintable(QStringLiteral("标签水平越界: %1..%2 / 视口 %3")
+                                .arg(labelRect.left()).arg(labelRect.right()).arg(map->width())));
+        QVERIFY2(labelRect.top() >= 7.5 && labelRect.bottom() <= map->height() - 7.5,
+                 qPrintable(QStringLiteral("标签垂直越界: %1..%2 / 视口 %3")
+                                .arg(labelRect.top()).arg(labelRect.bottom()).arg(map->height())));
+        const QPointF markerCenter = marker->mapToItem(
+            map, QPointF(marker->width() / 2, marker->height() / 2));
+        const QRectF markerBox(markerCenter - QPointF(9, 9), QSizeF(18, 18));
+        QVERIFY2(!labelRect.intersects(markerBox), "标签压住了震中标记");
+
+        // 开关：关掉标签后标记必须还在（两个开关互不连带）。
+        controller.settings()->setShowEstimateLabel(false);
+        QTRY_VERIFY(!label->isVisible());
+        QVERIFY(marker->isVisible());
+        controller.settings()->setShowEstimateLabel(true);
+        QTRY_VERIFY(label->isVisible());
+
+        QTest::qWait(150);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window) + "/48-estimate-label.png"));
+    }
+
+    /// 回归：左上角 HUD 的翻页按钮必须能翻到**每一条**活动事件，页码跟着走。
+    ///
+    /// 用户报的现象：「切换按钮只能切换两个，显示还不变化，一直是 1/3」。
+    /// 根因在 `shiftHud()` 末尾无条件调用 `syncWarning()`：后者从「当前选择」出发，
+    /// 只要会话里有机构优先级更高的事件就把它顶回去。于是翻页改的是 `mapFocus_`
+    /// （HUD 内容跟着换），而 `selectedWarning_`（页码来源）瞬间被改回最高优先级那条 ——
+    /// 页码卡在 1/N，内容只在「最优那条」和「第一次翻到的那条」之间来回。
+    /// 这里用 1 条 JMA + 2 条 GQ 固定复现：JMA 永远比 GQ 更优。
+    void hudPagerCyclesAllActiveEvents() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("HudPagerTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+
+        auto make = [&](const QString& id, const QString& agency, double lon) {
+            EarthquakeEvent e;
+            e.id = e.eventId = id.toStdString();
+            e.sourceProvider = "Wolfx";
+            e.sourceAgency = agency.toStdString();
+            e.source = agency == QStringLiteral("JMA") ? "JMA 紧急地震速报" : "GQ 地震信息";
+            e.timestamp = e.reportTime = now;
+            e.latitude = 35.0;
+            e.longitude = lon;
+            e.depth = 10.0;
+            e.magnitude = 5.0;
+            e.location = id.toStdString();
+            return e;
+        };
+        controller.handleEvent(make(QStringLiteral("HUD-JMA"), QStringLiteral("JMA"), 140.0),
+                               false, false);
+        controller.handleEvent(make(QStringLiteral("HUD-GQ-1"), QStringLiteral("GQ"), 104.0),
+                               false, false);
+        controller.handleEvent(make(QStringLiteral("HUD-GQ-2"), QStringLiteral("GQ"), 105.0),
+                               false, false);
+        QCOMPARE(controller.hudCount(), 3);
+        // 优先级最高的（JMA）排在第一页。
+        QCOMPARE(controller.hudIndex(), 0);
+
+        // 向后翻满一圈：1 → 2 → 3 → 1。每一页都必须真的到位。
+        for (int step = 1; step <= 3; ++step) {
+            controller.hudNext();
+            QCOMPARE(controller.hudIndex(), step % 3);
+        }
+        // 向前翻也要按环形走。
+        controller.hudPrev();
+        QCOMPARE(controller.hudIndex(), 2);
+        controller.hudPrev();
+        QCOMPARE(controller.hudIndex(), 1);
     }
 
     /// 回归：震源推算设置页的开关与滑块必须**真的**生效。
@@ -2842,6 +3109,85 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(map->property("following").toBool(), 1000);
         const double hypoLon = map->property("shiftedHypo").toMap().value("lon").toDouble();
         QTRY_VERIFY_WITH_TIMEOUT(std::abs(map->property("centerLon").toDouble() - hypoLon) < 5.0, 3000);
+    }
+
+    /// 回归：从一个事件切到另一个事件时，镜头应完整补间飞行。
+    ///
+    /// 曾经切换焦点时 `setMapFocus` 先 `updateWaveTimer()`（同步发 waveRadiiChanged），
+    /// 再发 centerMapRequested（QML 里 `Qt.callLater(focusEvent)`）。自动跟随分支与
+    /// 布局重取景都用 duration 0 落位，它们排在入场补间之前，先把镜头瞬移到新震中，
+    /// 随后那段 600ms 飞行就成了零距离 —— 用户看到的就是「几乎没有动画」。
+    void switchingEventsKeepsFlightAnimation() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("SwitchFlightTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(map);
+        QTest::qWait(400);
+
+        EarthquakeEvent a;
+        a.id = a.eventId = "SWITCH-A";
+        a.timestamp = now;
+        a.latitude = 30.6;
+        a.longitude = 104.0;
+        a.magnitude = 5.0;
+        a.depth = 10.0;
+        a.rawIntensity = 3.0;
+        controller.handleEvent(a, false, false);
+        QTest::qWait(800);   // 等入场取景补间结束
+        QVERIFY(map->property("following").toBool());
+        const double startLon = map->property("centerLon").toDouble();
+
+        // 切到远处的事件 B：应是 600ms 飞行，而不是瞬移。
+        EarthquakeEvent b = a;
+        b.id = b.eventId = "SWITCH-B";
+        b.latitude = 38.0;
+        b.longitude = 140.0;
+        b.magnitude = 7.2;
+        b.depth = 320.0;
+        b.location = "日本本州东岸近海深源地震（超长地名用来撑高 HUD 卡片高度）";
+        controller.handleEvent(b, false, false);
+        // 采样整段补间：任何一次采样步进都不该吃掉大半路程（瞬移的特征）。
+        // 切换事件会同时改变 HUD 高度 -> 布局重取景；若它先于入场补间落位，
+        // 镜头会在一帧内跳到新震中，后面那段飞行就是零距离。
+        QList<QPair<int, double>> samples;
+        for (int t = 0; t <= 640; t += 20) {
+            if (t > 0) QTest::qWait(20);
+            samples.append({t, map->property("centerLon").toDouble()});
+        }
+        const double targetLon = map->property("shiftedHypo").toMap().value("lon").toDouble();
+        const double distance = std::abs(targetLon - startLon);
+        QVERIFY2(distance > 20.0, "测试前置条件失败：两个事件距离太近");
+        double maxStep = 0.0;
+        int maxStepAt = 0;
+        for (int i = 1; i < samples.size(); ++i) {
+            const double step = std::abs(samples[i].second - samples[i - 1].second);
+            if (step > maxStep) { maxStep = step; maxStepAt = samples[i].first; }
+        }
+        QVERIFY2(maxStep < distance * 0.25,
+                 qPrintable(QStringLiteral("切换事件时镜头瞬移（t=%1ms 单步 %2°，总路程 %3°）")
+                                .arg(maxStepAt).arg(maxStep, 0, 'f', 1).arg(distance, 0, 'f', 1)));
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(map->property("centerLon").toDouble() - targetLon) < 8.0, 3000);
     }
 
     void settingsNavigationAndTheme() {
@@ -3498,6 +3844,375 @@ private slots:
         // 新的关键紧急预警达到门槛，允许正常切换
         QCOMPARE(controller.activeWarning_.eventId, alert2.eventId);
         QCOMPARE(controller.selectedWarning_, alert2.identity());
+    }
+
+    /// 机构优先级：JMA/CEA 永远压过 USGS/GQ；GQ 的新报不能把权威事件顶掉。
+    /// 手动选中 GQ 后同样如此（用户要求「USGS 和 GQ 永远是最低的」）。
+    void eventPriorityPutsAuthorityAboveUsgsAndGq() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EventPriorityTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+
+        const auto make = [](const QString& id, const QString& agency,
+                             double lat, double lon, long long stamp) {
+            EarthquakeEvent e;
+            e.id = e.eventId = id.toStdString();
+            e.sourceProvider = "Pancakes";
+            e.sourceAgency = agency.toStdString();
+            e.source = (agency + QStringLiteral(" 地震信息")).toStdString();
+            e.timestamp = stamp;
+            e.reportTime = stamp;
+            e.latitude = lat;
+            e.longitude = lon;
+            e.depth = 10.0;
+            e.magnitude = 5.0;
+            e.location = "优先级测试";
+            return e;
+        };
+        const auto focusedId = [&]() {
+            const QVariantMap map = controller.mapEvent().toMap();
+            return map.value("id").toString();
+        };
+
+        // 1. 先来一条 GQ：没有竞争者，正常聚焦。
+        const EarthquakeEvent gq1 = make("GQ-1", "GQ", 45.0, 150.0, now);
+        controller.handleEvent(gq1, false, false);
+        QCOMPARE(focusedId(), QString::fromStdString(gq1.identity()));
+
+        // 2. JMA 到达（更晚，但即使更早也一样）：权威机构接管。
+        now += 60'000;
+        const EarthquakeEvent jma = make("JMA-1", "JMA", 36.0, 140.0, now);
+        controller.handleEvent(jma, false, false);
+        QCOMPARE(focusedId(), QString::fromStdString(jma.identity()));
+        QCOMPARE(controller.hudIndex(), 0);   // 优先级最高的排在第一页
+
+        // 3. 后续 GQ 报（更新）不得把 JMA 顶掉。
+        now += 60'000;
+        const EarthquakeEvent gq2 = make("GQ-2", "GQ", 30.0, 104.0, now);
+        controller.handleEvent(gq2, false, false);
+        QCOMPARE(focusedId(), QString::fromStdString(jma.identity()));
+
+        // 4. 用户手动选中 GQ 后，普通 GQ 仍不能抢；但权威机构事件可以。
+        controller.toggleMapFocus(QString::fromStdString(gq2.identity()));
+        QCOMPARE(focusedId(), QString::fromStdString(gq2.identity()));
+        now += 60'000;
+        const EarthquakeEvent gq3 = make("GQ-3", "GQ", 31.0, 105.0, now);
+        controller.handleEvent(gq3, false, false);
+        QCOMPARE(focusedId(), QString::fromStdString(gq2.identity()));
+
+        now += 60'000;
+        const EarthquakeEvent jma2 = make("JMA-2", "JMA", 37.0, 141.0, now);
+        controller.handleEvent(jma2, false, false);
+        QCOMPARE(focusedId(), QString::fromStdString(jma2.identity()));
+
+        // 5. 取消焦点后再来一条 GQ：会话里已有 JMA，镜头仍应回到 JMA 而不是 GQ
+        //    （焦点目标取「会话中优先级最高的那条」，不只是刚到的那条）。
+        controller.clearMapFocus();
+        now += 60'000;
+        const EarthquakeEvent gq4 = make("GQ-4", "GQ", 32.0, 106.0, now);
+        controller.handleEvent(gq4, false, false);
+        QCOMPARE(focusedId(), QString::fromStdString(jma2.identity()));
+    }
+
+    /// USGS 与 GQ 的同一场地震被权威机构同报时，目录合并必须保留权威那一条。
+    void mergedDirectoryPrefersAuthoritativeAgency() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("MergePriorityTest");
+        AppController controller(nullptr, false);
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+
+        EarthquakeEvent usgs;
+        usgs.id = usgs.eventId = "USGS-SAME";
+        usgs.sourceProvider = "Pancakes"; usgs.sourceAgency = "USGS";
+        usgs.source = "USGS 地震信息";
+        usgs.timestamp = now; usgs.reportTime = now;
+        usgs.latitude = 30.0; usgs.longitude = 104.0; usgs.magnitude = 5.6;
+        usgs.location = "四川";
+        controller.handleEvent(usgs, false, true);
+
+        // 同一次地震（同发震时刻 + 同震中），JMA 的报更早推送，但机构更权威。
+        EarthquakeEvent jma = usgs;
+        jma.id = jma.eventId = "JMA-SAME";
+        jma.sourceAgency = "JMA";
+        jma.source = "JMA 地震情报";
+        jma.reportTime = now - 5000;
+        jma.magnitude = 5.5;
+        controller.handleEvent(jma, false, true);
+
+        const QVariantList list = controller.eventList();
+        int matches = 0;
+        QString picked;
+        for (const QVariant& entry : list) {
+            const QVariantMap map = entry.toMap();
+            if (std::abs(map.value("latitude").toDouble() - 30.0) < 0.2) {
+                ++matches;
+                picked = map.value("source").toString();
+            }
+        }
+        QCOMPARE(matches, 1);   // 同一场地震只保留一条
+        // 权威机构的条目胜出（USGS 那条被合并掉）。
+        QCOMPARE(picked, QStringLiteral("JMA 地震情报"));
+    }
+
+    /// 普通事件的波前保持实线；震中下方浮动信息照旧。虚线只属于推算（见
+    /// estimateFocusOutranksUsgsAndGq 的虚线断言），不能把两者画混。
+    void eventWavefrontsStaySolidAndEpicenterInfoShowsBelowMarker() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("DashedWaveTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        auto* pWave = window->findChild<QQuickItem*>("pWaveRing");
+        auto* sWave = window->findChild<QQuickItem*>("sWaveRing");
+        auto* sFill = window->findChild<QQuickItem*>("sWaveFill");
+        auto* info = window->findChild<QQuickItem*>("epicenterInfo");
+        QVERIFY(map && pWave && sWave && sFill && info);
+        QTest::qWait(400);
+
+        // 40 秒前的 M7.5：P 波半径足够大，像素级判据才有效，且尚未淡出。
+        EarthquakeEvent e;
+        e.id = e.eventId = "SOLID-A";
+        e.sourceProvider = "Wolfx"; e.sourceAgency = "CENC"; e.source = "中国地震台网";
+        e.timestamp = now - 40'000;
+        e.latitude = 30.0; e.longitude = 104.0;
+        e.depth = 10.0; e.magnitude = 7.5; e.location = "四川雅安";
+        controller.handleEvent(e, false, false);
+        QTest::qWait(900);   // 等入场取景补间结束
+
+        QVERIFY2(controller.property("wavePKm").toDouble() > 0.0, "P 波半径必须已算出");
+        QVERIFY2(controller.property("wavePOpacity").toDouble() > 0.5, "P 波必须可见");
+        QVERIFY2(!pWave->property("dashed").toBool(), "普通事件的 P 波必须是实线");
+        QVERIFY2(!sWave->property("dashed").toBool(), "普通事件的 S 波必须是实线");
+        QVERIFY2(sFill->isVisible(), "普通事件的 S 波渐变填充仍在");
+        // 信息块默认不显示，指针悬停到震中十字上才出现。
+        const double hx = map->property("hypocenterX").toDouble();
+        const double hy = map->property("hypocenterY").toDouble();
+        const QPointF epicenter = map->mapToScene(QPointF(hx, hy));
+        QVERIFY2(!info->isVisible(), "信息块默认不该常驻，只应在悬停震中时显示");
+        // 模糊必须采样地图图层（而不是整棵树，否则会把浮层自己采进去）。
+        QCOMPARE(info->property("backdropSource").value<QQuickItem*>(),
+                 map->property("renderLayer").value<QQuickItem*>());
+        QTest::mouseMove(window, epicenter.toPoint());
+        QTRY_VERIFY_WITH_TIMEOUT(info->isVisible(), 500);
+        QCOMPARE(info->property("placeText").toString(), QStringLiteral("四川雅安"));
+        // 卡片必须带上发震时刻（与 HUD 同源的 UTC+8 文本），不能只有地名/震级。
+        auto* infoTime = window->findChild<QQuickItem*>("epicenterInfoTime");
+        QVERIFY(infoTime);
+        const QString timeLine = infoTime->property("text").toString();
+        QVERIFY2(timeLine.contains("UTC+8") && timeLine.size() >= 21,
+                 qPrintable(QStringLiteral("震中卡片缺少发震时刻: \"%1\"").arg(timeLine)));
+
+        // 实线像素判据：沿 P 波圆右半侧采样，实线几乎每格都有蓝色；若误改成虚线，
+        // 命中率会掉到 0.6 左右。只断言属性抓不到「strokeStyle 写错」。
+        const double radiusPx = controller.property("wavePKm").toDouble() *
+                                map->property("pxPerKmValue").toDouble();
+        QVERIFY2(radiusPx > 40.0, "P 波圆太小，无法验证实线");
+        const double hitRatio = blueRingHitRatio(window, epicenter, radiusPx);
+        QVERIFY2(hitRatio > 0.90,
+                 qPrintable(QStringLiteral("普通事件 P 波不是实线（命中率 %1）").arg(hitRatio)));
+
+        // 信息块在十字下方，且不越出窗口。
+        QVERIFY2(info->y() > hy, "信息块应位于震中下方");
+        QVERIFY(info->y() + info->height() <= map->height() + 1);
+        QVERIFY(info->x() >= -1);
+        QVERIFY(info->x() + info->width() <= map->width() + 1);
+        QTest::qWait(150);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window) + "/46-event-wavefronts-solid.png"));
+
+        // 指针移开后信息块收起。
+        QTest::mouseMove(window, QPoint(4, 4));
+        QTRY_VERIFY(!info->isVisible());
+
+        // 焦点清掉后不再标注（历史事件另行显示十字也无所谓，信息块只跟当前事件）。
+        controller.clearMapFocus();
+        QTRY_VERIFY(!info->isVisible());
+    }
+
+    /// 推算也参与聚焦：USGS/GQ 占着镜头时，本地推算解出现就接管；权威事件到达后让位。
+    void estimateFocusOutranksUsgsAndGq() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EstimateFocusTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+        controller.settings()->setSourceEstimationEnabled(true);
+        controller.settings()->setDeveloperMode(true);
+        controller.settings()->setSourceEstimationRegionEnabled("china", true);
+
+        QSignalSpy camera(&controller, &AppController::centerMapRequested);
+        EarthquakeEvent gq;
+        gq.id = gq.eventId = "GQ-FOCUS";
+        gq.sourceProvider = "Pancakes"; gq.sourceAgency = "GQ";
+        gq.source = "GlobalQuake地震信息";
+        gq.timestamp = now;
+        gq.latitude = 45.0; gq.longitude = 150.0;
+        gq.magnitude = 5.0; gq.location = "远东";
+        controller.handleEvent(gq, false, false);
+        QCOMPARE(controller.mapEvent().toMap().value("id").toString(),
+                 QString::fromStdString(gq.identity()));
+
+        std::vector<StationSnapshot::Entry> frame;
+        std::vector<StationSnapshot::StationMeta> metas;
+        for (double lat = 28.4; lat <= 31.6 + 1e-9; lat += 0.2) {
+            for (double lon = 102.4; lon <= 105.6 + 1e-9; lon += 0.2) {
+                StationSnapshot::Entry entry;
+                entry.lat = lat;
+                entry.lon = lon;
+                entry.csis = true;
+                entry.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Csis, 5.8,
+                    QuakeCalculator::haversineDistance(30.0, 104.0, lat, lon), 10.0);
+                entry.meta = static_cast<int>(frame.size());
+                frame.push_back(entry);
+                StationSnapshot::StationMeta meta;
+                meta.source = QStringLiteral("PancakesSeis");
+                metas.push_back(meta);
+            }
+        }
+        controller.stationSnapshot_->setEntries(frame, metas);
+        controller.sourceEstimation_->ingestObservations(frame);
+        controller.sourceEstimation_->runEstimation();
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.focusEstimate_.isEmpty(), 5000);
+        if (controller.sourceEstimation_->watcher_.isRunning())
+            controller.sourceEstimation_->watcher_.waitForFinished();
+        QCoreApplication::processEvents();
+
+        const QVariantMap estimate = controller.focusEstimate_;
+        QCOMPARE(estimate.value("id").toString(), QStringLiteral("china"));
+        QVERIFY(std::abs(estimate.value("latitude").toDouble() - 30.0) < 2.0);
+        QVERIFY(std::abs(estimate.value("longitude").toDouble() - 104.0) < 2.0);
+        // 主 HUD 让位（由推算卡做唯一主展示），但活动预警本身仍在会话里。
+        QVERIFY2(!controller.hudEvent().isValid(), "推算焦点期间主 HUD 应隐藏");
+        QVERIFY(controller.hasWarning());
+        // 镜头被带到推定震中，而不是 GQ 的远东位置。
+        QVERIFY(!camera.isEmpty());
+        const QList<QVariant> last = camera.last();
+        QVERIFY(std::abs(last.at(0).toDouble() - 30.0) < 2.0);
+        QVERIFY(std::abs(last.at(1).toDouble() - 104.0) < 2.0);
+
+        // QML 侧：镜头真的落在推定震中上，事件十字/主 HUD 让位，推算卡成为主展示。
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        auto* hud = window->findChild<QQuickItem*>("hudCard");
+        auto* info = window->findChild<QQuickItem*>("epicenterInfo");
+        auto* estimateCard = window->findChild<QQuickItem*>("sourceEstimateCard");
+        QVERIFY(map && hud && info && estimateCard);
+        QTRY_VERIFY(map->property("estimateFocused").toBool());
+        QTest::qWait(900);   // 等取景补间结束
+        QVERIFY2(std::abs(map->property("centerLon").toDouble() - 104.0) < 3.0,
+                 qPrintable(QStringLiteral("镜头未跟到推定震中: centerLon=%1")
+                                .arg(map->property("centerLon").toDouble())));
+        QVERIFY2(std::abs(map->property("centerLat").toDouble() - 30.0) < 3.0,
+                 qPrintable(QStringLiteral("镜头未跟到推定震中: centerLat=%1")
+                                .arg(map->property("centerLat").toDouble())));
+        QVERIFY2(!info->isVisible(), "推算焦点期间不应再画事件十字信息");
+        QVERIFY2(!hud->isVisible(), "推算焦点期间主 HUD 应让位");
+        QTRY_VERIFY(estimateCard->isVisible());
+        // 推定震中标记必须落在镜头所指的震中附近（回归：曾只注入 shifted 没写 x/y，
+        // 四个区域标记全叠在 (0,0)，镜头却飞到看不见标记的地方）。
+        auto* marker = window->findChild<QQuickItem*>("sourceEstimateMarker");
+        QVERIFY(marker && marker->isVisible());
+        const QPointF markerCenter =
+            marker->mapToScene(QPointF(marker->width() / 2, marker->height() / 2));
+        QVERIFY2(markerCenter.x() > 200 && markerCenter.x() < window->width() - 100,
+                 qPrintable(QStringLiteral("推定震中标记 x 不在视口内: %1").arg(markerCenter.x())));
+        QVERIFY2(markerCenter.y() > 200 && markerCenter.y() < window->height() - 100,
+                 qPrintable(QStringLiteral("推定震中标记 y 不在视口内: %1").arg(markerCenter.y())));
+
+        // 推算波前：虚线、圆心就是推定震中、颜色仍用普通的 pWave/sWave。
+        QTRY_VERIFY_WITH_TIMEOUT(controller.property("wavePKm").toDouble() > 0.0, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(controller.property("wavePOpacity").toDouble() > 0.3, 2000);
+        auto* pWave = window->findChild<QQuickItem*>("pWaveRing");
+        auto* sWave = window->findChild<QQuickItem*>("sWaveRing");
+        auto* sFill = window->findChild<QQuickItem*>("sWaveFill");
+        QVERIFY(pWave && sWave && sFill);
+        QVERIFY2(pWave->isVisible(), "推算焦点的 P 波必须可见");
+        QVERIFY2(pWave->property("dashed").toBool(), "推算 P 波必须是虚线");
+        QVERIFY2(sWave->property("dashed").toBool(), "推算 S 波必须是虚线");
+        QVERIFY2(!sFill->isVisible(), "推算焦点不画 S 波实色填充，否则会盖住虚线边界");
+        QCOMPARE(qRound(pWave->x() + pWave->width() / 2),
+                 qRound(marker->x() + marker->width() / 2));
+        QCOMPARE(qRound(pWave->y() + pWave->height() / 2),
+                 qRound(marker->y() + marker->height() / 2));
+        const double waveRadius = pWave->width() / 2.0;
+        QVERIFY2(waveRadius > 40.0, "推算 P 波圆太小，无法验证虚线");
+        const QPointF waveCenter =
+            map->mapToScene(QPointF(pWave->x() + pWave->width() / 2,
+                                    pWave->y() + pWave->height() / 2));
+        const double waveHit = blueRingHitRatio(window, waveCenter, waveRadius);
+        QVERIFY2(waveHit > 0.30 && waveHit < 0.85,
+                 qPrintable(QStringLiteral("推算 P 波不是虚线（命中率 %1）").arg(waveHit)));
+
+        QTest::qWait(150);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window) + "/47-estimate-focus.png"));
+
+        // 权威事件到达：推算让位，事件重新成为焦点。
+        now += 60'000;
+        EarthquakeEvent jma;
+        jma.id = jma.eventId = "JMA-FOCUS";
+        jma.sourceProvider = "Whews"; jma.sourceAgency = "JMA";
+        jma.source = "JMA 紧急地震速报";
+        jma.timestamp = now;
+        jma.latitude = 36.0; jma.longitude = 140.0;
+        jma.magnitude = 6.0; jma.location = "千叶县东方海域";
+        controller.handleEvent(jma, false, false);
+        QVERIFY(controller.focusEstimate_.isEmpty());
+        QCOMPARE(controller.mapEvent().toMap().value("id").toString(),
+                 QString::fromStdString(jma.identity()));
+        QVERIFY(controller.hudEvent().isValid());
     }
 };
 QTEST_MAIN(GuiTest)
