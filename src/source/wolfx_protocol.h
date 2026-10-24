@@ -33,11 +33,27 @@ struct WolfxProtocol {
     }
 
     static bool isEewType(const QString& type) {
+        return eewTypes().contains(type);
+    }
+
+    /// 已接入的 EEW 频道（查询报文与子数据源 id 同源）。
+    static const QStringList& eewTypes() {
         static const QStringList types = {
             QStringLiteral("cenc_eew"), QStringLiteral("sc_eew"), QStringLiteral("jma_eew"),
             QStringLiteral("cwa_eew"),  QStringLiteral("fj_eew"), QStringLiteral("cq_eew"),
         };
-        return types.contains(type);
+        return types;
+    }
+
+    /// 订阅报文 → 频道 id；未知报文返回空串（发送端应跳过）。
+    static QString typeForQuery(const QString& query) {
+        if (query == "query_cenceew") return QStringLiteral("cenc_eew");
+        if (query == "query_sceew") return QStringLiteral("sc_eew");
+        if (query == "query_jmaeew") return QStringLiteral("jma_eew");
+        if (query == "query_cwaeew") return QStringLiteral("cwa_eew");
+        if (query == "query_fjeew") return QStringLiteral("fj_eew");
+        if (query == "query_cqeew") return QStringLiteral("cq_eew");
+        return QString();
     }
 
     /// 报文展示名（HUD 标题）。对齐 Wolfx Open API 文档的接口名。

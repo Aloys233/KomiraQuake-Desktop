@@ -139,6 +139,10 @@ std::optional<EarthquakeEvent> JianParser::parseRecord(const JianChannel& channe
                         ? true
                         : data.value(QStringLiteral("isFinal")).toBool(false);
     event.isCanceled = canceled;
+    // 目录/速报通道：只进列表与历史，没有「第 N 报」语义；测定状态（正式/自动）留给
+    // 详情页标注，不参与合并。
+    event.isInfo = channel.kind == SourceEventKind::Directory;
+    if (event.isInfo) event.determination = EewParser::parseDetermination(data).toStdString();
 
     EewParser::recompute(event, user, standard);
     if (channel.kind == SourceEventKind::Directory) {

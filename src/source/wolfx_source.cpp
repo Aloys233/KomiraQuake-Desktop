@@ -14,7 +14,9 @@
 #include <vector>
 
 #include "source/eew_parser.h"
+#include "source/raw_payload.h"
 #include "source/wolfx_protocol.h"
+#include "source/ws_latency_probe.h"
 
 namespace komira {
 
@@ -26,10 +28,11 @@ void stampSource(EarthquakeEvent& event, const QString& provider, const QString&
     event.sourceAgency = agency.toStdString();
 }
 
-/// 一个目录端点：URL + 该源的报数机构 + 解析函数。
+/// 一个目录端点：URL + 该源的报数机构 + 子源 id + 解析函数。
 struct DirectoryEndpoint {
     QString url;
     QString agency;
+    QString subId;
     std::optional<EarthquakeEvent> (*parse)(const QJsonObject&, const EewParser::UserLocation&,
                                             IntensityStandard, long long);
 };
@@ -47,12 +50,15 @@ std::optional<EarthquakeEvent> parseJmaEntry(const QJsonObject& obj, const EewPa
 /// 目录端点全集，按声明顺序在一个轮询周期内串行拉取。
 ///
 /// jma_eqlist 与 Pancakes 的同名子源互为备份：两路都启用时同一 JMA 地震会各自送达，
-/// 由 AppController 按「发震时刻 + 震中」（QuakeCalculator::isSameQuake）合并为一条展示，
-/// 因此这里无需在源内跨 provider 去重；任一路中断，另一路仍能独立填充目录。
+/// 由 AppController 按「同一报数机构 + 同一上游事件 ID」识别为同一份报文的重复转送，
+/// 合并为一条展示并保留两个聚合源标签；因此这里无需在源内跨 provider 去重，
+/// 任一路中断，另一路仍能独立填充目录。
 const std::vector<DirectoryEndpoint>& directoryEndpoints() {
     static const std::vector<DirectoryEndpoint> endpoints = {
-        {WolfxProtocol::eqListUrl(), WolfxProtocol::directoryAgency(), &parseCencEntry},
-        {WolfxProtocol::jmaEqListUrl(), WolfxProtocol::jmaDirectoryAgency(), &parseJmaEntry},
+        {WolfxProtocol::eqListUrl(), WolfxProtocol::directoryAgency(),
+         QStringLiteral("cenc_eqlist"), &parseCencEntry},
+        {WolfxProtocol::jmaEqListUrl(), WolfxProtocol::jmaDirectoryAgency(),
+         QStringLiteral("jma_eqlist"), &parseJmaEntry},
     };
     return endpoints;
 }
@@ -212,11 +218,11 @@ void WolfxSource::attachSocketHandlers(QWebSocket* socket, quint64 generation,
                   QStringLiteral("WS 连接失败：%1").arg(socket->errorString()));
         scheduleReconnect();
     });
-    connect(socket, &QWebSocket::pong, this,
-            [this, current](quint64 elapsed, const QByteArray&) {
-        if (!current()) return;
-        info_.latencyMs = static_cast<qint64>(elapsed);
-        info_.lastHeartbeat = nowMs();
+    // 链路延迟：协议级 ping/pong 探针（与其余四个事件源同一份实现）。不要再用
+    // sendQueries 里的 ping —— 那一个只是为了触发上游心跳，量不到 RTT。
+    attachLatencyProbe(socket, current, [this](qint64 latencyMs) {
+        if (info_.latencyMs == latencyMs) return;
+        info_.latencyMs = latencyMs;
         emit infoChanged();
     });
 }
@@ -231,8 +237,14 @@ void WolfxSource::scheduleReconnect() {
 
 void WolfxSource::sendQueries() {
     if (!running_ || !socket_ || socket_->state() != QAbstractSocket::ConnectedState) return;
-    socket_->ping();
-    for (const QString& q : WolfxProtocol::queries()) socket_->sendTextMessage(q);
+    // 这里不再 ping：延迟统一由 attachLatencyProbe 的独立探针测量，两个 ping 源会让
+    // `pong(elapsed)` 的归属变得不确定（谁先量到就写谁）。
+    for (const QString& q : WolfxProtocol::queries()) {
+        // 关闭的子源不再订阅：少发一条查询，上游也不会为该频道推流。
+        const QString type = WolfxProtocol::typeForQuery(q);
+        if (!type.isEmpty() && !isSubSourceEnabled(type)) continue;
+        socket_->sendTextMessage(q);
+    }
 }
 
 void WolfxSource::handleMessage(const QString& text) {
@@ -265,6 +277,7 @@ void WolfxSource::handleJsonObject(const QJsonObject& obj) {
 
     const QString resolved = type.isEmpty() ? QStringLiteral("cwa_eew") : type;
     if (!WolfxProtocol::isEewType(resolved)) return;
+    if (!isSubSourceEnabled(resolved)) return;
 
     // 无定位时照常解析，只是距离/烈度/走时为未知。JMA 报文时刻为 JST，需按时区解析。
     // eventNamespace 用频道名（如 jma_eew），使 eventId 与其它聚合商的同名频道对齐合并。
@@ -280,6 +293,7 @@ void WolfxSource::handleJsonObject(const QJsonObject& obj) {
             return;
         }
         stampSource(*event, WolfxProtocol::providerName(), WolfxProtocol::agencyFor(resolved));
+        attachRawPayload(*event, obj);
         emit eventReceived(*event, SourceEventKind::Live);
     }
 }
@@ -288,6 +302,18 @@ void WolfxSource::pollDirectory() {
     // 地震列表完全由本 HTTP 轮询填充；WS 只负责实时预警。无定位也照常拉取（仅距离/烈度为未知）。
     if (!running_ || !directoryPollingEnabled_
         || info_.directoryStatus == ConnectionStatus::Connecting) return;
+    // 目录子源全部关闭时不再轮询：这属于用户的显式选择，不是链路异常。
+    bool anyEnabled = false;
+    for (const auto& endpoint : directoryEndpoints()) {
+        if (isSubSourceEnabled(endpoint.subId)) { anyEnabled = true; break; }
+    }
+    if (!anyEnabled) {
+        ++directoryGeneration_;
+        info_.directoryStatus = ConnectionStatus::Disconnected;
+        info_.directoryError.clear();
+        emit infoChanged();
+        return;
+    }
     const quint64 generation = ++directoryGeneration_;
     info_.directoryStatus = ConnectionStatus::Connecting;
     info_.directoryError.clear();
@@ -321,6 +347,10 @@ void WolfxSource::fetchDirectoryEndpoint(int index) {
     }
 
     const DirectoryEndpoint endpoint = endpoints[static_cast<size_t>(index)];
+    if (!isSubSourceEnabled(endpoint.subId)) {
+        fetchDirectoryEndpoint(index + 1);
+        return;
+    }
     QNetworkRequest request{QUrl(endpoint.url)};
     request.setTransferTimeout(15000);
     request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("komiraquake/2.0"));
@@ -353,9 +383,11 @@ void WolfxSource::fetchDirectoryEndpoint(int index) {
         for (auto it = root.begin(); it != root.end(); ++it) {
             if (!running_ || !directoryPollingEnabled_ || generation != directoryGeneration_) return;
             if (!it.key().startsWith(QLatin1String("No"))) continue;
-            auto event = endpoint.parse(it.value().toObject(), userLocation(), standard_, nowMs());
+            const QJsonObject raw = it.value().toObject();
+            auto event = endpoint.parse(raw, userLocation(), standard_, nowMs());
             if (event) {
                 stampSource(*event, WolfxProtocol::providerName(), endpoint.agency);
+                attachRawPayload(*event, raw);
                 emit eventReceived(*event, SourceEventKind::Directory);
             }
         }

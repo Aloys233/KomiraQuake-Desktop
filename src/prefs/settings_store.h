@@ -48,6 +48,9 @@ public:
     /// 已禁用的数据源 id 列表。采用「禁用集合」而非「启用集合」：未列出的源默认启用，
     /// 新增数据源无需迁移即默认开启（两端一致）。
     Q_PROPERTY(QStringList disabledSources READ disabledSources WRITE setDisabledSources NOTIFY disabledSourcesChanged)
+    /// 已禁用的子数据源（`sourceId:subId` 复合键）。空集合 = 全部启用；
+    /// 与顶层源一样采用「禁用集合」：新增频道无需迁移即默认开启。
+    Q_PROPERTY(QStringList disabledSubSources READ disabledSubSources WRITE setDisabledSubSources NOTIFY disabledSubSourcesChanged)
     /// 已禁用的测站显示源 id 列表（仅桌面端）。空的禁用集合 = 三路测站都开启。
     Q_PROPERTY(QStringList disabledStationSources READ disabledStationSources WRITE setDisabledStationSources NOTIFY disabledStationSourcesChanged)
     /// Jian 数据源的刷新令牌（rt_…，登录后由应用写入并持久化；不向 UI 回显明文）。
@@ -284,6 +287,40 @@ public:
         set("disabledSources", disabled);
     }
 
+    /// 子数据源持久化键：`sourceId:subId`。子源 id 只在所属聚合源内唯一，
+    /// 例如 Wolfx 与 Whews 都有 `jma_eew`，必须带上源前缀。
+    static QString subSourceKey(const QString& sourceId, const QString& subId) {
+        return sourceId + QLatin1Char(':') + subId;
+    }
+    QStringList disabledSubSources() const {
+        return s_.value("disabledSubSources").toStringList();
+    }
+    void setDisabledSubSources(const QStringList& v) { set("disabledSubSources", v); }
+    /// 某子源是否启用（未在禁用集合中即启用）。
+    Q_INVOKABLE bool isSubSourceEnabled(const QString& sourceId, const QString& subId) const {
+        return !disabledSubSources().contains(subSourceKey(sourceId, subId));
+    }
+    Q_INVOKABLE void setSubSourceEnabled(const QString& sourceId, const QString& subId, bool enabled) {
+        const QString key = subSourceKey(sourceId, subId);
+        QStringList disabled = disabledSubSources();
+        if ((!disabled.contains(key)) == enabled) return;
+        if (enabled) disabled.removeAll(key); else disabled << key;
+        set("disabledSubSources", disabled);
+    }
+    /// 分组批量启停（「全开 / 全不选」）：一次写入，只发一次变更通知。
+    Q_INVOKABLE void setSubSourcesEnabled(const QString& sourceId, const QStringList& subIds,
+                                          bool enabled) {
+        QStringList disabled = disabledSubSources();
+        bool modified = false;
+        for (const QString& subId : subIds) {
+            const QString key = subSourceKey(sourceId, subId);
+            if ((!disabled.contains(key)) == enabled) continue;
+            if (enabled) disabled.removeAll(key); else disabled << key;
+            modified = true;
+        }
+        if (modified) set("disabledSubSources", disabled);
+    }
+
     /// 测站显示源（仅桌面端）：与事件源分开管理，默认全开。
     QStringList disabledStationSources() const {
         return s_.value("disabledStationSources").toStringList();
@@ -299,8 +336,9 @@ public:
         set("disabledStationSources", disabled);
     }
 
-    /// 逐源「信息事件震级过滤」：仅作用于目录事件，不影响实时预警链路。
+    /// 逐源「信息事件震级过滤」：仅作用于目录事件的**展示**，不影响实时预警链路。
     /// -1 = 不接收；0 = 不过滤；>0 = 低于该震级的信息事件不显示。
+    /// 设置变化只影响展示层（见 AppController::refreshEventModel），已入库的记录不会丢。
     Q_INVOKABLE double infoMagnitudeFilter(const QString& sourceId) const {
         return s_.value(QStringLiteral("minMagnitude.") + sourceId, 0.0).toDouble();
     }
@@ -453,6 +491,7 @@ signals:
     void customNtpServerChanged();
     void developerModeChanged();
     void disabledSourcesChanged();
+    void disabledSubSourcesChanged();
     void disabledStationSourcesChanged();
     void enableAlarmToneChanged();
     void enableNtpSyncChanged();
@@ -466,6 +505,9 @@ signals:
     /// 都挂在这一个信号上 —— 逐区读取接口是 Q_INVOKABLE，绑在函数调用上的绑定不会自动重算。
     void sourceEstimationRegionStateChanged();
     void intensityStandardChanged();
+    /// 任一数据源的「信息事件震级过滤」变化（复合键 `minMagnitude.<sourceId>`）。
+    /// 过滤在展示层求值，列表需要据此立即重筛。
+    void infoMagnitudeChanged();
     void isMutedChanged();
     void jianRefreshTokenChanged();
     void localIntensityFilterChanged();

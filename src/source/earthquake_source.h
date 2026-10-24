@@ -4,6 +4,7 @@
 #include <QString>
 
 #include <functional>
+#include <utility>
 
 #include "core/intensity_calculator.h"
 #include "model/data_source_info.h"
@@ -39,6 +40,11 @@ public:
     /// Pause/resume background directory polling without interrupting realtime transport.
     /// Sources without a directory poll may keep the default no-op implementation.
     virtual void setDirectoryPollingEnabled(bool enabled) { (void)enabled; }
+    /// 逐子源启停过滤器：返回 false 的频道不得解析、也不应再请求其目录端点。
+    /// 未设置过滤器时全部启用。AppController 在设置变化时重新推送。
+    void setSubSourceFilter(std::function<bool(const QString&)> filter) {
+        subSourceFilter_ = std::move(filter);
+    }
     /// 显式刷新目录；未启用时应忽略。
     virtual void refreshDirectory() = 0;
     virtual void setUserLocation(double lat, double lon) = 0;
@@ -58,6 +64,15 @@ public:
         (void)event;
         (void)status;
     }
+
+protected:
+    /// 子源是否启用（未安装过滤器时恒为 true）。
+    bool isSubSourceEnabled(const QString& subId) const {
+        return !subSourceFilter_ || subSourceFilter_(subId);
+    }
+
+private:
+    std::function<bool(const QString&)> subSourceFilter_;
 
 signals:
     void eventReceived(const komira::EarthquakeEvent& event, komira::SourceEventKind kind);

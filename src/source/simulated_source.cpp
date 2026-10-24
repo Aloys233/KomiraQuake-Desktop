@@ -11,6 +11,8 @@
 
 #include "source/simulated_parser.h"
 #include "source/simulated_protocol.h"
+#include "source/raw_payload.h"
+#include "source/ws_latency_probe.h"
 
 namespace komira {
 
@@ -190,10 +192,11 @@ void SimulatedSource::attachSocketHandlers(QWebSocket* socket, quint64 generatio
         scheduleReconnect();
     });
 
-    connect(socket, &QWebSocket::pong, this, [this, current](quint64 elapsed, const QByteArray&) {
-        if (!current()) return;
-        info_.latencyMs = static_cast<qint64>(elapsed);
-        info_.lastHeartbeat = nowMs();
+    // 链路延迟：协议级 ping/pong 探针。此前这里只连了 pong、从未 ping（死代码），
+    // 模拟源在自测时看不到「延迟」这一项。
+    attachLatencyProbe(socket, current, [this](qint64 latencyMs) {
+        if (info_.latencyMs == latencyMs) return;
+        info_.latencyMs = latencyMs;
         emit infoChanged();
     });
 }
@@ -259,6 +262,7 @@ void SimulatedSource::handleFrame(const QJsonObject& frame) {
         return;
     }
 
+    attachRawPayload(*event, frame);
     emit eventReceived(*event, kind);
     // 不在这里回执：墓碑 / 重复这些判定在仓库层（AppController::handleEvent），
     // 源无从得知。由 onAdmission 回调补发，回执才如实反映最终处置。

@@ -243,6 +243,7 @@ const QList<SettingsStore::KeySignal>& SettingsStore::keySignals() {
         {"developerMode", &SettingsStore::developerModeChanged},
         {"disabledSources", &SettingsStore::disabledSourcesChanged},
         {"disabledStationSources", &SettingsStore::disabledStationSourcesChanged},
+        {"disabledSubSources", &SettingsStore::disabledSubSourcesChanged},
         {"enableAlarmTone", &SettingsStore::enableAlarmToneChanged},
         {"enableNtpSync", &SettingsStore::enableNtpSyncChanged},
         {"enableSoundAlert", &SettingsStore::enableSoundAlertChanged},
@@ -292,6 +293,11 @@ void SettingsStore::emitKeyChanged(const QString& key) {
     if (isRegionParamKey(key)) {
         emit sourceEstimationRegionParamsChanged();
         emit sourceEstimationRegionStateChanged();
+        return;
+    }
+    // 逐源震级过滤也是复合键（`minMagnitude.<sourceId>`）：一个信号覆盖全部源。
+    if (key.startsWith(QLatin1String("minMagnitude."))) {
+        emit infoMagnitudeChanged();
         return;
     }
     const auto& entries = keySignals();

@@ -13,6 +13,8 @@
 #include <chrono>
 
 #include "source/pancakes_protocol.h"
+#include "source/raw_payload.h"
+#include "source/ws_latency_probe.h"
 
 namespace komira {
 
@@ -157,6 +159,14 @@ void PancakesSource::attachSocketHandlers(QWebSocket* socket, quint64 generation
                   QStringLiteral("WS 连接失败：%1").arg(socket->errorString()));
         scheduleReconnect();
     });
+
+    // 链路延迟：协议级 ping/pong 探针。聚合通道外层只有 `timestampMs`（上游生成该帧的
+    // 时刻，不是发出时刻），推不出链路 RTT，此前完全没有延迟。
+    attachLatencyProbe(socket, current, [this](qint64 latencyMs) {
+        if (info_.latencyMs == latencyMs) return;
+        info_.latencyMs = latencyMs;
+        emit infoChanged();
+    });
 }
 
 void PancakesSource::scheduleReconnect() {
@@ -189,16 +199,31 @@ void PancakesSource::handleJsonObject(const QJsonObject& obj) {
     if (type == QLatin1String("pong") || type == QLatin1String("heartbeat")) return;
     auto parsed = PancakesParser::parseRealtime(obj, userLocation(), standard_, nowMs());
     if (!parsed) return;
+    if (!isSubSourceEnabled(parsed->source)) return;
 
     const EarthquakeEvent& event = parsed->event;
     const long long now = nowMs();
     if (event.timestamp > 0 && now - event.timestamp > PancakesProtocol::kLiveWindowMs) return;
-    emit eventReceived(event, parsed->kind);
+    EarthquakeEvent stamped = event;
+    attachRawPayload(stamped, obj);
+    emit eventReceived(stamped, parsed->kind);
 }
 
 void PancakesSource::pollDirectory() {
     if (!running_ || !directoryPollingEnabled_
         || info_.directoryStatus == ConnectionStatus::Connecting) return;
+    // 只轮询启用的子源；全部关闭属于显式选择，不是目录异常。
+    QStringList enabledSources;
+    for (const QString& source : PancakesProtocol::quakeSources()) {
+        if (isSubSourceEnabled(source)) enabledSources << source;
+    }
+    if (enabledSources.isEmpty()) {
+        ++directoryGeneration_;
+        info_.directoryStatus = ConnectionStatus::Disconnected;
+        info_.directoryError.clear();
+        emit infoChanged();
+        return;
+    }
     const quint64 generation = ++directoryGeneration_;
     info_.directoryStatus = ConnectionStatus::Connecting;
     info_.directoryError.clear();
@@ -206,7 +231,7 @@ void PancakesSource::pollDirectory() {
     pendingDirectory_ = 0;
     emit infoChanged();
     if (!running_ || !directoryPollingEnabled_ || generation != directoryGeneration_) return;
-    for (const QString& source : PancakesProtocol::quakeSources()) {
+    for (const QString& source : enabledSources) {
         fetchList(source, generation);
     }
     if (pendingDirectory_ == 0) finishDirectoryRequest();
@@ -239,8 +264,12 @@ void PancakesSource::fetchList(const QString& source, quint64 generation) {
         const long long now = nowMs();
         for (const auto& v : doc.array()) {
             if (!running_ || !directoryPollingEnabled_ || generation != directoryGeneration_) return;
-            auto event = PancakesParser::parseListItem(v.toObject(), userLocation(), standard_, now);
-            if (event) emit eventReceived(*event, SourceEventKind::Directory);
+            const QJsonObject raw = v.toObject();
+            auto event = PancakesParser::parseListItem(raw, userLocation(), standard_, now);
+            if (event) {
+                attachRawPayload(*event, raw);
+                emit eventReceived(*event, SourceEventKind::Directory);
+            }
         }
         info_.directoryLatencyMs = monoMs() - started;
         finishDirectoryRequest();

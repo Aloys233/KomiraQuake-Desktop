@@ -4,6 +4,7 @@
 #include <QJsonValue>
 #include <cmath>
 
+#include "core/region_names.h"
 #include "source/pancakes_protocol.h"
 
 namespace komira {
@@ -88,7 +89,16 @@ PancakesParsed build(const QString& source,
     event.latitude = latitude;
     event.longitude = longitude;
     event.depth = depth;
-    event.location = location.toStdString();
+    // GQ / USGS 的 location 是上游原文（USGS 形如「15 km SSW of ...」，全英文），
+    // 用震源推算同一张 1°×1° 震源区表按坐标补中文名；表里该格无名称时保留原文。
+    // 取消报文没有坐标（0/0），不能用表覆盖它的「已取消」。
+    QString place = location;
+    if (!isCanceled
+        && (source == PancakesProtocol::sourceGq() || source == PancakesProtocol::sourceUsgs())) {
+        const std::string region = RegionNameTable::instance().nameAt(latitude, longitude);
+        if (!region.empty()) place = QString::fromStdString(region);
+    }
+    event.location = place.toStdString();
     event.timestamp = originTime;
     event.reportTime = sourceUpdatedAt;
     event.source = PancakesProtocol::titleFor(source).toStdString();
@@ -99,6 +109,7 @@ PancakesParsed build(const QString& source,
     event.reportNum = reportNum;
     event.isFinal = isFinal;
     event.isCanceled = isCanceled;
+    event.isInfo = kind == SourceEventKind::Directory;
 
     EewParser::recompute(event, user, standard);
     if (kind == SourceEventKind::Directory) {
@@ -213,10 +224,14 @@ std::optional<PancakesParsed> parseJmaEqlist(const QString& action, const QJsonO
                                        .value_or(firstString(payload, QStringLiteral("announcedTime"))
                                                      .value_or(QString()));
     const auto max = EewParser::parseMaxIntensity(payload, standard);
-    return build(PancakesProtocol::sourceJmaEqlist(), *rawId, magnitude, *latitude, *longitude, depth,
-                 location, origin, max.text, max.raw, serial, true, canceled,
-                 EewParser::parseTime(reportTimeText),
-                 user, standard, SourceEventKind::Directory);
+    PancakesParsed built = build(PancakesProtocol::sourceJmaEqlist(), *rawId, magnitude, *latitude,
+                                 *longitude, depth, location, origin, max.text, max.raw, serial,
+                                 true, canceled, EewParser::parseTime(reportTimeText), user,
+                                 standard, SourceEventKind::Directory);
+    // Pancakes 的 JMA 情报里 `infoType` / `infoTypeName` 表达「已确认 / 正式(已核实)」，
+    // 与 Wolfx 的 Title 同义；统一收口成 reviewed / automatic，供详情页标注。
+    built.event.determination = EewParser::parseDetermination(payload).toStdString();
+    return built;
 }
 
 } // namespace

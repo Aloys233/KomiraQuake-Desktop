@@ -333,11 +333,39 @@ std::optional<EarthquakeEvent> EewParser::parseCencDirectory(const QJsonObject& 
     EarthquakeEvent event = buildEvent(id, rawEventId, *magnitude, *latitude, *longitude, depth,
                                        location, origin, sourceTitle, user, standard,
                                        maxIntensity.text, maxIntensity.raw, 1, true, false);
+    // 目录条目：没有「第 N 报」语义，只标测定状态（自动 / 正式），供详情页区分。
+    event.isInfo = true;
+    event.determination = parseDetermination(obj).toStdString();
+    // 发布时刻：CENC 目录用 ReportTime（发震时刻之后几分钟），列表排序与详情「发布」
+    // 都按它；缺省留 0，退回接收时刻。
+    event.reportTime = parseUtc8Time(firstString(obj, {"ReportTime", "reportTime"}).value_or(QString()));
     // 目录永不产生 warning/critical
     if (event.warningLevel == WarningLevel::Critical || event.warningLevel == WarningLevel::Warning) {
         event.warningLevel = WarningLevel::Watch;
     }
     return event;
+}
+
+QString EewParser::parseDetermination(const QJsonObject& obj) {
+    // 同一件事在各聚合商目录端点的键名不同：Wolfx cenc_eqlist 用 `type`
+    // （automatic / reviewed），Whews 用 `infoType` / `infoTypeName`（正式(已核实) /
+    // 已确认），Pancakes 用 `status`。统一收口成两个 ASCII 值，UI 不必再猜中文文案。
+    static const char* const kKeys[] = {"type", "infoType", "infoTypeName", "status",
+                                        "createType", "determination"};
+    for (const char* key : kKeys) {
+        const QString raw = obj.value(QLatin1String(key)).toString().trimmed();
+        if (raw.isEmpty()) continue;
+        const QString lower = raw.toLower();
+        if (lower == QLatin1String("reviewed") || lower == QLatin1String("confirmed")
+            || raw.contains(QStringLiteral("正式")) || raw.contains(QStringLiteral("已核实"))
+            || raw.contains(QStringLiteral("已确认")) || raw.contains(QStringLiteral("確定")))
+            return QStringLiteral("reviewed");
+        if (lower == QLatin1String("automatic") || lower == QLatin1String("auto")
+            || raw.contains(QStringLiteral("自动")) || raw.contains(QStringLiteral("暫定"))
+            || raw.contains(QStringLiteral("推定")))
+            return QStringLiteral("automatic");
+    }
+    return QString();
 }
 
 EewParser::MaxIntensityValue EewParser::parseMaxIntensity(const QJsonObject& obj,
@@ -401,6 +429,9 @@ std::optional<EarthquakeEvent> EewParser::parseJmaDirectory(const QJsonObject& o
     EarthquakeEvent event = buildEvent(id, eventId, magnitude, *latitude, *longitude, depth,
                                        location, origin, QStringLiteral("JMA 地震情报"), user, standard,
                                        shindoText, shindoRaw, 1, true, false);
+    // JMA 情报（震源・震度情報 / 遠地地震情報…）：没有报次语义，也不区分自动/正式，
+    // 只标成情报；报告标题（Title）留在原文里，详情页不重复展示。
+    event.isInfo = true;
     // 目录永不产生 warning/critical
     if (event.warningLevel == WarningLevel::Critical || event.warningLevel == WarningLevel::Warning) {
         event.warningLevel = WarningLevel::Watch;

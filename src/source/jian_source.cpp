@@ -14,6 +14,8 @@
 
 #include "source/jian_parser.h"
 #include "source/jian_protocol.h"
+#include "source/raw_payload.h"
+#include "source/ws_latency_probe.h"
 
 namespace komira {
 
@@ -211,6 +213,14 @@ void JianSource::attachSocketHandlers(QWebSocket* socket, quint64 generation, qu
                   QStringLiteral("WS 连接失败：%1").arg(socket->errorString()));
         scheduleReconnect();
     });
+
+    // 链路延迟：协议级 ping/pong 探针。Jian 的业务帧里只有发震时刻、没有发出时刻，
+    // 推不出链路 RTT，此前完全没有延迟（latencyMs 恒为 -1）。
+    attachLatencyProbe(socket, current, [this](qint64 latencyMs) {
+        if (info_.latencyMs == latencyMs) return;
+        info_.latencyMs = latencyMs;
+        emit infoChanged();
+    });
 }
 
 void JianSource::scheduleReconnect(const QString& note) {
@@ -283,12 +293,14 @@ void JianSource::handleRecord(const QString& type, const QJsonObject& data) {
     if (data.isEmpty()) return;
     const JianChannel* channel = jianChannelFor(type);
     if (!channel) return;
+    if (!isSubSourceEnabled(channel->type)) return;
     auto event = JianParser::parseRecord(*channel, data, userLocation(), standard_);
     if (!event) return;
     if (channel->kind == SourceEventKind::Live) {
         const long long now = nowMs();
         if (event->timestamp > 0 && now - event->timestamp > JianProtocol::kEewLiveWindowMs) return;
     }
+    attachRawPayload(*event, data);
     emit eventReceived(*event, channel->kind);
 }
 

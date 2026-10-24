@@ -15,7 +15,8 @@ bool EventGate::sameBody(const EarthquakeEvent& a, const EarthquakeEvent& b) {
            a.depth == b.depth && a.location == b.location && a.isFinal == b.isFinal &&
            a.isCanceled == b.isCanceled && a.timestamp == b.timestamp &&
            a.reportTime == b.reportTime && a.maxIntensityRaw == b.maxIntensityRaw &&
-           a.maxIntensityText == b.maxIntensityText;
+           a.maxIntensityText == b.maxIntensityText && a.isInfo == b.isInfo &&
+           a.determination == b.determination;
 }
 
 void EventGate::prune(long long nowMs) {

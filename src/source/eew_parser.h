@@ -52,6 +52,11 @@ public:
                                                             const UserLocation& user,
                                                             IntensityStandard standard);
 
+    /// 测定状态：`reviewed`（正式测定）/ `automatic`（自动测定）/ 空（上游无此字段）。
+    /// 各聚合商的目录端点用不同键表达同一件事（`type` / `infoType` / `infoTypeName` /
+    /// `status` / `createType`），统一在这里收口，避免每个解析器各写一套判断。
+    static QString parseDetermination(const QJsonObject& obj);
+
     /// 有定位：烈度 + 震级联合判定。
     static WarningLevel deriveLevel(double rawIntensity, double magnitude, bool isCanceled);
     /// 无定位：仅按震级判定。

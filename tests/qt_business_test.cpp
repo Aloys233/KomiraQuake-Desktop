@@ -17,6 +17,7 @@
 #include <QTimer>
 #include <QVector>
 #include <QWebSocket>
+#include <QWebSocketServer>
 #include <cmath>
 #include <functional>
 #include <optional>
@@ -24,10 +25,12 @@
 
 #include "core/ip_geo_lookup.h"
 #include "core/quake_calculator.h"
+#include "core/quake_key.h"
 #include "core/travel_time_service.h"
 #include "core/version_compare.h"
 #include "core/warning_session.h"
 #include "model/data_source_info.h"
+#include "model/event_list_model.h"
 #include "prefs/settings_store.h"
 #include "service/autostart.h"
 #include "service/sentry_service.h"
@@ -40,6 +43,7 @@
 #include "source/pancakes_seis_parser.h"
 #include "source/simulated_parser.h"
 #include "source/simulated_protocol.h"
+#include "source/sub_source_catalog.h"
 #include "source/snet_station_parser.h"
 #include "source/whews_parser.h"
 #include "source/whews_protocol.h"
@@ -58,6 +62,8 @@
 #include "source/pancakes_seis_source.h"
 #include "source/whews_source.h"
 #include "source/simulated_source.h"
+#include "source/pancakes_source.h"
+#include "source/jian_source.h"
 #undef private
 
 using namespace komira;
@@ -1395,6 +1401,67 @@ private slots:
         QCOMPARE(settings.intensityStandard(), 0);
     }
 
+    /// 子数据源默认全部启用；禁用键按 `sourceId:subId` 隔离（同名频道跨源互不影响），
+    /// 且必须经 QSettings 往返存活。
+    void subSourcesDefaultEnabledAndScopedPerSource() {
+        QSettings().clear();
+        SettingsStore settings;
+        QSignalSpy changed(&settings, &SettingsStore::disabledSubSourcesChanged);
+        QVERIFY(changed.isValid());
+
+        QVERIFY(settings.isSubSourceEnabled("wolfx", "jma_eew"));
+        QVERIFY(settings.isSubSourceEnabled("whews", "jma_eew"));
+
+        settings.setSubSourceEnabled("wolfx", "jma_eew", false);
+        QCOMPARE(changed.count(), 1);
+        QVERIFY(!settings.isSubSourceEnabled("wolfx", "jma_eew"));
+        // 同名频道在别的聚合源下不受影响；也不影响顶层源开关。
+        QVERIFY(settings.isSubSourceEnabled("whews", "jma_eew"));
+        QVERIFY(settings.isSourceEnabled("wolfx"));
+        // 幂等：重复关闭不再发信号。
+        settings.setSubSourceEnabled("wolfx", "jma_eew", false);
+        QCOMPARE(changed.count(), 1);
+
+        SettingsStore reloaded;
+        QVERIFY(!reloaded.isSubSourceEnabled("wolfx", "jma_eew"));
+        QVERIFY(reloaded.isSubSourceEnabled("whews", "jma_eew"));
+
+        // 分组批量启停（全开 / 全不选）：一次写入，只发一次通知。
+        const QStringList ids = {"cenc_eew", "sc_eew", "jma_eew"};
+        reloaded.setSubSourcesEnabled("wolfx", ids, false);
+        QVERIFY(!reloaded.isSubSourceEnabled("wolfx", "cenc_eew"));
+        QVERIFY(!reloaded.isSubSourceEnabled("wolfx", "sc_eew"));
+        reloaded.setSubSourcesEnabled("wolfx", ids, true);
+        QVERIFY(reloaded.isSubSourceEnabled("wolfx", "jma_eew"));
+
+        reloaded.resetToDefaults();
+        QVERIFY(reloaded.disabledSubSources().isEmpty());
+        QVERIFY(reloaded.isSubSourceEnabled("wolfx", "jma_eew"));
+    }
+
+    /// 子源目录必须覆盖各聚合源实际接入的频道，且源内 id 唯一、名称非空。
+    void subSourceCatalogCoversAggregatorChannels() {
+        const QVector<SubSourceInfo>& wolfx = subSourcesFor("wolfx");
+        QCOMPARE(wolfx.size(), 8); // 6 个 EEW + 2 个目录端点
+        QCOMPARE(wolfx.first().id, QStringLiteral("cenc_eew"));
+        QCOMPARE(wolfx.last().id, QStringLiteral("jma_eqlist"));
+        QVERIFY(wolfx.last().kind == SourceEventKind::Directory);
+
+        QCOMPARE(subSourcesFor("pancakes").size(), 4);
+        QCOMPARE(subSourcesFor("jian").size(), 7);
+        QCOMPARE(subSourcesFor("whews").size(), 41);
+        QVERIFY(subSourcesFor("simulated").isEmpty());
+
+        for (const QString& sourceId : {"wolfx", "pancakes", "jian", "whews"}) {
+            QSet<QString> seen;
+            for (const SubSourceInfo& sub : subSourcesFor(sourceId)) {
+                QVERIFY2(!seen.contains(sub.id), qPrintable(sourceId + ':' + sub.id));
+                seen.insert(sub.id);
+                QVERIFY(!sub.name.isEmpty());
+            }
+        }
+    }
+
     /// 逐项 NOTIFY 必须真的隔离：改一个设置只能惊动它自己的绑定。
     ///
     /// 回归点（2026-10）：49 个属性原先全挂聚合的 changed()，改任意一项都会让 QML 里
@@ -1784,6 +1851,9 @@ private slots:
             QCOMPARE(parsed->event.sourceAgency, std::string("USGS"));
             QVERIFY(parsed->event.isFinal);
             QCOMPARE(parsed->event.reportTime, origin + 5000);
+            // USGS 的 placeName 是英文原文，按坐标换成震源区中文名。
+            QCOMPARE(QString::fromStdString(parsed->event.location),
+                     QStringLiteral("圣克鲁斯群岛附近"));
         }
         {
             auto parsed = PancakesParser::parseRealtime(
@@ -1797,6 +1867,9 @@ private slots:
             QVERIFY(parsed->event.isFinal);
             QCOMPARE(parsed->event.reportNum, 4);
             QCOMPARE(QString::fromStdString(parsed->event.maxIntensityText), QStringLiteral("VIII"));
+            // GQ 的 region 也换成同一张震源区表的中文名。
+            QCOMPARE(QString::fromStdString(parsed->event.location),
+                     QStringLiteral("日本本州东岸近海附近"));
         }
         {
             auto parsed = PancakesParser::parseRealtime(
@@ -1805,6 +1878,8 @@ private slots:
             QVERIFY(parsed.has_value());
             QVERIFY(parsed->event.isCanceled);
             QCOMPARE(parsed->event.reportNum, PancakesProtocol::kCancelReportNum);
+            // 取消报文没有坐标，不能被 0/0 的震源区名覆盖。
+            QCOMPARE(QString::fromStdString(parsed->event.location), QStringLiteral("已取消"));
         }
         {
             auto parsed = PancakesParser::parseRealtime(
@@ -1858,6 +1933,8 @@ private slots:
                      .toMSecsSinceEpoch());
         QCOMPARE(event->reportTime, origin);
         QVERIFY(!event->isCanceled);
+        // 列表项与实时报文走同一条命名规则。
+        QCOMPARE(QString::fromStdString(event->location), QStringLiteral("加利福尼亚州北部附近"));
     }
 
     // Wolfx 的 JMA 报文时刻是无时区 JST(UTC+9) 墙钟，必须按 JST 解析，才能与 Pancakes 的
@@ -1970,6 +2047,8 @@ private slots:
         a.sWaveArrival = origin + 23000;
         a.reportNum = 4;
         a.isFinal = true;
+        a.isInfo = true;
+        a.determination = "reviewed";
         {
             HistoryStore store;
             QVERIFY(store.init(path));
@@ -2009,6 +2088,9 @@ private slots:
             QVERIFY(saved.sWaveArrival == a.sWaveArrival);
             QCOMPARE(saved.reportNum, 4);
             QVERIFY(saved.isFinal);
+            // 情报标记与测定状态也要跨重启存活：详情页靠它们标「情报/正式测定」。
+            QVERIFY(saved.isInfo);
+            QCOMPARE(saved.determination, std::string("reviewed"));
             a.reportNum = 5;
             a.reportTime += 2000;
             a.maxIntensityRaw = 7;
@@ -2030,6 +2112,108 @@ private slots:
             QCOMPARE(store.loadRecent().front().id, a.id);
             store.clear();
             QVERIFY(store.loadRecent().empty());
+        }
+    }
+
+    /// 报次归档的键与主键语义：同一场地震的预警（`n:2`）与情报（`i:<发布时刻>`）
+    /// 各自成行；升级前的老表按 `n:<报数>` 原地搬家，不丢历史。
+    void reportArchiveKeysSeparateInfoFromEew() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath("reports.sqlite");
+        const std::string agency = "CENC";
+        const long long origin = 1'800'000'000'000LL;
+        const QString key = quakePrimaryGroupKey(agency, origin, 30.0, 103.0);
+        QVERIFY(!key.isEmpty());
+        {
+            HistoryStore store;
+            QVERIFY(store.init(path));
+            StoredReport eew;
+            eew.quakeKey = key;
+            eew.reportKey = QStringLiteral("n:2");
+            eew.reportNum = 2;
+            eew.sourceId = QStringLiteral("wolfx");
+            eew.sourceTag = QStringLiteral("Wolfx·CENC");
+            eew.receivedAt = origin + 5000;
+            eew.rawJson = QStringLiteral(R"({"n":2})");
+            eew.timestamp = origin;
+            eew.reportTime = origin + 4000;
+            eew.magnitude = 5.2;
+            eew.latitude = 30.0;
+            eew.longitude = 103.0;
+            eew.location = QStringLiteral("灾测震中");
+            StoredReport info = eew;
+            info.reportKey = QStringLiteral("i:%1").arg(origin + 600'000);
+            info.reportNum = 1;
+            info.isInfo = true;
+            info.determination = QStringLiteral("reviewed");
+            info.sourceId = QStringLiteral("pancakes");
+            info.sourceTag = QStringLiteral("Pancakes·CENC");
+            // 同一报数（1）却是不同报次槽：旧主键 (key, report_num, source) 已不足以区分。
+            StoredReport eewFirst = eew;
+            eewFirst.reportKey = QStringLiteral("n:1");
+            eewFirst.reportNum = 1;
+            eewFirst.sourceId = QStringLiteral("pancakes");
+            eewFirst.sourceTag = QStringLiteral("Pancakes·CENC");
+            store.upsertReports({eew, info, eewFirst});
+            const auto rows = store.loadReports(key);
+            QCOMPARE(rows.size(), qsizetype(3));
+            bool sawReviewed = false;
+            bool sawEew2 = false;
+            for (const StoredReport& r : rows) {
+                if (r.isInfo && r.determination == QStringLiteral("reviewed")) sawReviewed = true;
+                if (!r.isInfo && r.reportNum == 2 && r.reportKey == QStringLiteral("n:2"))
+                    sawEew2 = true;
+            }
+            QVERIFY(sawReviewed);
+            QVERIFY(sawEew2);
+        }
+        {
+            // 幂等：重开不会重复写。
+            HistoryStore store;
+            QVERIFY(store.init(path));
+            QCOMPARE(store.loadReports(key).size(), qsizetype(3));
+        }
+
+        // 升级前的归档表（无 report_key，quake_key = 机构|发震时刻毫秒）要能被搬过来。
+        const auto legacyPath = dir.filePath("legacy_reports.sqlite");
+        const QString legacyKey = QStringLiteral("cenc|") + QString::number(origin);
+        {
+            const QString connection = "qt_business_report_legacy";
+            auto db = QSqlDatabase::addDatabase("QSQLITE", connection);
+            db.setDatabaseName(legacyPath);
+            QVERIFY(db.open());
+            QSqlQuery q(db);
+            QVERIFY(q.exec("CREATE TABLE event_reports (quake_key TEXT NOT NULL, "
+                           "report_num INTEGER NOT NULL, source_id TEXT NOT NULL, "
+                           "source_tag TEXT NOT NULL, received_at INTEGER NOT NULL, "
+                           "raw_json TEXT NOT NULL DEFAULT '', timestamp INTEGER NOT NULL, "
+                           "report_time INTEGER NOT NULL, magnitude REAL NOT NULL, "
+                           "depth REAL NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, "
+                           "location TEXT NOT NULL, max_intensity_text TEXT NOT NULL DEFAULT '', "
+                           "is_final INTEGER NOT NULL, is_canceled INTEGER NOT NULL, "
+                           "PRIMARY KEY (quake_key, report_num, source_id))"));
+            QSqlQuery insert(db);
+            insert.prepare(QStringLiteral(
+                "INSERT INTO event_reports VALUES (?,1,'wolfx','Wolfx·CENC',?,?,?,?,5.0,10.0,"
+                "30.0,103.0,'旧报次','',0,0)"));
+            insert.addBindValue(legacyKey);
+            insert.addBindValue(origin + 1000);
+            insert.addBindValue(QStringLiteral(R"({"legacy":true})"));
+            insert.addBindValue(origin);
+            insert.addBindValue(origin + 900);
+            QVERIFY(insert.exec());
+        }
+        QSqlDatabase::removeDatabase("qt_business_report_legacy");
+        {
+            HistoryStore store;
+            QVERIFY(store.init(legacyPath));
+            // 旧键的毫秒被重算成分钟桶 + 震中网格：新键与 quakePrimaryGroupKey 一致。
+            const auto rows = store.loadReports(key);
+            QCOMPARE(rows.size(), qsizetype(1));
+            QCOMPARE(rows.front().reportKey, QStringLiteral("n:1"));
+            QCOMPARE(rows.front().location, QStringLiteral("旧报次"));
+            QVERIFY(rows.front().rawJson.contains("legacy"));
         }
     }
 
@@ -2062,6 +2246,9 @@ private slots:
         QCOMPARE(cencEvent->timestamp,
                  QDateTime::fromString(QStringLiteral("2026-08-13T00:47:00Z"), Qt::ISODate)
                      .toMSecsSinceEpoch());
+        // 只有 USGS 频道换地名；CENC 自带的行政区名原样保留。
+        QCOMPARE(QString::fromStdString(cencEvent->location),
+                 QString::fromUtf8("甘肃临夏州永靖县"));
 
         const auto* jma = whewsChannelFor(QStringLiteral("jma_eew"));
         QVERIFY(jma);
@@ -2080,6 +2267,23 @@ private slots:
                      .toMSecsSinceEpoch());
         QCOMPARE(jmaEvent->reportNum, 10);
         QCOMPARE(jmaEvent->maxIntensityRaw, 6.5);   // JMA 震度文本 "6+"
+    }
+
+    // USGS 频道的地名是英文原文（「10 km NE of ...」），与 GQ / 震源推算一致，
+    // 按坐标查 1°×1° 震源区表补中文名。
+    void whewsUsgsUsesRegionNameTable() {
+        const auto* usgs = whewsChannelFor(QStringLiteral("usgs"));
+        QVERIFY(usgs);
+        const auto event = WhewsParser::parseRecord(
+            *usgs,
+            QJsonObject{{"id", QStringLiteral("us7000abcd")},
+                        {"shockTime", QStringLiteral("2026-10-05 11:19:29")},
+                        {"latitude", 38.8}, {"longitude", -122.8}, {"depth", 10.0},
+                        {"magnitude", 4.9},
+                        {"placeName", QStringLiteral("10 km NE of Berkeley, CA")}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(event.has_value());
+        QCOMPARE(QString::fromStdString(event->location), QStringLiteral("加利福尼亚州北部附近"));
     }
 
     // createTime / updateTime 同样按频道时区解析。
@@ -2625,6 +2829,158 @@ private slots:
         QVERIFY(reloaded.developerMode());
         QCOMPARE(reloaded.simulatedUrl(), QStringLiteral("ws://10.0.2.2:8080/ws"));
         QSettings().clear();
+    }
+
+    /// 侧栏筛选全部是**展示层**条件：切筛选立即重算，不改源行。
+    /// 「近 24h」必须双向判定 —— 未来时间戳不能混进来（否则会永远钉在最前面）。
+    void eventFilterAppliesTimeWindowBothDirections() {
+        EventListModel model;
+        EventFilterModel filter;
+        filter.setSourceModel(&model);
+
+        const long long now = 1'800'000'000'000LL;
+        filter.setNowProvider([now] { return now; });
+
+        const auto row = [](const QString& id, long long timestamp, double magnitude,
+                            double distance) {
+            EventListModel::Row r;
+            r.id = id;
+            r.timestamp = timestamp;
+            r.magnitude = magnitude;
+            r.source = QStringLiteral("Wolfx 地震信息");
+            r.sourceTag = QStringLiteral("Wolfx·CENC");
+            r.sourceTags = QStringList{r.sourceTag};
+            r.location = QStringLiteral("四川");
+            if (distance >= 0.0) {
+                r.hasDistance = true;
+                r.distance = distance;
+            }
+            return r;
+        };
+        constexpr long long kHour = 3600LL * 1000LL;
+        model.setRows({row(QStringLiteral("old"), now - 30 * kHour, 6.0, 100.0),
+                       row(QStringLiteral("fresh"), now - 2 * kHour, 3.0, 900.0),
+                       row(QStringLiteral("near"), now - kHour, 4.5, 120.0),
+                       row(QStringLiteral("future"), now + 10 * 60'000, 7.0, 50.0)});
+
+        filter.setFilter(QStringLiteral("RECENT_24H"), QString());
+        // future 是时钟漂移/源侧错误：不属于「近 24h」；old 已过期。
+        QCOMPARE(filter.rowCount(), 2);
+
+        filter.setFilter(QStringLiteral("WITHIN_500"), QString());
+        // fresh 距离 900 km 被挡；old / near / future 都在 500 km 内。
+        QCOMPARE(filter.rowCount(), 3);
+
+        filter.setFilter(QStringLiteral("M4_PLUS"), QString());
+        QCOMPARE(filter.rowCount(), 3);   // old + near + future，fresh 3.0 被挡
+
+        filter.setFilter(QStringLiteral("ALL"), QString());
+        QCOMPARE(filter.rowCount(), 4);
+
+        filter.setFilter(QStringLiteral("ALL"), QStringLiteral("cenc"));
+        QCOMPARE(filter.rowCount(), 4);   // 来源标签命中
+    }
+
+    // 五个事件源都必须真的测出链路延迟：`latencyMs` 是设置页「延迟」的唯一数据来源。
+    //
+    // 这条用例钉住的原缺陷：此前只有 Wolfx 调过 `socket_->ping()`，Whews / Simulated 连了
+    // pong 却从不 ping（死代码），Jian / Pancakes 连 pong 都没接 —— `latencyMs` 恒为 -1，
+    // 设置页的延迟对四个源永远不显示，用户看到的就是「延迟那栏一直是空的」。
+    //
+    // 用本机 QWebSocketServer 做对端（它按 RFC 6455 自动回 pong），因此不依赖外网、也不
+    // 依赖真实上游是否支持控制帧。回环 RTT 常常量到 0 ms，所以断言「测到了」（>= 0）
+    // 而不是一个正数 —— 0 ms 是合法测量值，与「没测过」（-1）是两件事。
+    void everyEventSourceMeasuresLinkLatency() {
+        QWebSocketServer server(QStringLiteral("komira-latency-probe-test"),
+                                QWebSocketServer::NonSecureMode);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QObject::connect(&server, &QWebSocketServer::newConnection, &server, [&server]() {
+            while (server.hasPendingConnections()) server.nextPendingConnection();
+        });
+        const QUrl url(QStringLiteral("ws://127.0.0.1:%1").arg(server.serverPort()));
+
+        // 每个源都按它真实的接线方式挂上回调，再接一条本机链路。
+        // 注意 `generation_` 要与传进 attachSocketHandlers 的一致：`current()` 守卫三个条件
+        // （running / generation / attempt），任何一项对不上，探针的 pong 回调就会被丢弃，
+        // 表现成「连上了但测不到延迟」——这本身也值得被这条用例覆盖。
+        // Wolfx
+        {
+            WolfxSource source;
+            source.running_ = true;
+            source.generation_ = 1;
+            auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+            source.socket_ = socket;
+            source.attachSocketHandlers(socket, /*generation*/ 1, ++source.attempt_);
+            QSignalSpy changed(&source, &WolfxSource::infoChanged);
+            socket->open(url);
+            QTRY_VERIFY_WITH_TIMEOUT(source.info().latencyMs >= 0, 5000);
+            // 只有真的发过 ping 才会拿到 pong，因此 infoChanged 必须被触发过。
+            QVERIFY(changed.count() > 0);
+            source.stop();
+        }
+        // Pancakes（此前完全没有 pong 处理）
+        {
+            PancakesSource source;
+            source.running_ = true;
+            source.generation_ = 1;
+            auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+            source.socket_ = socket;
+            source.attachSocketHandlers(socket, /*generation*/ 1, ++source.attempt_);
+            socket->open(url);
+            QTRY_VERIFY_WITH_TIMEOUT(source.info().latencyMs >= 0, 5000);
+            source.stop();
+        }
+        // Jian（此前完全没有 pong 处理）
+        {
+            JianSource source;
+            source.running_ = true;
+            source.generation_ = 1;
+            auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+            source.socket_ = socket;
+            source.attachSocketHandlers(socket, /*generation*/ 1, ++source.attempt_);
+            socket->open(url);
+            QTRY_VERIFY_WITH_TIMEOUT(source.info().latencyMs >= 0, 5000);
+            source.stop();
+        }
+        // Whews（此前 pong 处理器是死代码）
+        {
+            WhewsSource source;
+            source.running_ = true;
+            source.generation_ = 1;
+            auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+            source.socket_ = socket;
+            source.attachSocketHandlers(socket, /*generation*/ 1, ++source.attempt_);
+            socket->open(url);
+            QTRY_VERIFY_WITH_TIMEOUT(source.info().latencyMs >= 0, 5000);
+            source.stop();
+        }
+        // Simulated（同上）
+        {
+            SimulatedSource source;
+            source.running_ = true;
+            source.generation_ = 1;
+            auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+            source.socket_ = socket;
+            source.attachSocketHandlers(socket, /*generation*/ 1, ++source.attempt_);
+            socket->open(url);
+            QTRY_VERIFY_WITH_TIMEOUT(source.info().latencyMs >= 0, 5000);
+            source.stop();
+        }
+
+        // 断开后不得留着旧值冒充当前延迟：setStatus 在非 Connected 时把 latencyMs 置 -1，
+        // 设置页据此把「延迟」整行收起（而不是继续显示几秒前的数）。
+        {
+            WhewsSource source;
+            source.running_ = true;
+            source.generation_ = 1;
+            auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+            source.socket_ = socket;
+            source.attachSocketHandlers(socket, /*generation*/ 1, ++source.attempt_);
+            socket->open(url);
+            QTRY_VERIFY_WITH_TIMEOUT(source.info().latencyMs >= 0, 5000);
+            source.stop();
+            QCOMPARE(source.info().latencyMs, qint64(-1));
+        }
     }
 
     void sentryServiceDsnAndBreadcrumbs() {

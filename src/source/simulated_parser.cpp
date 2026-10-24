@@ -83,6 +83,7 @@ std::optional<EarthquakeEvent> SimulatedParser::parseReport(const QJsonObject& f
     event.reportNum = toInt(frame, QStringLiteral("reportNum"), 1);
     event.isFinal = toBool(frame, QStringLiteral("isFinal"));
     event.isCanceled = toBool(frame, QStringLiteral("isCanceled"));
+    event.isInfo = kind == SourceEventKind::Directory;
     // 收帧时刻：目录去重以 reportTime 决胜（见 AppController::handleEvent），
     // 缺省会令目录条目任意胜出。服务端不发送该字段。
     event.reportTime = nowMs;

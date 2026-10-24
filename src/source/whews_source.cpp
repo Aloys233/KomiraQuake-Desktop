@@ -13,6 +13,8 @@
 
 #include "source/whews_parser.h"
 #include "source/whews_protocol.h"
+#include "source/raw_payload.h"
+#include "source/ws_latency_probe.h"
 
 namespace komira {
 
@@ -202,10 +204,11 @@ void WhewsSource::attachSocketHandlers(QWebSocket* socket, quint64 generation, q
         scheduleReconnect();
     });
 
-    connect(socket, &QWebSocket::pong, this, [this, current](quint64 elapsed, const QByteArray&) {
-        if (!current()) return;
-        info_.latencyMs = static_cast<qint64>(elapsed);
-        info_.lastHeartbeat = nowMs();
+    // 链路延迟：协议级 ping/pong 探针。此前这里只连了 pong、从未 ping —— 死代码，
+    // `latencyMs` 恒为 -1，设置页对 Whews 永远不显示延迟。
+    attachLatencyProbe(socket, current, [this](qint64 latencyMs) {
+        if (info_.latencyMs == latencyMs) return;
+        info_.latencyMs = latencyMs;
         emit infoChanged();
     });
 }
@@ -248,6 +251,7 @@ void WhewsSource::handleFrame(const QJsonObject& frame) {
     const WhewsChannel* channel =
         whewsChannelFor(frame.value(QStringLiteral("source")).toString());
     if (!channel) return;
+    if (!isSubSourceEnabled(channel->source)) return;
     auto event = WhewsParser::parseRecord(*channel, data, userLocation(), standard_);
     if (!event) return;
     if (channel->kind == SourceEventKind::Live) {
@@ -259,6 +263,7 @@ void WhewsSource::handleFrame(const QJsonObject& frame) {
             return;
         }
     }
+    attachRawPayload(*event, frame);
     emit eventReceived(*event, channel->kind);
 }
 

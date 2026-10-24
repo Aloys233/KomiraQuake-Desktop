@@ -4,6 +4,8 @@
 #include <QJsonValue>
 #include <QStringList>
 
+#include "core/region_names.h"
+
 namespace komira {
 
 namespace {
@@ -70,6 +72,12 @@ std::optional<EarthquakeEvent> WhewsParser::parseRecord(const WhewsChannel& chan
     const double depth = firstDouble(data, {"depth", "Depth"}).value_or(EewParser::kDefaultDepth);
     QString location = firstString(data, {"placeName", "place", "location"}).value_or(QString());
     if (location.isEmpty()) location = QString::fromUtf8("未知震源");
+    // USGS 频道的地名是英文原文；与 GQ / 震源推算一致，按坐标查震源区中文名，
+    // 该格无名称时保留原文。
+    if (channel.source == QLatin1String("usgs")) {
+        const std::string region = RegionNameTable::instance().nameAt(*latitude, *longitude);
+        if (!region.empty()) location = QString::fromStdString(region);
+    }
 
     // 报次：EEW 用 updates；情报多为 1。
     const int reportNum = firstInt(data, {"updates", "number", "serial"}).value_or(1);
@@ -104,6 +112,9 @@ std::optional<EarthquakeEvent> WhewsParser::parseRecord(const WhewsChannel& chan
     event.reportNum = reportNum;
     event.isFinal = finalReport;
     event.isCanceled = canceled;
+    // 目录/速报通道：只进列表与历史，没有「第 N 报」语义。
+    event.isInfo = channel.kind == SourceEventKind::Directory;
+    if (event.isInfo) event.determination = EewParser::parseDetermination(data).toStdString();
 
     const QString updatedAt = firstString(data, {"createTime", "updateTime"}).value_or(QString());
     if (!updatedAt.isEmpty()) event.reportTime = parseWallClock(updatedAt, channel.tz);
