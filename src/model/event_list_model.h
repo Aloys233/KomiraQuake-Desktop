@@ -4,6 +4,9 @@
 #include <QHash>
 #include <QSortFilterProxyModel>
 #include <QString>
+#include <QStringList>
+#include <QTimer>
+#include <functional>
 #include <vector>
 
 namespace komira {
@@ -28,11 +31,14 @@ public:
         EventDepthTextRole,
         EventTimeTextRole,
         EventSourceTagRole,
+        EventSourceTagsRole,
         EventIntensityRole,
         EventIntensityLabelRole,
         EventIntensityColorRole,
         EventActiveRole,
         EventFocusedRole,
+        /// 距用户的距离（km，整数文本）；无定位时为空串。
+        EventDistanceTextRole,
     };
 
     struct Row {
@@ -44,6 +50,8 @@ public:
         QString depthText;
         QString timeText;
         QString sourceTag;
+        /// 同一物理事件可能同时被多个聚合源收录；保留完整来源集合供 UI 排版。
+        QStringList sourceTags;
         QString intensity;
         QString intensityLabel;
         QString intensityColor;
@@ -51,6 +59,7 @@ public:
         long long timestamp = 0;
         double magnitude = 0.0;
         double distance = -1.0;
+        QString distanceText;
         bool hasDistance = false;
         bool isActive = false;
         bool focused = false;
@@ -77,19 +86,29 @@ private:
 };
 
 /// 侧栏筛选代理。筛选项只改变代理行，源模型与 delegate 生命周期不受影响。
+///
+/// 「近 24 小时」是**时间相关**条件：行本身不变，但随着时间推移会自然失效。
+/// 因此代理自带一个 60 s 定时器，在选中该筛选时重新求值；否则列表会停在首次
+/// 筛选结果上，过了 24 h 的条目永远不下线。
 class EventFilterModel final : public QSortFilterProxyModel {
     Q_OBJECT
 public:
     explicit EventFilterModel(QObject* parent = nullptr);
 
     Q_INVOKABLE void setFilter(const QString& filter, const QString& searchQuery);
+    /// 供时效筛选使用的应用时钟（校时后的 now）。未注入时退回系统时钟。
+    void setNowProvider(std::function<long long()> provider) { nowProvider_ = std::move(provider); }
 
 protected:
     bool filterAcceptsRow(int sourceRow, const QModelIndex& sourceParent) const override;
 
 private:
+    long long nowMs() const;
+
     QString filter_ = QStringLiteral("ALL");
     QString searchQuery_;
+    std::function<long long()> nowProvider_;
+    QTimer recencyTimer_;
 };
 
 } // namespace komira

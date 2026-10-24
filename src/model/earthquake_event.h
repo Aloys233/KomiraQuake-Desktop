@@ -26,17 +26,32 @@ struct EarthquakeEvent {
     std::string sourceProvider;
     /// 报数机构，如 "CENC"、"JMA"。UI 以 `<provider>·<agency>` 标明来源。
     std::string sourceAgency;
+    /// 抓取该记录的数据源 ID（`wolfx` / `pancakes` / `jian` / `whews`…），
+    /// 供设置页的逐源「信息事件震级过滤」在**展示层**复核。旧库记录为空。
+    std::string sourceId;
     double distanceKm = 0.0;
+    /// 本条报文的原始 JSON（紧凑序列化）。只用于详情页「原始数据」展示，
+    /// 不进入 events 表；报次归档见 AppController 的 event_reports。
+    std::string rawJson;
+    /// 抓取到本条报文的本地时刻（epoch ms，校时时钟）。详情页按源展示接收时间。
+    long long receivedAt = 0;
     std::string estimatedIntensity;   // 本地预估烈度（需定位；无定位为 "--"）
     double rawIntensity = 0.0;
     double maxIntensityRaw = 0.0;     // 源报最大烈度（数值；未知为 0）
     std::string maxIntensityText;     // 源报最大烈度（展示文本；未知为空）
+    /// 测定状态（仅目录/情报报文有意义）：`reviewed`（正式测定）/ `automatic`
+    /// （自动测定）/ 空（上游没有这个字段）。只用于详情页标注，不参与去重与合并。
+    std::string determination;
     std::optional<long long> pWaveArrival;
     std::optional<long long> sWaveArrival;
     WarningLevel warningLevel = WarningLevel::Normal;
     int reportNum = 1;
     bool isFinal = false;
     bool isCanceled = false;
+    /// 目录/情报报文（相对于实时预警）。情报没有「报次」语义：同一条上游电文只会
+    /// 出现在列表与历史里，报次（第 N 报）只由实时预警产生。UI 据此决定标「情报」
+    /// 还是「第 N 报」，不再把恒为 1 的 reportNum 当成报次显示。
+    bool isInfo = false;
 
     int remainingSeconds(long long nowMs) const {
         if (!sWaveArrival) return -1;

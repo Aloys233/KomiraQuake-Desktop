@@ -45,7 +45,11 @@ GlassCard {
                 font.weight: Font.Medium
                 elide: Text.ElideRight
             }
-            Text { text: root.event ? "第 " + root.event.reportNum + " 报" : ""; color: root.theme.outline; font.pixelSize: 10 }
+            Text {
+                text: root.event && root.event.reportNumText !== undefined
+                      ? String(root.event.reportNumText) : ""
+                color: root.theme.outline; font.pixelSize: 10
+            }
         }
 
         RowLayout {

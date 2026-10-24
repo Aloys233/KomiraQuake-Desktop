@@ -90,6 +90,7 @@ qt_add_executable(komiraquake WIN32
 
     # source
     src/source/earthquake_source.h
+    src/source/raw_payload.h
     src/source/eew_parser.cpp
     src/source/wolfx_source.cpp
     src/source/pancakes_parser.cpp
@@ -113,6 +114,7 @@ qt_add_executable(komiraquake WIN32
     src/source/simulated_protocol.cpp
     src/source/simulated_parser.cpp
     src/source/simulated_source.cpp
+    src/source/sub_source_catalog.cpp
 
     # store / prefs
     src/store/history_store.cpp
@@ -188,8 +190,11 @@ set(KOMIRA_QML_FILES
     qml/IntensityBadge.qml
     qml/EventTile.qml
     qml/EventListSidebar.qml
+    qml/EventDetailPanel.qml
+    qml/JsonView.qml
     qml/MapView.qml
     qml/StationIntensityCard.qml
+    qml/StationStack.qml
     qml/SourceEstimateCard.qml
     qml/EstimateMarker.qml
     qml/EpicenterInfo.qml
@@ -201,6 +206,7 @@ set(KOMIRA_QML_FILES
     qml/settings/WarningSection.qml
     qml/settings/AudioSection.qml
     qml/settings/SourceSection.qml
+    qml/settings/SourceDetailCard.qml
     qml/settings/ClockSection.qml
     qml/settings/AboutSection.qml
     qml/settings/SourceEstimationSection.qml
@@ -366,10 +372,12 @@ if(BUILD_TESTING)
         src/source/wolfx_seis_parser.cpp src/source/wolfx_seis_source.cpp
         src/source/simulated_protocol.cpp src/source/simulated_parser.cpp
         src/source/simulated_source.cpp
+        src/source/sub_source_catalog.cpp
         src/service/sentry_service.cpp
         src/service/source_estimation_service.cpp
         src/service/travel_time_arrivals.h
         src/core/source_estimator.cpp src/core/region_names.cpp
+        src/model/event_list_model.cpp src/model/event_list_model.h
         src/store/history_store.cpp src/prefs/settings_store.cpp)
     target_include_directories(qt_business_test PRIVATE src)
     target_link_libraries(qt_business_test PRIVATE Qt6::Test Qt6::Network Qt6::WebSockets Qt6::Sql sentry)

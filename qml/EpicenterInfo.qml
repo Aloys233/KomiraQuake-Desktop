@@ -54,14 +54,12 @@ Item {
     /// 发震时刻（UTC+8）：与 HUD / 事件列表同源，独占一行保证完整可见。
     readonly property string timeText: hasData && event.timeText !== undefined
         ? String(event.timeText) : ""
-    /// 数据源 + 报数/取消态：次要信息，压缩到一行。
+    /// 数据源 + 报数/情报态：次要信息，压缩到一行。
     readonly property string sourceText: {
         if (!hasData) return "";
         const tag = event.sourceTag !== undefined ? String(event.sourceTag) : "";
-        let tail = "";
-        if (event.isCanceled === true) tail = "取消报";
-        else if (event.reportNum !== undefined && Number(event.reportNum) > 0)
-            tail = "第 " + String(event.reportNum) + " 报";
+        // 报数文案由 AppController 成型：情报没有「第 N 报」语义（见 toMap）。
+        const tail = event.reportNumText !== undefined ? String(event.reportNumText) : "";
         return tail.length ? (tag.length ? tag + " · " + tail : tail) : tag;
     }
     /// 默认挂在十字下方；下方剩余空间不够时翻到上方（避免贴底被裁）。

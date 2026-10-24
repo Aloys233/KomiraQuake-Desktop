@@ -1,5 +1,7 @@
 #include "store/history_store.h"
 
+#include <QDebug>
+#include <QRegularExpression>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QSet>
@@ -7,6 +9,8 @@
 #include <QVariant>
 
 #include <utility>
+
+#include "core/quake_key.h"
 
 namespace komira {
 
@@ -81,7 +85,11 @@ bool HistoryStore::createTable() {
         {QStringLiteral("event_id"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
         {QStringLiteral("report_time"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
         {QStringLiteral("max_intensity_raw"), QStringLiteral("REAL NOT NULL DEFAULT 0")},
-        {QStringLiteral("max_intensity_text"), QStringLiteral("TEXT NOT NULL DEFAULT ''")}
+        {QStringLiteral("max_intensity_text"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
+        {QStringLiteral("source_id"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
+        // 情报标记与测定状态：重启后详情页仍要区分「情报」与「第 N 报」。
+        {QStringLiteral("is_info"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
+        {QStringLiteral("determination"), QStringLiteral("TEXT NOT NULL DEFAULT ''")}
     };
     for (const auto& column : additions) {
         if (!columns.contains(column.first)
@@ -97,10 +105,143 @@ bool HistoryStore::createTable() {
         db_.rollback();
         return false;
     }
+    // 报次归档：同一场地震的每一报、每一路聚合源各一行。quake_key 由控制器按
+    // 「机构 + 发震时刻分钟桶 + 震中网格」生成，实时预警与情报因此能落进同一组。
+    //
+    // 主键用 report_key 而不是 report_num：同一场地震的预警与情报各自从第 1 报开始
+    // 编号（情报甚至没有报数），只用 (quake_key, report_num) 会让「情报」覆盖掉「第 1 报」。
+    // 旧库的主键是 (quake_key, report_num, source_id)，SQLite 不能原地改主键，只能重建。
+    if (!q.exec(QStringLiteral("PRAGMA table_info(event_reports)"))) {
+        db_.rollback();
+        return false;
+    }
+    QSet<QString> reportColumns;
+    while (q.next()) reportColumns.insert(q.value(1).toString());
+    q.finish();
+    const bool reportsTableExists = !reportColumns.isEmpty();
+    const bool legacyReports = reportsTableExists
+                               && !reportColumns.contains(QStringLiteral("report_key"));
+    if (legacyReports) {
+        // 升级前的归档：quake_key 是 `<机构>|<发震时刻毫秒>`，报次只按 report_num 分。
+        // 新键要「分钟桶 + 震中网格」，两者都能从行内已有数据算出来，所以原地搬家，
+        // 不丢用户的报次历史（见下方 C++ 迁移）。
+        if (!q.exec(QStringLiteral("ALTER TABLE event_reports RENAME TO event_reports_legacy"))) {
+            db_.rollback();
+            return false;
+        }
+    }
+    if (!q.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS event_reports ("
+            "quake_key TEXT NOT NULL, report_key TEXT NOT NULL, report_num INTEGER NOT NULL, "
+            "source_id TEXT NOT NULL, source_tag TEXT NOT NULL, received_at INTEGER NOT NULL, "
+            "raw_json TEXT NOT NULL DEFAULT '', timestamp INTEGER NOT NULL, "
+            "report_time INTEGER NOT NULL, magnitude REAL NOT NULL, depth REAL NOT NULL, "
+            "latitude REAL NOT NULL, longitude REAL NOT NULL, location TEXT NOT NULL, "
+            "max_intensity_text TEXT NOT NULL DEFAULT '', is_final INTEGER NOT NULL, "
+            "is_canceled INTEGER NOT NULL, is_info INTEGER NOT NULL DEFAULT 0, "
+            "determination TEXT NOT NULL DEFAULT '', "
+            "PRIMARY KEY (quake_key, report_key, source_id))"))) {
+        db_.rollback();
+        return false;
+    }
+    if (legacyReports && !migrateLegacyReports()) {
+        db_.rollback();
+        return false;
+    }
     q.finish();
     if (db_.commit()) return true;
     db_.rollback();
     return false;
+}
+
+bool HistoryStore::migrateLegacyReports() {
+    // 旧行没有报数机构：quake_key 形如 `<小写机构>|<发震时刻毫秒>`，机构段可直接取回。
+    // identity 兜底键（`机构|eventId`）的后半段不是纯数字，靠这一点筛掉。
+    QSqlQuery read(db_);
+    if (!read.exec(QStringLiteral(
+            "SELECT quake_key, report_num, source_id, source_tag, received_at, raw_json, "
+            "timestamp, report_time, magnitude, depth, latitude, longitude, location, "
+            "max_intensity_text, is_final, is_canceled FROM event_reports_legacy"))) {
+        return false;
+    }
+    QVector<StoredReport> migrated;
+    const QRegularExpression numericSuffix(QStringLiteral("^\\d+$"));
+    while (read.next()) {
+        const QString legacyKey = read.value(0).toString();
+        const int split = legacyKey.lastIndexOf(QLatin1Char('|'));
+        if (split <= 0) continue;
+        const QString agency = legacyKey.left(split);
+        const QString suffix = legacyKey.mid(split + 1);
+        if (!numericSuffix.match(suffix).hasMatch()) continue;   // identity 兜底键，跳过
+        bool ok = false;
+        const long long timestamp = suffix.toLongLong(&ok);
+        if (!ok || timestamp <= 0) continue;
+        StoredReport r;
+        r.quakeKey = quakePrimaryGroupKey(agency.toStdString(), timestamp,
+                                          read.value(10).toDouble(), read.value(11).toDouble());
+        if (r.quakeKey.isEmpty()) continue;
+        r.reportNum = read.value(1).toInt();
+        r.reportKey = QStringLiteral("n:") + QString::number(r.reportNum);
+        r.sourceId = read.value(2).toString();
+        r.sourceTag = read.value(3).toString();
+        r.receivedAt = read.value(4).toLongLong();
+        r.rawJson = read.value(5).toString();
+        r.timestamp = read.value(6).toLongLong();
+        r.reportTime = read.value(7).toLongLong();
+        r.magnitude = read.value(8).toDouble();
+        r.depth = read.value(9).toDouble();
+        r.latitude = read.value(10).toDouble();
+        r.longitude = read.value(11).toDouble();
+        r.location = read.value(12).toString();
+        r.maxIntensityText = read.value(13).toString();
+        r.isFinal = read.value(14).toInt() != 0;
+        r.isCanceled = read.value(15).toInt() != 0;
+        migrated.push_back(r);
+        if (migrated.size() >= 2000) {
+            writeReportsBlocking(migrated);
+            migrated.clear();
+        }
+    }
+    read.finish();
+    if (!migrated.isEmpty()) writeReportsBlocking(migrated);
+    QSqlQuery drop(db_);
+    return drop.exec(QStringLiteral("DROP TABLE event_reports_legacy"));
+}
+
+bool HistoryStore::writeReportsBlocking(const QVector<StoredReport>& reports) {
+    if (reports.isEmpty()) return true;
+    QSqlQuery q(db_);
+    q.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO event_reports (quake_key, report_key, report_num, source_id, "
+        "source_tag, received_at, raw_json, timestamp, report_time, magnitude, depth, latitude, "
+        "longitude, location, max_intensity_text, is_final, is_canceled, is_info, determination) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
+    for (const StoredReport& r : reports) {
+        q.addBindValue(r.quakeKey);
+        q.addBindValue(r.reportKey);
+        q.addBindValue(r.reportNum);
+        q.addBindValue(r.sourceId);
+        q.addBindValue(r.sourceTag);
+        q.addBindValue(r.receivedAt);
+        q.addBindValue(r.rawJson);
+        q.addBindValue(r.timestamp);
+        q.addBindValue(r.reportTime);
+        q.addBindValue(r.magnitude);
+        q.addBindValue(r.depth);
+        q.addBindValue(r.latitude);
+        q.addBindValue(r.longitude);
+        q.addBindValue(r.location);
+        q.addBindValue(r.maxIntensityText);
+        q.addBindValue(r.isFinal ? 1 : 0);
+        q.addBindValue(r.isCanceled ? 1 : 0);
+        q.addBindValue(r.isInfo ? 1 : 0);
+        q.addBindValue(r.determination);
+        if (!q.exec()) {
+            qWarning() << "[history] migrate report failed:" << q.lastError().text();
+            return false;
+        }
+    }
+    return true;
 }
 
 QVector<EarthquakeEvent> HistoryStore::loadRecent(int limit) const {
@@ -111,8 +252,8 @@ QVector<EarthquakeEvent> HistoryStore::loadRecent(int limit) const {
         "SELECT id, source, magnitude, latitude, longitude, depth, location, timestamp, "
         "distance_km, estimated_intensity, raw_intensity, p_wave_arrival, s_wave_arrival, "
         "warning_level, report_num, is_final, is_canceled, source_provider, source_agency, "
-        "event_id, report_time, max_intensity_raw, max_intensity_text "
-        "FROM events ORDER BY timestamp DESC LIMIT ?"));
+        "event_id, report_time, max_intensity_raw, max_intensity_text, source_id, "
+        "is_info, determination FROM events ORDER BY timestamp DESC LIMIT ?"));
     q.addBindValue(limit);
     if (!q.exec()) return out;
 
@@ -141,6 +282,9 @@ QVector<EarthquakeEvent> HistoryStore::loadRecent(int limit) const {
         e.reportTime = q.value(20).toLongLong();
         e.maxIntensityRaw = q.value(21).toDouble();
         e.maxIntensityText = q.value(22).toString().toStdString();
+        e.sourceId = q.value(23).toString().toStdString();
+        e.isInfo = q.value(24).toInt() != 0;
+        e.determination = q.value(25).toString().toStdString();
         out.push_back(e);
     }
     return out;
@@ -154,8 +298,9 @@ void HistoryStore::upsertAll(const QVector<EarthquakeEvent>& events) {
         "INSERT OR REPLACE INTO events (id, source, magnitude, latitude, longitude, depth, location, "
         "timestamp, distance_km, estimated_intensity, raw_intensity, p_wave_arrival, s_wave_arrival, "
         "warning_level, report_num, is_final, is_canceled, source_provider, source_agency, "
-        "event_id, report_time, max_intensity_raw, max_intensity_text) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
+        "event_id, report_time, max_intensity_raw, max_intensity_text, source_id, "
+        "is_info, determination) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
     for (const EarthquakeEvent& e : events) {
         q.addBindValue(QString::fromStdString(e.id));
         q.addBindValue(QString::fromStdString(e.source));
@@ -180,12 +325,59 @@ void HistoryStore::upsertAll(const QVector<EarthquakeEvent>& events) {
         q.addBindValue(e.reportTime);
         q.addBindValue(e.maxIntensityRaw);
         q.addBindValue(QString::fromStdString(e.maxIntensityText));
+        q.addBindValue(QString::fromStdString(e.sourceId));
+        q.addBindValue(e.isInfo ? 1 : 0);
+        q.addBindValue(QString::fromStdString(e.determination));
         if (!q.exec()) {
             db_.rollback();
             return;
         }
     }
     if (!db_.commit()) db_.rollback();
+}
+
+void HistoryStore::upsertReports(const QVector<StoredReport>& reports) {
+    if (!ready_ || reports.isEmpty()) return;
+    if (!db_.transaction()) return;
+    writeReportsBlocking(reports);
+    if (!db_.commit()) db_.rollback();
+}
+
+QVector<StoredReport> HistoryStore::loadReports(const QString& quakeKey) const {
+    QVector<StoredReport> out;
+    if (!ready_ || quakeKey.isEmpty()) return out;
+    QSqlQuery q(db_);
+    q.prepare(QStringLiteral(
+        "SELECT quake_key, report_key, report_num, source_id, source_tag, received_at, raw_json, "
+        "timestamp, report_time, magnitude, depth, latitude, longitude, location, "
+        "max_intensity_text, is_final, is_canceled, is_info, determination "
+        "FROM event_reports WHERE quake_key = ? ORDER BY report_num ASC, received_at ASC"));
+    q.addBindValue(quakeKey);
+    if (!q.exec()) return out;
+    while (q.next()) {
+        StoredReport r;
+        r.quakeKey = q.value(0).toString();
+        r.reportKey = q.value(1).toString();
+        r.reportNum = q.value(2).toInt();
+        r.sourceId = q.value(3).toString();
+        r.sourceTag = q.value(4).toString();
+        r.receivedAt = q.value(5).toLongLong();
+        r.rawJson = q.value(6).toString();
+        r.timestamp = q.value(7).toLongLong();
+        r.reportTime = q.value(8).toLongLong();
+        r.magnitude = q.value(9).toDouble();
+        r.depth = q.value(10).toDouble();
+        r.latitude = q.value(11).toDouble();
+        r.longitude = q.value(12).toDouble();
+        r.location = q.value(13).toString();
+        r.maxIntensityText = q.value(14).toString();
+        r.isFinal = q.value(15).toInt() != 0;
+        r.isCanceled = q.value(16).toInt() != 0;
+        r.isInfo = q.value(17).toInt() != 0;
+        r.determination = q.value(18).toString();
+        out.push_back(r);
+    }
+    return out;
 }
 
 void HistoryStore::prune(int keep) {
@@ -196,12 +388,20 @@ void HistoryStore::prune(int keep) {
         "(SELECT id FROM events ORDER BY timestamp DESC LIMIT ?)"));
     q.addBindValue(keep);
     q.exec();
+    // 报次归档不按事件 id 关联（跨链路合并后会换 id），按接收时间保留最近一段：
+    // 8000 行约等于 400 场地震各 20 报，足够覆盖列表里的历史条目。
+    if (!q.exec(QStringLiteral(
+            "DELETE FROM event_reports WHERE rowid NOT IN "
+            "(SELECT rowid FROM event_reports ORDER BY received_at DESC LIMIT 8000)"))) {
+        qWarning() << "[history] prune event_reports failed:" << q.lastError().text();
+    }
 }
 
 void HistoryStore::clear() {
     if (!ready_) return;
     QSqlQuery q(db_);
     q.exec(QStringLiteral("DELETE FROM events"));
+    q.exec(QStringLiteral("DELETE FROM event_reports"));
 }
 
 void HistoryStore::saveTombstone(const QString& key, long long endedAt) {

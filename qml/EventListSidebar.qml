@@ -17,8 +17,38 @@ Item {
     clip: true
     property string searchQuery: ""
     property string activeFilter: "ALL"
+    /// 非空 = 右侧面板显示该事件的详情，而不是列表。
+    property string detailEventId: ""
+    readonly property bool detailOpen: detailEventId.length > 0
+    function openDetail(id) {
+        // 先让控制器装载详情；条目在被点到之前刚好被目录裁掉时，不要再切到一个空面板。
+        app.showEventDetail(id)
+        root.detailEventId = (app.eventDetail && app.eventDetail.id) ? id : ""
+    }
+    function closeDetail() {
+        root.detailEventId = ""
+        app.closeEventDetail()
+    }
+    // 控制器裁剪目录时可能主动关掉详情（事件已不存在）：列表要及时回来。
+    Connections {
+        target: app
+        function onEventDetailChanged() {
+            if (root.detailEventId.length
+                && (!app.eventDetail || !app.eventDetail.id))
+                root.detailEventId = ""
+        }
+    }
     function updateFilter() {
         app.eventModel.setFilter(root.activeFilter, root.searchQuery)
+    }
+    // 「500 km 内」依赖基准位置：无定位时这个筛选项不可选，避免点出一个永远空的列表。
+    function selectFilter(id) {
+        if (id === "WITHIN_500" && !root.hasLocation) return
+        root.activeFilter = id
+    }
+    onHasLocationChanged: {
+        // 定位丢失后旧筛选没有意义：退回「全部」，否则列表会一直空着且看不出原因。
+        if (!root.hasLocation && root.activeFilter === "WITHIN_500") root.activeFilter = "ALL"
     }
     onActiveFilterChanged: updateFilter()
     onSearchQueryChanged: updateFilter()
@@ -33,6 +63,7 @@ Item {
             anchors.fill: parent
             anchors.margins: 20
             spacing: 14
+            visible: !root.detailOpen
             RowLayout {
                 width: parent.width
                 GlassButton { visible: root.compact; theme: root.theme; iconName: "arrow-left"; accessibleName: "返回地图"; flat: true; onClicked: root.toggleRequested() }
@@ -40,7 +71,7 @@ Item {
                     Layout.fillWidth: true
                     spacing: 5
                     Text { text: "地震事件"; font.pixelSize: 22; font.weight: Font.Medium; color: root.theme.textPrimary }
-                    Text { text: "实时速报与历史目录"; font.pixelSize: 11; color: root.theme.outline }
+                    Text { text: "历史地震目录"; font.pixelSize: 11; color: root.theme.outline }
                 }
                 GlassButton { theme: root.theme; iconName: "refresh-cw"; accessibleName: "刷新事件"; flat: true; onClicked: app.refreshCatalog() }
             }
@@ -64,9 +95,11 @@ Item {
                         text: modelData.label
                         primary: root.activeFilter === modelData.id
                         flat: !primary
+                        // 无定位时「500 km 内」不可选：行上本来就没有距离，选它只会得到空列表。
+                        enabled: modelData.id !== "WITHIN_500" || root.hasLocation
                         implicitWidth: modelData.id === "WITHIN_500" ? 90 : 64
                         implicitHeight: 34
-                        onClicked: root.activeFilter = modelData.id
+                        onClicked: root.selectFilter(modelData.id)
                     }
                 }
             }
@@ -84,7 +117,11 @@ Item {
                 reuseItems: true
                 model: app.eventModel
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                delegate: EventTile { width: ListView.view.width; theme: root.theme }
+                delegate: EventTile {
+                    width: ListView.view.width
+                    theme: root.theme
+                    onDetailRequested: root.openDetail(eventId)
+                }
                 Column {
                     anchors.centerIn: parent
                     width: parent.width - 32
@@ -102,6 +139,14 @@ Item {
                     }
                 }
             }
+        }
+        EventDetailPanel {
+            anchors.fill: parent
+            anchors.margins: 20
+            visible: root.detailOpen
+            theme: root.theme
+            detail: app.eventDetail
+            onBack: root.closeDetail()
         }
     }
 }

@@ -15,6 +15,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <unordered_map>
 #include <utility>
@@ -23,6 +24,7 @@
 #include "core/intensity_calculator.h"
 #include "core/ip_geo_lookup.h"
 #include "core/quake_calculator.h"
+#include "core/quake_key.h"
 #include "core/region_names.h"
 #include "core/travel_time_service.h"
 #include "model/station_snapshot.h"
@@ -48,6 +50,7 @@
 #include "source/simulated_source.h"
 #include "source/snet_station_protocol.h"
 #include "source/snet_station_source.h"
+#include "source/sub_source_catalog.h"
 #include "source/whews_source.h"
 #include "source/wolfx_seis_protocol.h"
 #include "source/wolfx_seis_source.h"
@@ -111,11 +114,25 @@ bool sameStoredEvent(const EarthquakeEvent& a, const EarthquakeEvent& b) {
            a.longitude == b.longitude && a.depth == b.depth && a.location == b.location &&
            a.timestamp == b.timestamp && a.reportTime == b.reportTime && a.source == b.source &&
            a.sourceProvider == b.sourceProvider && a.sourceAgency == b.sourceAgency &&
+           a.sourceId == b.sourceId &&
            a.distanceKm == b.distanceKm && a.estimatedIntensity == b.estimatedIntensity &&
            a.rawIntensity == b.rawIntensity && a.maxIntensityRaw == b.maxIntensityRaw &&
            a.maxIntensityText == b.maxIntensityText && a.pWaveArrival == b.pWaveArrival &&
            a.sWaveArrival == b.sWaveArrival && a.warningLevel == b.warningLevel &&
-           a.reportNum == b.reportNum && a.isFinal == b.isFinal && a.isCanceled == b.isCanceled;
+           a.reportNum == b.reportNum && a.isFinal == b.isFinal && a.isCanceled == b.isCanceled &&
+           a.isInfo == b.isInfo && a.determination == b.determination;
+}
+
+QString sourceTagFor(const EarthquakeEvent& event) {
+    const QString provider = QString::fromStdString(event.sourceProvider).trimmed();
+    const QString agency = QString::fromStdString(event.sourceAgency).trimmed();
+    if (provider.isEmpty()) return agency;
+    return agency.isEmpty() ? provider : provider + QStringLiteral("·") + agency;
+}
+
+void appendSourceTag(QStringList& tags, const EarthquakeEvent& event) {
+    const QString tag = sourceTagFor(event);
+    if (!tag.isEmpty() && !tags.contains(tag)) tags.push_back(tag);
 }
 
 QVariantMap toMap(const EarthquakeEvent& e, IntensityStandard standard = IntensityStandard::Csis) {
@@ -175,6 +192,20 @@ QVariantMap toMap(const EarthquakeEvent& e, IntensityStandard standard = Intensi
     m["levelTag"] = QString::fromLatin1(warningTag(e.warningLevel));
     m["levelCode"] = warningCode(e.warningLevel);
     m["reportNum"] = e.reportNum;
+    m["isInfo"] = e.isInfo;
+    // 报数文案在 C++ 侧成型：情报没有「第 N 报」语义（上游一条电文即一次定稿，
+    // 解析器给的 reportNum 恒为 1），各处 QML 不必各自判断。
+    if (e.isInfo)
+        m["reportNumText"] = e.isCanceled ? QStringLiteral("取消情报") : QStringLiteral("情报");
+    else if (e.isCanceled)
+        m["reportNumText"] = QStringLiteral("取消报");
+    else
+        m["reportNumText"] = QStringLiteral("第 %1 报").arg(e.reportNum > 0 ? e.reportNum : 1);
+    m["determinationText"] = e.determination == QLatin1String("reviewed")
+                                 ? QStringLiteral("正式测定")
+                                 : (e.determination == QLatin1String("automatic")
+                                        ? QStringLiteral("自动测定")
+                                        : QString());
     m["isFinal"] = e.isFinal;
     m["isCanceled"] = e.isCanceled;
     m["severityColor"] = SeismicColors::severity(e.warningLevel, false).name();
@@ -268,6 +299,8 @@ AppController::AppController(QObject* parent, bool startServices)
     eventListModel_ = new EventListModel(this);
     eventModel_ = new EventFilterModel(this);
     eventModel_->setSourceModel(eventListModel_);
+    // 时效筛选（近 24h）用校时后的 now，与列表时间文本同源。
+    eventModel_->setNowProvider([this]() { return nowMs(); });
     systemDark_ = QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
     darkMode_ = resolveDarkMode();
     // themeMode 是唯一的用户意图来源；系统配色只在「跟随系统」时参与判定。
@@ -369,6 +402,7 @@ AppController::AppController(QObject* parent, bool startServices)
     directoryUiTimer_.setSingleShot(true);
     connect(&directoryUiTimer_, &QTimer::timeout, this, [this]() {
         refreshEventModel();
+        refreshOpenEventDetail();
         emit hudEventChanged();
     });
 
@@ -475,6 +509,8 @@ void AppController::wire() {
     // 数据源与定位解耦：先连数据源，定位并行获取；校时并行后台进行。
     const IntensityStandard startStandard =
         settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis;
+    // 启动时也要先装好子源过滤器：持久化的禁用集合必须从第一帧起生效。
+    applySubSourceFilters();
     for (EarthquakeSource* source : std::as_const(sources_)) {
         source->setStandard(startStandard);
         source->setDirectoryPollingEnabled(directoryRefreshEnabled_);
@@ -538,6 +574,15 @@ void AppController::wireSettings() {
     const auto applySources = [this]() { applySourceSettings(); };
     connect(settings_, &SettingsStore::disabledSourcesChanged, this, applySources);
     connect(settings_, &SettingsStore::disabledStationSourcesChanged, this, applySources);
+    // 子源启停不影响连接本身：只重推过滤谓词并立即刷新目录（开回频道时不必等下一轮轮询）。
+    connect(settings_, &SettingsStore::disabledSubSourcesChanged, this, [this]() {
+        applySubSourceFilters();
+        for (EarthquakeSource* source : std::as_const(sources_)) {
+            if (startServices_ && settings_->isSourceEnabled(source->id()) && source->isConfigured())
+                source->refreshDirectory();
+        }
+        if (rebuildSources()) emit statusChanged();
+    });
     connect(settings_, &SettingsStore::jianRefreshTokenChanged, this, applySources);
     connect(settings_, &SettingsStore::whewsTokenChanged, this, applySources);
     connect(settings_, &SettingsStore::developerModeChanged, this, applySources);
@@ -597,10 +642,23 @@ void AppController::wireSettings() {
         syncWarning();
         emit statusChanged();
     });
+    // 逐源信息事件震级过滤在展示层求值：改阈值/切「不接收」后立即重筛侧栏，
+    // 不必等下一次目录刷新或重启。
+    connect(settings_, &SettingsStore::infoMagnitudeChanged, this,
+            [this]() { scheduleDirectoryUiRefresh(); });
 
     // ---- 7. 自动检查更新 ----
     connect(settings_, &SettingsStore::autoCheckUpdatesChanged, this,
             [this]() { maybeAutoCheckUpdates(); });
+}
+
+void AppController::applySubSourceFilters() {
+    for (EarthquakeSource* source : std::as_const(sources_)) {
+        const QString sourceId = source->id();
+        source->setSubSourceFilter([this, sourceId](const QString& subId) {
+            return settings_->isSubSourceEnabled(sourceId, subId);
+        });
+    }
 }
 
 void AppController::applySourceSettings() {
@@ -612,6 +670,7 @@ void AppController::applySourceSettings() {
     // 凭据可能刚被写入：先推给需要的源，再按门控启停。
     jian_->setRefreshToken(settings_->jianRefreshToken());
     whews_->setToken(settings_->whewsToken());
+    applySubSourceFilters();
     for (EarthquakeSource* source : std::as_const(sources_)) {
         source->setStandard(standard);
         // 未配置凭据的源不启动：不建立任何连接。
@@ -661,7 +720,7 @@ double AppController::userLongitude() const { return location_->longitude(); }
 QString AppController::locationStatusText() const { return location_->statusText(); }
 
 bool AppController::rebuildSources() {
-    auto describe = [](const DataSourceInfo& info, bool enabled, bool configured) {
+    auto describe = [this](const DataSourceInfo& info, bool enabled, bool configured) {
         QVariantMap m;
         m["id"] = info.id;
         m["name"] = info.name;
@@ -670,8 +729,12 @@ bool AppController::rebuildSources() {
         m["configured"] = configured;
         m["status"] = info.statusLabel();
         m["statusTag"] = info.statusTag();
-        m["latency"] = info.latencyMs >= 0 ? QStringLiteral("%1 ms").arg(info.latencyMs)
-                                           : QStringLiteral("— ms");
+        // 延迟分两路给出：数值（-1 = 未测出）供 QML 判空与排序，文本供直接展示。
+        // 旧版只给文本，QML 用 `latency !== "— ms"` 判断「有没有测到」——字符串比较既
+        // 脆弱又容易被本地化文案撞车，且拿不到数值就没法做「<100 ms 才算良好」这类判断。
+        m["latencyMs"] = info.latencyMs;
+        m["latencyText"] = info.latencyMs >= 0 ? QStringLiteral("%1 ms").arg(info.latencyMs)
+                                              : QString();
         switch (info.directoryStatus) {
         case ConnectionStatus::Connected: m["directory"] = QStringLiteral("目录刷新成功"); break;
         case ConnectionStatus::Connecting: m["directory"] = QStringLiteral("目录刷新中"); break;
@@ -680,9 +743,26 @@ bool AppController::rebuildSources() {
         default:         m["directory"] = QStringLiteral("目录未刷新"); break;
         }
         m["directoryStatusTag"] = directoryTag(info.directoryStatus);
-        m["directoryLatency"] = info.directoryLatencyMs >= 0
-            ? QStringLiteral("%1 ms").arg(info.directoryLatencyMs) : QStringLiteral("— ms");
+        m["directoryLatencyMs"] = info.directoryLatencyMs;
+        m["directoryLatencyText"] = info.directoryLatencyMs >= 0
+            ? QStringLiteral("%1 ms").arg(info.directoryLatencyMs) : QString();
         m["description"] = info.description;
+        // 覆盖范围。设置页右栏的概况行读它区分「全球聚合」与「自测」；少这一项时
+        // QML 里 region.length 会读到 undefined，每帧刷一条 TypeError。
+        m["region"] = info.region;
+        // 子数据源（频道）元数据 + 当前启停状态。QML 的逐项绑定必须读这个快照：
+        // isSubSourceEnabled() 是 Q_INVOKABLE，绑在函数调用上的绑定不会自动重算。
+        QVariantList subs;
+        for (const SubSourceInfo& sub : subSourcesFor(info.id)) {
+            QVariantMap item;
+            item["id"] = sub.id;
+            item["name"] = sub.name;
+            item["kind"] = sub.kind == SourceEventKind::Live
+                ? QStringLiteral("live") : QStringLiteral("directory");
+            item["enabled"] = settings_->isSubSourceEnabled(info.id, sub.id);
+            subs.push_back(item);
+        }
+        m["subSources"] = subs;
         return m;
     };
     QVariantList list;
@@ -718,100 +798,202 @@ QVariantList AppController::history() const {
     return historyCache_;
 }
 
-std::vector<std::pair<EarthquakeEvent, bool>> AppController::mergedEvents() const {
-    // 目录条目用权威数据；同一物理地震（发震时刻 + 震中）只保留一条，实时预警命中目录时
-    // 用目录数据并标记 isActive，未命中目录的实时预警另行补上。
+/// 同一份上游报文的几条转送记录之间选代表：机构优先级 > 报次（越新越完整）>
+/// 聚合源名（**字典序固定**）。刻意不用推送时刻做平手裁决：两路轮询时刻不同，
+/// 用时刻会让代表记录在聚合源之间来回换，行的 id（identity）随之变化，列表会
+/// 「自己跳」。同一报次的内容来自同一份上游报文，取哪一路在语义上没有区别。
+bool preferCatalogRecord(const EarthquakeEvent& a, const EarthquakeEvent& b) {
+    const int rankA = agencyPriority(a);
+    const int rankB = agencyPriority(b);
+    if (rankA != rankB) return rankA > rankB;
+    if (a.reportNum != b.reportNum) return a.reportNum > b.reportNum;
+    const QString providerA = QString::fromStdString(a.sourceProvider).toCaseFolded();
+    const QString providerB = QString::fromStdString(b.sourceProvider).toCaseFolded();
+    if (providerA != providerB) return providerA < providerB;
+    return a.id < b.id;
+}
+
+/// 上游报文 ID：去掉聚合商加的频道前缀（`jma_eqlist:` / `jma_eew:` / `cenc:` …）。
+/// 同一条上游报文在不同链路里的前缀可能不同（甚至没有），所以比较前统一剥掉。
+std::string upstreamEventId(const EarthquakeEvent& e) {
+    const std::string& id = e.eventId.empty() ? e.id : e.eventId;
+    const auto colon = id.find(':');
+    if (colon == std::string::npos) return id;
+    const std::string rest = id.substr(colon + 1);
+    return rest.empty() ? id : rest;
+}
+
+std::string lowercaseAgency(const std::string& agency) {
+    std::string out = agency;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return out;
+}
+
+/// 目录去重键。**只在明确是同一份上游报文时相同**：
+/// 同一报数机构 + 同一上游事件 ID；数据源提供方（Wolfx / Pancakes / Jian…）不参与，
+/// 因为它们是同一份报文的重复转送。
+///
+/// 刻意不含「发震时刻 + 震中」窗口：同一机构附近连续发生的两场小地震会因此被压成
+/// 一条，且「最佳记录」的震级/地点/时间会覆盖掉另一条 —— 等于丢事件。
+std::string catalogKey(const EarthquakeEvent& e) {
+    if (e.sourceAgency.empty()) return e.identity();
+    return lowercaseAgency(e.sourceAgency) + "|" + upstreamEventId(e);
+}
+
+/// 跨链路兜底键：**报数机构 + 发震时刻**（要求毫秒级相同，不开窗口）。
+/// CENC 会按分发链路给同一场地震不同的 EventID（同一 M7.0：Wolfx 拿到
+/// `AU.20261022223344.0`、Jian 拿到 `CC.20261022224454.0` —— 中段是各链路的报文
+/// 时刻，不是发震时刻），此时 catalogKey 对不上，只能靠发震时刻认人：同一机构不会在
+/// 同一毫秒发出两场地震，再配合行内震中邻近复核，不会把相邻小震压成一条。
+std::string catalogAgencyTimeKey(const EarthquakeEvent& e) {
+    if (e.sourceAgency.empty() || e.timestamp <= 0) return {};
+    return lowercaseAgency(e.sourceAgency) + "|" + std::to_string(e.timestamp);
+}
+
+/// 第三级兜底：**机构 + 发震时刻的分钟桶**。
+///
+/// 各链路对同一份速报的秒数处理不同 —— Wolfx 的 cenc_eqlist 保留秒（`16:47:57`），
+/// Whews / Jian 的同一条只到分钟（`16:47:00`）—— 毫秒级相等的兜底键因此对不上，
+/// 同一场地震会在列表里占两行。分钟桶能覆盖这种截断差（情报链路一律是**截断**而不是
+/// 四舍五入，见 core/quake_key.h），桶内再按震中距离复核，相邻两场小震不会被压成一条。
+std::vector<std::string> catalogAgencyMinuteKeys(const EarthquakeEvent& e) {
+    std::vector<std::string> keys;
+    if (e.sourceAgency.empty() || e.timestamp <= 0) return keys;
+    // 实时预警不参与这条兜底：它一秒一报，同一分钟内本来就有多条。
+    if (!e.isInfo) return keys;
+    const std::string agency = lowercaseAgency(e.sourceAgency);
+    for (const QString& key : quakeSameMinuteKeys(e.sourceAgency, e.timestamp, e.latitude,
+                                                  e.longitude)) {
+        // 去掉机构前缀（这里统一用小写机构拼接，和 catalogAgencyTimeKey 同形）。
+        const QString rest = key.section(QLatin1Char('|'), 1);
+        if (!rest.isEmpty()) keys.push_back(agency + "|" + rest.toStdString());
+    }
+    return keys;
+}
+
+std::vector<AppController::CatalogEntry> AppController::catalogEvents() const {
+    // 归并口径 = **同一份上游报文的重复聚合链路**：先按 catalogKey（机构 + 上游 ID），
+    // 再由 catalogAgencyTimeKey（机构 + 发震时刻 + 震中邻近）兜底 —— Wolfx / Pancakes /
+    // Jian / Whews 各自转送的同一报合成一行，并保留全部来源标签。
     //
-    // 旧实现对每条历史都线性扫一遍已合并列表、再加一次「是否已发出」的线性扫描：
-    // 200 条目录 × 各自几十次 haversine，最坏上万次三角函数。这里改为一次性分桶：
-    // 两个列表都只有几十~两百条，用「发震时刻 / 30 s」做桶键，桶内再按距离判定。
-    constexpr long long kBucketMs = QuakeCalculator::kSameQuakeWindowMs;
+    // 除此之外各数据源的目录记录保持独立 —— 不做时间窗合并（相邻 30 s 内的两场小地震
+    // 不会被压成一条，也不会让「最佳记录」覆盖掉另一条的震级/地点/时间）：兜底键要求
+    // 发震时刻**完全相同**，那只会命中同一份报文的不同 ID。按 Kanameishi 的口径，只有
+    // 明确重复的聚合源才合并。
+    //
+    // 实时会话不参与建行：只按 identity 给已有目录行打 active 标记。
+    std::unordered_map<std::string, int> slotByKey;
+    slotByKey.reserve(static_cast<std::size_t>(history_.size()));
+    // 上游 ID 对不上时的兜底索引：机构 + 发震时刻 → 已建行的下标（见 catalogAgencyTimeKey）。
+    std::unordered_map<std::string, std::vector<int>> slotsByAgencyTime;
+    slotsByAgencyTime.reserve(static_cast<std::size_t>(history_.size()));
+    // 第二级兜底：机构 + 发震时刻分钟桶 + 震中网格 → 已建行的下标（见 catalogAgencyMinuteKeys）。
+    std::unordered_map<std::string, std::vector<int>> slotsByAgencyMinute;
+    slotsByAgencyMinute.reserve(static_cast<std::size_t>(history_.size()));
+    std::vector<CatalogEntry> out;
+    out.reserve(static_cast<std::size_t>(history_.size()));
 
-    std::vector<EarthquakeEvent> catalog;
-    catalog.reserve(history_.size());
-    std::unordered_map<long long, std::vector<int>> buckets;
+    const auto passesInfoFilter = [this](const EarthquakeEvent& e) {
+        // 旧库记录没有 sourceId：无从复核逐源阈值，按「通过」处理。
+        if (e.sourceId.empty()) return true;
+        return settings_->passesInfoMagnitudeFilter(QString::fromStdString(e.sourceId), e.magnitude);
+    };
+    // 同一份上游报文在两条链路里的秒数处理可能不同（一条保留秒、一条截断到分钟），
+    // 震中也会随测定修正抖动几十公里内的零头；候选行必须再按「同一场地震」复核。
+    const auto adoptFromBucket = [&out](const EarthquakeEvent& incoming,
+                                        const std::vector<int>& bucket) {
+        for (const int index : bucket) {
+            const EarthquakeEvent& candidate = out[static_cast<std::size_t>(index)].event;
+            if (QuakeCalculator::haversineDistance(candidate.latitude, candidate.longitude,
+                                                   incoming.latitude, incoming.longitude)
+                > QuakeCalculator::kSameQuakeRadiusKm)
+                continue;
+            return index;
+        }
+        return -1;
+    };
+    // 分钟桶只在「确实有链路丢精度」时才算同一份报文：整分钟的发震时刻说明这一路把秒
+    // 截断了，才可能与另一路差几十秒（见 core/quake_key.h 的同名判据）。
+    // 两路都带秒却不同秒，是同一分钟内的两场地震。
+    const auto truncatedToMinute = [](const EarthquakeEvent& e) {
+        return quakeTimestampTruncatedToMinute(e.timestamp);
+    };
+
     for (const auto& e : std::as_const(history_)) {
-        const long long bucket = e.timestamp / kBucketMs;
-        int found = -1;
-        // 同震窗口是 30 s，只可能落在本桶或相邻桶里。
-        for (long long b = bucket - 1; b <= bucket + 1 && found < 0; ++b) {
-            const auto it = buckets.find(b);
-            if (it == buckets.end()) continue;
-            for (const int index : it->second) {
-                if (samePhysicalEvent(catalog[static_cast<std::size_t>(index)], e)) {
-                    found = index;
-                    break;
+        const std::string key = catalogKey(e);
+        int slot = -1;
+        if (const auto exact = slotByKey.find(key); exact != slotByKey.end()) {
+            slot = exact->second;
+        } else if (const std::string timeKey = catalogAgencyTimeKey(e); !timeKey.empty()) {
+            // 上游 ID 不同但可能仍是同一份报文（CENC 跨链路换 ID）：按发震时刻找回原行，
+            // 桶内只有同一机构的少数几行，逐个复核震中距离。
+            if (const auto bucket = slotsByAgencyTime.find(timeKey);
+                bucket != slotsByAgencyTime.end()) {
+                slot = adoptFromBucket(e, bucket->second);
+            }
+        }
+        if (slot < 0) {
+            // 第三级：同机构、同一分钟、同震中网格 —— 秒被截断到分钟的另一条链路。
+            // 只在**这一条**或行内代表记录确实是整分钟时才启用，否则同一分钟内两场
+            // 都带秒的地震会被并成一条。
+            const auto tryMinute = [&](const EarthquakeEvent& other) {
+                if (!truncatedToMinute(e) && !truncatedToMinute(other)) return false;
+                const long long delta = e.timestamp > other.timestamp ? e.timestamp - other.timestamp
+                                                                      : other.timestamp - e.timestamp;
+                return delta <= 60'000;
+            };
+            for (const std::string& minuteKey : catalogAgencyMinuteKeys(e)) {
+                const auto bucket = slotsByAgencyMinute.find(minuteKey);
+                if (bucket == slotsByAgencyMinute.end()) continue;
+                for (const int index : bucket->second) {
+                    if (!tryMinute(out[static_cast<std::size_t>(index)].event)) continue;
+                    slot = adoptFromBucket(e, {index});
+                    if (slot >= 0) break;
                 }
+                if (slot >= 0) break;
             }
         }
-        if (found < 0) {
-            buckets[bucket].push_back(static_cast<int>(catalog.size()));
-            catalog.push_back(e);
-            continue;
-        }
-        // 同一地震若有自动/正式两条，先看报数机构：权威机构（JMA/CEA…）的条目
-        // 永远压过 USGS/GQ；同机构再取推送时间较晚（通常为正式）的一条。
-        EarthquakeEvent& slot = catalog[static_cast<std::size_t>(found)];
-        const long long prev = slot.reportTime > 0 ? slot.reportTime : slot.timestamp;
-        const long long next = e.reportTime > 0 ? e.reportTime : e.timestamp;
-        const int prevRank = agencyPriority(slot);
-        const int nextRank = agencyPriority(e);
-        if (nextRank > prevRank || (nextRank == prevRank && next > prev)) slot = e;
-    }
 
-    // 实时会话与目录对齐：一个会话最多消耗一条目录条目（catalogUsed）。
-    std::vector<char> catalogUsed(catalog.size(), 0);
-    std::vector<std::pair<EarthquakeEvent, bool>> out;
-    out.reserve(catalog.size() + sessions_.active.size());
-    std::unordered_map<long long, std::vector<int>> emittedBuckets;
-    const auto alreadyEmitted = [&emittedBuckets, &out](const EarthquakeEvent& e) {
-        const long long bucket = e.timestamp / kBucketMs;
-        for (long long b = bucket - 1; b <= bucket + 1; ++b) {
-            const auto it = emittedBuckets.find(b);
-            if (it == emittedBuckets.end()) continue;
-            for (const int index : it->second) {
-                if (samePhysicalEvent(out[static_cast<std::size_t>(index)].first, e)) return true;
-            }
-        }
-        return false;
-    };
-    const auto markEmitted = [&emittedBuckets](const EarthquakeEvent& e, int index) {
-        emittedBuckets[e.timestamp / kBucketMs].push_back(index);
-    };
-
-    for (const auto& [key, state] : sessions_.active) {
-        Q_UNUSED(key);
-        const EarthquakeEvent& live = state.event;
-        if (alreadyEmitted(live)) continue;
-        int found = -1;
-        for (int i = 0; i < static_cast<int>(catalog.size()); ++i) {
-            if (!catalogUsed[static_cast<std::size_t>(i)] && samePhysicalEvent(catalog[static_cast<std::size_t>(i)], live)) {
-                found = i;
-                break;
-            }
-        }
-        if (found >= 0) {
-            catalogUsed[static_cast<std::size_t>(found)] = 1;
-            // 目录一般更权威，但目录是 USGS/GQ、实时链路是 JMA/CEA 时不能反过来盖掉
-            // 权威机构的数据（同一场地震的两条记录只保留一条展示）。
-            const EarthquakeEvent& fromCatalog = catalog[static_cast<std::size_t>(found)];
-            const EarthquakeEvent& chosen =
-                agencyPriority(live) > agencyPriority(fromCatalog) ? live : fromCatalog;
-            markEmitted(chosen, static_cast<int>(out.size()));
-            out.emplace_back(chosen, true);
+        if (slot < 0) {
+            CatalogEntry entry;
+            entry.event = e;
+            entry.active = sessions_.active.count(e.identity()) > 0;
+            entry.passesInfoFilter = passesInfoFilter(e);
+            appendSourceTag(entry.sourceTags, e);
+            slot = static_cast<int>(out.size());
+            if (const std::string timeKey = catalogAgencyTimeKey(e); !timeKey.empty())
+                slotsByAgencyTime[timeKey].push_back(slot);
+            for (const std::string& minuteKey : catalogAgencyMinuteKeys(e))
+                slotsByAgencyMinute[minuteKey].push_back(slot);
+            out.push_back(std::move(entry));
         } else {
-            markEmitted(live, static_cast<int>(out.size()));
-            out.emplace_back(live, true);
+            CatalogEntry& entry = out[static_cast<std::size_t>(slot)];
+            entry.passesInfoFilter = entry.passesInfoFilter || passesInfoFilter(e);
+            appendSourceTag(entry.sourceTags, e);
+            if (preferCatalogRecord(e, entry.event)) entry.event = e;
+            // 代表记录被换掉后，active 也要按它的 identity 重算（同一上游报文的
+            // 不同链路可能只有一路还在活动会话里）。
+            if (sessions_.active.count(e.identity()) > 0) entry.active = true;
+            // 兜底命中行时也把新键登记到这一行，后续同键记录直接命中。
+            if (const std::string timeKey = catalogAgencyTimeKey(e); !timeKey.empty())
+                slotsByAgencyTime[timeKey].push_back(slot);
+            for (const std::string& minuteKey : catalogAgencyMinuteKeys(e))
+                slotsByAgencyMinute[minuteKey].push_back(slot);
         }
-    }
-    for (int i = 0; i < static_cast<int>(catalog.size()); ++i) {
-        const EarthquakeEvent& e = catalog[static_cast<std::size_t>(i)];
-        if (catalogUsed[static_cast<std::size_t>(i)] || alreadyEmitted(e)) continue;
-        out.emplace_back(e, false);
+        // 兜底命中的另一条 ID 也指向同一行，后续同 ID 记录直接走精确键。
+        slotByKey.emplace(key, slot);
     }
 
-    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
-        return a.first.timestamp > b.first.timestamp;
+    // 排序：发震时刻倒序；同一时刻按机构优先级，最后按 identity 稳定收尾。
+    // 次级键必须确定，否则目录整表重发时同刻事件的行序会随遍历顺序抖动。
+    std::sort(out.begin(), out.end(), [](const CatalogEntry& a, const CatalogEntry& b) {
+        if (a.event.timestamp != b.event.timestamp) return a.event.timestamp > b.event.timestamp;
+        const int rankA = agencyPriority(a.event);
+        const int rankB = agencyPriority(b.event);
+        if (rankA != rankB) return rankA > rankB;
+        return a.event.identity() < b.event.identity();
     });
     return out;
 }
@@ -820,14 +1002,17 @@ QVariantList AppController::eventList() const {
     // 兼容入口：完整字段的 QVariantMap 数组。QML 已改用 eventModel 的逐列 role，
     // 这里仅供 C++ 测试/调试使用，故不再随刷新 emit 信号（那曾让每次目录更新
     // 都重建一整份约 200×40 项的 QVariant 树，即使 QML 根本没人读）。
-    const auto merged = mergedEvents();
+    // 与列表一致：被逐源震级过滤挡住的目录不出现（过滤在展示层求值）。
+    const auto catalog = catalogEvents();
     QVariantList out;
-    out.reserve(static_cast<qsizetype>(merged.size()));
+    out.reserve(static_cast<qsizetype>(catalog.size()));
     const IntensityStandard standard =
         settings_->intensityStandard() == 1 ? IntensityStandard::Jma : IntensityStandard::Csis;
-    for (const auto& [event, active] : merged) {
-        QVariantMap m = toMap(event, standard);
-        m["isActive"] = active;
+    for (const auto& entry : catalog) {
+        if (!entry.passesInfoFilter) continue;
+        QVariantMap m = toMap(entry.event, standard);
+        m["isActive"] = entry.active;
+        m["sourceTags"] = entry.sourceTags;
         out.push_back(m);
     }
     return out;
@@ -1655,8 +1840,17 @@ QString AppController::identityOf(const EarthquakeEvent& event) {
 }
 
 bool AppController::samePhysicalEvent(const EarthquakeEvent& a, const EarthquakeEvent& b) {
-    return QuakeCalculator::isSameQuake(a.timestamp, a.latitude, a.longitude,
-                                        b.timestamp, b.latitude, b.longitude);
+    // 情报链路的发震时刻常只到分钟（JMA `time_full` 把秒截断为 :00），与实时预警最多
+    // 差 59 s；只用 30 s 窗口会把它判成「另一场地震」，于是同一场地震先由预警提醒、
+    // 再由情报提醒一次。跨类型（预警 ↔ 情报）放宽到 90 s，同类型仍是 30 s —— 相邻
+    // 两场小震不会被压成一场。
+    if (a.timestamp <= 0 || b.timestamp <= 0) return false;
+    const long long delta = a.timestamp > b.timestamp ? a.timestamp - b.timestamp
+                                                      : b.timestamp - a.timestamp;
+    const long long window = a.isInfo != b.isInfo ? 90'000 : QuakeCalculator::kSameQuakeWindowMs;
+    if (delta > window) return false;
+    return QuakeCalculator::haversineDistance(a.latitude, a.longitude, b.latitude, b.longitude)
+           <= QuakeCalculator::kSameQuakeRadiusKm;
 }
 
 void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bool inDirectory,
@@ -1666,10 +1860,19 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         if (source) source->onAdmission(e, status);
     };
     EarthquakeEvent event = incoming;
+    // 接收时刻由仓库层统一打戳：数据源只负责解析，归档/详情页都按这个时间展示
+    // 「每个源收到数据的时间」。
+    event.receivedAt = nowMs();
+    // 记录抓取该条目的数据源 ID：设置页的逐源震级过滤在展示层复核时需要它，
+    // 重启后从库里读回的历史也要能按同一口径过滤（见 HistoryStore 的 source_id 列）。
+    if (source) event.sourceId = source->id().toStdString();
     EewParser::UserLocation user;
     if (hasLocation()) user = std::make_pair(userLatitude(), userLongitude());
     EewParser::recompute(event, user, settings_->intensityStandard() == 1
         ? IntensityStandard::Jma : IntensityStandard::Csis);
+    // 归档必须在去重门控之前：同一报经 Wolfx 与 Pancakes 各送一次时，EventGate 会
+    // 判后者重复并丢弃，但详情页要显示「这一报被哪几个源收到」。
+    recordReport(event);
     SentryService::instance()->addBreadcrumb(
         QStringLiteral("quake.event"),
         QStringLiteral("[%1] %2 M%3 (inDir=%4)")
@@ -1679,11 +1882,11 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         QStringLiteral("info"));
     // Directory and warning gates are deliberately independent.
     if (inDirectory) {
-        // 逐源信息事件震级过滤：只影响目录展示，不拦截实时预警链路。
-        if (source && !settings_->passesInfoMagnitudeFilter(source->id(), event.magnitude)) {
-            admit(event, AdmissionStatus::Filtered);
-            return;
-        }
+        // 逐源信息事件震级过滤只在**展示层**求值（见 refreshEventModel）：这里仅决定
+        // 要不要提醒。记录一律照常入库 —— 否则把阈值调高再调回来时，中间那段目录
+        // 会永久丢失，表现为「改完设置要重启才像生效」。
+        const bool visibleByFilter =
+            !source || settings_->passesInfoMagnitudeFilter(source->id(), event.magnitude);
         const auto decision = gate_.admit(event, nowMs());
         if (decision == EventGateDecision::Duplicate || decision == EventGateDecision::Stale) {
             admit(event, AdmissionStatus::Duplicate);
@@ -1707,7 +1910,7 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
             const long long stamp = event.reportTime > 0 ? event.reportTime : event.timestamp;
             const long long now = nowMs();
             const bool recent = stamp > 0 && stamp <= now + 60'000 && now - stamp <= 30 * 60'000;
-            if (!alreadyKnown && recent) {
+            if (visibleByFilter && !alreadyKnown && recent) {
                 const IntensityStandard standard = settings_->intensityStandard() == 1
                     ? IntensityStandard::Jma : IntensityStandard::Csis;
                 emit notifiableEvent(toMap(event, standard), QStringLiteral("info"));
@@ -1850,7 +2053,15 @@ void AppController::flushHistoryWrites() {
     // 每 80 ms 一次的合并写已经把事务数压到最低。
     if (!historyStore_ || !historyStore_->isReady()) {
         pendingHistoryWrites_.clear();
+        pendingReportWrites_.clear();
         return;
+    }
+    if (!pendingReportWrites_.empty()) {
+        QVector<StoredReport> batch;
+        batch.reserve(static_cast<qsizetype>(pendingReportWrites_.size()));
+        for (const auto& entry : pendingReportWrites_) batch.push_back(entry.second);
+        pendingReportWrites_.clear();
+        historyStore_->upsertReports(batch);
     }
     if (!pendingHistoryWrites_.empty()) {
         QVector<EarthquakeEvent> batch;
@@ -2015,16 +2226,22 @@ void AppController::rebuildHistory() {
 
 void AppController::refreshEventModel() {
     if (!eventListModel_) return;
-    const auto merged = mergedEvents();
+    const auto catalog = catalogEvents();
     std::vector<EventListModel::Row> rows;
-    rows.reserve(merged.size());
-    for (const auto& [event, active] : merged) rows.push_back(makeRow(event, active));
+    rows.reserve(catalog.size());
+    for (const auto& entry : catalog) {
+        // 逐源震级过滤在这里求值：设置页改阈值/切「不接收」后只需重建一次行模型，
+        // 已入库的记录不会被删掉，改回来还能重新出现。
+        if (!entry.passesInfoFilter) continue;
+        rows.push_back(makeRow(entry.event, entry.active, entry.sourceTags));
+    }
     eventListModel_->setRows(std::move(rows));
     focusedEventId_ = hasMapFocus_ ? QString::fromStdString(mapFocus_.identity()) : QString();
     eventListModel_->setFocusedId(focusedEventId_);
 }
 
-EventListModel::Row AppController::makeRow(const EarthquakeEvent& event, bool active) const {
+EventListModel::Row AppController::makeRow(const EarthquakeEvent& event, bool active,
+                                           const QStringList& sourceTags) const {
     // 只算 delegate 真正会读的字段：文本/颜色/标注在这里一次成型，QML 侧不再做格式化。
     EventListModel::Row row;
     row.id = QString::fromStdString(event.identity());
@@ -2037,13 +2254,14 @@ EventListModel::Row AppController::makeRow(const EarthquakeEvent& event, bool ac
     row.isActive = active;
     // 发震时刻：与校时时钟一致，固定渲染为 UTC+8（与 HUD/事件卡的 timeText 同源）。
     row.timeText = utc8Text(event.timestamp);
-    const QString provider = QString::fromStdString(event.sourceProvider);
-    const QString agency = QString::fromStdString(event.sourceAgency);
-    row.sourceTag = agency.isEmpty() ? provider : provider + QStringLiteral("·") + agency;
+    row.sourceTag = sourceTagFor(event);
+    row.sourceTags = sourceTags;
+    if (row.sourceTags.isEmpty() && !row.sourceTag.isEmpty()) row.sourceTags.push_back(row.sourceTag);
 
     const bool hasDistance = event.distanceKm >= 0.0;
     row.hasDistance = hasDistance;
     row.distance = hasDistance ? event.distanceKm : -1.0;
+    row.distanceText = hasDistance ? QString::number(event.distanceKm, 'f', 0) : QString();
 
     // 列表徽章：固定展示「震源最大烈度」（震中当地量），不随定位变化。
     const QString maxText = QString::fromStdString(event.maxIntensityText);
@@ -2063,6 +2281,591 @@ EventListModel::Row AppController::makeRow(const EarthquakeEvent& event, bool ac
     row.intensityColor = SeismicColors::intensityColor(listRaw).name();
     row.levelTag = QString::fromLatin1(warningTag(event.warningLevel));
     return row;
+}
+
+QStringList AppController::reportCandidateKeys(const EarthquakeEvent& event) {
+    QStringList keys = quakeGroupKeys(event.sourceAgency, event.timestamp, event.latitude,
+                                      event.longitude);
+    if (keys.isEmpty()) keys.push_back(QString::fromStdString(event.identity()));
+    return keys;
+}
+
+QString AppController::reportSlotKey(const EarthquakeEvent& event) {
+    // 预警：同报被多路聚合源收到要合成一行，所以槽就是报数。
+    // 情报：没有报数（解析器一律给 1），同一场地震还会先出「自动测定」、后出「正式
+    // 测定」两条，必须各自留行；用发布时刻做槽，同一份报文重复轮询才会命中同一行。
+    if (event.isCanceled && !event.isInfo) return QStringLiteral("c");
+    if (!event.isInfo) return QStringLiteral("n:") + QString::number(event.reportNum > 0 ? event.reportNum : 1);
+    const long long stamp = event.reportTime > 0 ? event.reportTime : event.timestamp;
+    return QStringLiteral("i:") + QString::number(stamp);
+}
+
+QString AppController::resolveReportSlot(const ReportGroup& group, const EarthquakeEvent& event) {
+    const QString base = reportSlotKey(event);
+    const ReportRecord* existing = nullptr;
+    for (const ReportRecord& record : group.reports) {
+        if (record.reportKey == base) {
+            existing = &record;
+            break;
+        }
+    }
+    if (!existing) return base;
+    // 同一槽已被占用：要么是同一份报文（另一路聚合源转送），要么是同一分钟同一网格里
+    // 另一场地震的第 1 报。两者只能靠一起点时刻与上游 ID 区分 —— 同一场地震的各链路
+    // 起点时刻一致（差 ≤2 s），相邻两场小震不会。
+    if (event.isInfo) return base;   // 情报的槽含发布时刻，撞车即同一份报文
+    const long long delta = existing->timestamp > event.timestamp
+                                ? existing->timestamp - event.timestamp
+                                : event.timestamp - existing->timestamp;
+    if (existing->timestamp <= 0 || event.timestamp <= 0 || delta <= 2'000) return base;
+    // 不同地震：给报次槽加一个稳定的后缀（上游 ID），同一路重复轮询仍命中同一行。
+    const std::string upstream = upstreamEventId(event);
+    return base + QLatin1Char('#')
+           + (upstream.empty() ? QString::number(event.timestamp)
+                               : QString::fromStdString(upstream));
+}
+
+QString AppController::resolveReportGroupKey(const EarthquakeEvent& event) const {
+    // 先按候选键找**已存在**且校验通过的组：分钟进位、网格跨格时，事件的主键会落在
+    // 新的一格里，但它仍然是刚才那场地震的同一报/下一报，必须并进旧组。
+    const QStringList keys = reportCandidateKeys(event);
+    for (const QString& key : keys) {
+        const auto it = reportGroups_.constFind(key);
+        if (it == reportGroups_.constEnd()) continue;
+        if (quakeGroupMergeable(it->timestamp, it->latitude, it->longitude, event.timestamp,
+                                event.latitude, event.longitude))
+            return key;
+    }
+    return keys.isEmpty() ? QString() : keys.first();
+}
+
+void AppController::recordReport(const EarthquakeEvent& event) {
+    const QString key = resolveReportGroupKey(event);
+    if (key.isEmpty()) return;
+
+    ReportGroup& group = reportGroups_[key];
+    group.lastReceivedAt = std::max(group.lastReceivedAt, event.receivedAt);
+    // 组的参照震源只在首次归档时记录：后续报次的震中/时刻会随测定修正小幅漂移，
+    // 若跟着改，「同一场地震」的判定基准会漂走。
+    if (group.timestamp <= 0) {
+        group.timestamp = event.timestamp;
+        group.latitude = event.latitude;
+        group.longitude = event.longitude;
+    }
+
+    const QString slot = resolveReportSlot(group, event);
+    const int num = event.reportNum > 0 ? event.reportNum : 1;
+    ReportRecord* record = nullptr;
+    for (ReportRecord& existing : group.reports) {
+        if (existing.reportKey == slot) {
+            record = &existing;
+            break;
+        }
+    }
+    bool contentChanged = false;
+    if (!record) {
+        group.reports.append(ReportRecord{});
+        record = &group.reports.last();
+        record->reportKey = slot;
+        record->reportNum = num;
+        contentChanged = true;
+    }
+    const auto assign = [&contentChanged](auto& field, const auto& value) {
+        if (field == value) return;
+        field = value;
+        contentChanged = true;
+    };
+    assign(record->reportNum, num);
+    assign(record->timestamp, event.timestamp);
+    assign(record->reportTime, event.reportTime);
+    assign(record->magnitude, event.magnitude);
+    assign(record->depth, event.depth);
+    assign(record->latitude, event.latitude);
+    assign(record->longitude, event.longitude);
+    assign(record->location, QString::fromStdString(event.location));
+    assign(record->maxIntensityText, QString::fromStdString(event.maxIntensityText));
+    assign(record->isFinal, event.isFinal);
+    assign(record->isCanceled, event.isCanceled);
+    assign(record->isInfo, event.isInfo);
+    assign(record->determination, QString::fromStdString(event.determination));
+
+    const QString sourceId = QString::fromStdString(event.sourceId);
+    const QString tag = sourceTagFor(event);
+    const QString raw = QString::fromStdString(event.rawJson);
+    ReportSourceRecord* sourceRecord = nullptr;
+    for (ReportSourceRecord& existing : record->sources) {
+        if (existing.sourceId == sourceId && existing.sourceTag == tag) {
+            sourceRecord = &existing;
+            break;
+        }
+    }
+    bool sourceAdded = false;
+    bool sourceChanged = false;
+    if (!sourceRecord) {
+        record->sources.append(ReportSourceRecord{sourceId, tag, event.receivedAt, raw});
+        sourceRecord = &record->sources.last();
+        sourceAdded = true;
+    } else if (sourceRecord->rawJson != raw) {
+        sourceRecord->rawJson = raw;
+        sourceChanged = true;
+    }
+
+    if (!contentChanged && !sourceAdded && !sourceChanged) return;   // 目录轮询的重复帧
+    if (contentChanged) {
+        for (const ReportSourceRecord& source : std::as_const(record->sources))
+            queueReportWrite(key, *record, source);
+    } else {
+        queueReportWrite(key, *record, *sourceRecord);
+    }
+    pruneReportGroups();
+    refreshDetailIfShowing(key);
+}
+
+/// 详情是否正打开着这场地震（可能因「同一报被不同源送达而换了代表记录」导致 detailKey
+/// 与本组的键不同）：按物理同一性判断，避免报次更新后详情页停在旧数据上。
+void AppController::refreshDetailIfShowing(const QString& groupKey) {
+    if (detailId_.isEmpty()) return;
+    if (detailKey_ == groupKey) {
+        rebuildEventDetail();
+        return;
+    }
+    const ReportGroup group = reportGroups_.value(groupKey);
+    if (quakeGroupMergeable(detailEvent_.timestamp, detailEvent_.latitude, detailEvent_.longitude,
+                            group.timestamp, group.latitude, group.longitude)) {
+        // 同一场地震换了组键（分钟进位/网格跨格）：把详情指向新组，后续报次才读得到。
+        detailKey_ = groupKey;
+        mergeStoredReports(groupKey);
+        rebuildEventDetail();
+    }
+}
+
+void AppController::queueReportWrite(const QString& groupKey, const ReportRecord& record,
+                                     const ReportSourceRecord& source) {
+    StoredReport stored;
+    stored.quakeKey = groupKey;
+    stored.reportKey = record.reportKey;
+    stored.reportNum = record.reportNum;
+    stored.sourceId = source.sourceId;
+    stored.sourceTag = source.sourceTag;
+    stored.receivedAt = source.receivedAt;
+    stored.rawJson = source.rawJson;
+    stored.timestamp = record.timestamp;
+    stored.reportTime = record.reportTime;
+    stored.magnitude = record.magnitude;
+    stored.depth = record.depth;
+    stored.latitude = record.latitude;
+    stored.longitude = record.longitude;
+    stored.location = record.location;
+    stored.maxIntensityText = record.maxIntensityText;
+    stored.isFinal = record.isFinal;
+    stored.isCanceled = record.isCanceled;
+    stored.isInfo = record.isInfo;
+    stored.determination = record.determination;
+    // 待写表按「组 + 报次槽 + 源」去重：同一报经两路聚合源送达是两行（各自存原文），
+    // 同一路重复轮询只覆盖一行。
+    pendingReportWrites_[groupKey + QChar(0x1f) + record.reportKey + QChar(0x1f)
+                         + (source.sourceId.isEmpty() ? source.sourceTag : source.sourceId)] = stored;
+    if (!historyFlushTimer_.isActive()) historyFlushTimer_.start();
+}
+
+void AppController::pruneReportGroups() {
+    // 纯展示缓存，按最后接收时间淘汰即可；不设上限的话长时间运行会把每场小震的
+    // 原始报文都留在内存里。
+    constexpr int kMaxGroups = 400;
+    if (reportGroups_.size() <= kMaxGroups) return;
+    QVector<QPair<long long, QString>> order;
+    order.reserve(reportGroups_.size());
+    for (auto it = reportGroups_.constBegin(); it != reportGroups_.constEnd(); ++it)
+        order.push_back({it.value().lastReceivedAt, it.key()});
+    std::sort(order.begin(), order.end());
+    const int removeCount = reportGroups_.size() - kMaxGroups;
+    for (int i = 0; i < removeCount; ++i) reportGroups_.remove(order.at(i).second);
+}
+
+void AppController::mergeStoredReports(const QString& groupKey) {
+    if (!historyStore_ || !historyStore_->isReady()) return;
+    // 读回时把候选键（本格本分钟、相邻分钟、相邻格）下的记录全并进**详情这一组**：
+    // 写入端已把同一场地震归一到同一个键，但旧版本入库时可能落在相邻网格/分钟里，
+    // 那些行若只读回各自的组，详情页仍然看不到。
+    QStringList keys;
+    if (!detailEvent_.location.empty()) keys = reportCandidateKeys(detailEvent_);
+    if (keys.isEmpty() && !groupKey.isEmpty()) keys.push_back(groupKey);
+    // 没打开详情时（例如归档预热）按传入键读，不做跨格合并。
+    const QString target = detailEvent_.location.empty() ? groupKey : resolveReportGroupKey(detailEvent_);
+    if (target.isEmpty()) return;
+    QSet<QString> loaded;
+    for (const QString& key : keys) {
+        if (key.isEmpty() || loaded.contains(key)) continue;
+        loaded.insert(key);
+        mergeStoredReportsOf(target, key);
+    }
+}
+
+void AppController::mergeStoredReportsOf(const QString& targetKey, const QString& sourceKey) {
+    if (!historyStore_ || !historyStore_->isReady() || targetKey.isEmpty()) return;
+    ReportGroup& group = reportGroups_[targetKey];
+    for (const StoredReport& stored : historyStore_->loadReports(sourceKey)) {
+        // 相邻键下的行必须复核真是同一场地震：网格相邻不等于同一场。
+        if (!quakeGroupMergeable(stored.timestamp, stored.latitude, stored.longitude,
+                                 group.timestamp, group.latitude, group.longitude)
+            && group.timestamp > 0)
+            continue;
+        if (group.timestamp <= 0) {
+            group.timestamp = stored.timestamp;
+            group.latitude = stored.latitude;
+            group.longitude = stored.longitude;
+        }
+        ReportRecord* record = nullptr;
+        const QString slot = stored.reportKey.isEmpty()
+                                 ? QStringLiteral("n:") + QString::number(stored.reportNum)
+                                 : stored.reportKey;
+        for (ReportRecord& existing : group.reports) {
+            if (existing.reportKey == slot) {
+                record = &existing;
+                break;
+            }
+        }
+        if (!record) {
+            group.reports.append(ReportRecord{});
+            record = &group.reports.last();
+            record->reportKey = slot;
+            record->reportNum = stored.reportNum;
+            record->timestamp = stored.timestamp;
+            record->reportTime = stored.reportTime;
+            record->magnitude = stored.magnitude;
+            record->depth = stored.depth;
+            record->latitude = stored.latitude;
+            record->longitude = stored.longitude;
+            record->location = stored.location;
+            record->maxIntensityText = stored.maxIntensityText;
+            record->isFinal = stored.isFinal;
+            record->isCanceled = stored.isCanceled;
+            record->isInfo = stored.isInfo;
+            record->determination = stored.determination;
+        }
+        bool hasSource = false;
+        for (const ReportSourceRecord& existing : std::as_const(record->sources)) {
+            if (existing.sourceId == stored.sourceId && existing.sourceTag == stored.sourceTag) {
+                hasSource = true;
+                break;
+            }
+        }
+        if (!hasSource) {
+            record->sources.append(ReportSourceRecord{stored.sourceId, stored.sourceTag,
+                                                      stored.receivedAt, stored.rawJson});
+        }
+        group.lastReceivedAt = std::max(group.lastReceivedAt, stored.receivedAt);
+    }
+}
+
+void AppController::showEventDetail(const QString& id) {
+    if (id.isEmpty()) return;
+    detailId_ = id;
+    bool found = false;
+    for (const CatalogEntry& entry : catalogEvents()) {
+        if (QString::fromStdString(entry.event.identity()) != id) continue;
+        detailEvent_ = entry.event;
+        detailSourceTags_ = entry.sourceTags;
+        detailActive_ = entry.active;
+        found = true;
+        break;
+    }
+    if (!found) {
+        closeEventDetail();
+        return;
+    }
+    // 归档键要用「已存在的那一组」：同一场地震先由相邻分钟/相邻网格归档时，主键会
+    // 落在新的一格里，直接按主键读会看不到刚收到的报次。
+    detailKey_ = resolveReportGroupKey(detailEvent_);
+    mergeStoredReports(detailKey_);
+    rebuildEventDetail();
+}
+void AppController::closeEventDetail() {
+    if (detailId_.isEmpty() && eventDetailCache_.isEmpty()) return;
+    detailId_.clear();
+    detailKey_.clear();
+    detailEvent_ = EarthquakeEvent{};
+    detailSourceTags_.clear();
+    detailActive_ = false;
+    eventDetailCache_.clear();
+    emit eventDetailChanged();
+}
+
+void AppController::refreshOpenEventDetail() {
+    if (detailId_.isEmpty()) return;
+    bool found = false;
+    for (const CatalogEntry& entry : catalogEvents()) {
+        if (QString::fromStdString(entry.event.identity()) != detailId_) continue;
+        detailEvent_ = entry.event;
+        detailSourceTags_ = entry.sourceTags;
+        detailActive_ = entry.active;
+        found = true;
+        break;
+    }
+    if (!found) {
+        // 目录裁剪后条目可能已经不在列表里；详情页不能继续显示一条不存在的事件。
+        closeEventDetail();
+        return;
+    }
+    // 归档键可能与这条记录的「主键」不同（同一场地震先由相邻分钟/相邻网格归档），
+    // 必须取进程内已存在的那一组，否则详情页看不到刚收到的报次。
+    const QString key = resolveReportGroupKey(detailEvent_);
+    if (key != detailKey_) {
+        detailKey_ = key;
+        mergeStoredReports(key);
+    }
+    rebuildEventDetail();
+}
+
+void AppController::rebuildEventDetail() {
+    if (detailId_.isEmpty()) return;
+    // 旧库记录（本功能上线前入库）没有 sourceProvider/agency，catalog 标签可能是空的；
+    // 至少退回 event.source，否则详情页会显示「暂无来源记录」。
+    QStringList displaySourceTags = detailSourceTags_;
+    if (displaySourceTags.isEmpty()) {
+        const QString tag = sourceTagFor(detailEvent_);
+        if (!tag.isEmpty()) displaySourceTags.push_back(tag);
+        else if (!detailEvent_.source.empty())
+            displaySourceTags.push_back(QString::fromStdString(detailEvent_.source));
+    }
+    const EventListModel::Row row = makeRow(detailEvent_, detailActive_, displaySourceTags);
+
+    QVariantMap detail;
+    detail["id"] = detailId_;
+    detail["location"] = row.location;
+    detail["timeText"] = row.timeText;
+    detail["magnitudeText"] = row.magnitudeText;
+    detail["depthText"] = row.depthText;
+    detail["distanceText"] = row.hasDistance ? row.distanceText : QStringLiteral("--");
+    detail["hasDistance"] = row.hasDistance;
+    detail["latitudeText"] = QString::number(detailEvent_.latitude, 'f', 4) + QChar(0x00B0);
+    detail["longitudeText"] = QString::number(detailEvent_.longitude, 'f', 4) + QChar(0x00B0);
+    detail["intensity"] = row.intensity;
+    detail["intensityLabel"] = row.intensityLabel;
+    detail["intensityColor"] = row.intensityColor;
+    detail["maxIntensity"] = QString::fromStdString(detailEvent_.maxIntensityText);
+    detail["active"] = detailActive_;
+    const QString localIntensity = QString::fromStdString(detailEvent_.estimatedIntensity);
+    detail["localIntensity"] = localIntensity;
+    detail["hasLocalIntensity"] = row.hasDistance && !localIntensity.isEmpty()
+                                  && localIntensity != QLatin1String("--");
+    detail["sourceTags"] = displaySourceTags;
+    QString statusText;
+    if (detailEvent_.isCanceled) statusText = QStringLiteral("已取消");
+    else if (detailEvent_.isFinal) statusText = QStringLiteral("最终报");
+    detail["statusText"] = statusText;
+    detail["reportNumText"] = detailEvent_.isInfo
+                                  ? QStringLiteral("情报")
+                                  : (detailEvent_.isCanceled && detailEvent_.reportNum >= 999999
+                                         ? QStringLiteral("取消报")
+                                         : (detailEvent_.reportNum > 0
+                                                ? QStringLiteral("第 %1 报")
+                                                      .arg(detailEvent_.reportNum)
+                                                : QString()));
+
+    const ReportGroup group = reportGroups_.value(detailKey_);
+    QVector<ReportRecord> ordered = group.reports;
+    // 排序：实时预警各报按报数升序在前，情报行按发布时刻在后。两类是不同性质的报文
+    // （预警是同一场地震的多次修正，情报是事后定稿），混在一起按报数排会让都从 1
+    // 开始的两条交替出现。
+    std::sort(ordered.begin(), ordered.end(), [](const ReportRecord& a, const ReportRecord& b) {
+        if (a.isInfo != b.isInfo) return !a.isInfo;
+        if (a.isInfo) {
+            const long long stampA = a.reportTime > 0 ? a.reportTime : a.timestamp;
+            const long long stampB = b.reportTime > 0 ? b.reportTime : b.timestamp;
+            if (stampA != stampB) return stampA < stampB;
+            return a.determination < b.determination;
+        }
+        if (a.reportNum != b.reportNum) return a.reportNum < b.reportNum;
+        return a.reportTime < b.reportTime;
+    });
+    // 旧数据没有报次归档：把 events 行里保留的最后一报当作单条记录展示，
+    // 否则老地震的详情页只剩基本信息，用户会以为「看不了」。
+    const bool synthesizedReports = ordered.isEmpty() && !detailEvent_.location.empty();
+    if (synthesizedReports) {
+        ReportRecord fallback;
+        fallback.reportKey = reportSlotKey(detailEvent_);
+        fallback.reportNum = detailEvent_.reportNum > 0 ? detailEvent_.reportNum : 1;
+        fallback.timestamp = detailEvent_.timestamp;
+        fallback.reportTime = detailEvent_.reportTime;
+        fallback.magnitude = detailEvent_.magnitude;
+        fallback.depth = detailEvent_.depth;
+        fallback.latitude = detailEvent_.latitude;
+        fallback.longitude = detailEvent_.longitude;
+        fallback.location = QString::fromStdString(detailEvent_.location);
+        fallback.maxIntensityText = QString::fromStdString(detailEvent_.maxIntensityText);
+        fallback.isFinal = detailEvent_.isFinal;
+        fallback.isCanceled = detailEvent_.isCanceled;
+        fallback.isInfo = detailEvent_.isInfo;
+        fallback.determination = QString::fromStdString(detailEvent_.determination);
+        const QString raw = QString::fromStdString(detailEvent_.rawJson);
+        for (const QString& tag : std::as_const(displaySourceTags)) {
+            fallback.sources.append(ReportSourceRecord{
+                QString::fromStdString(detailEvent_.sourceId), tag, detailEvent_.receivedAt, raw});
+        }
+        ordered.push_back(fallback);
+    }
+    detail["reportsSynthesized"] = synthesizedReports;
+
+    // ── 数据源：按来源聚合报次；接收时间取最早/最晚，原始 JSON 取最新一报。
+    QMap<QString, QVariantMap> bySource;
+    for (const ReportRecord& report : ordered) {
+        for (const ReportSourceRecord& source : report.sources) {
+            const QString tag = source.sourceTag.isEmpty() ? source.sourceId : source.sourceTag;
+            if (tag.isEmpty()) continue;
+            auto it = bySource.find(tag);
+            if (it == bySource.end()) {
+                QVariantMap entry;
+                entry["tag"] = tag;
+                entry["sourceId"] = source.sourceId;
+                entry["firstReceivedAt"] = source.receivedAt;
+                entry["lastReceivedAt"] = source.receivedAt;
+                entry["firstReceivedText"] = source.receivedAt > 0 ? utc8Text(source.receivedAt)
+                                                                  : QStringLiteral("--");
+                entry["lastReceivedText"] = entry.value("firstReceivedText");
+                entry["reportCount"] = 1;
+                entry["rawJson"] = source.rawJson;
+                bySource.insert(tag, entry);
+                continue;
+            }
+            QVariantMap& entry = it.value();
+            if (source.receivedAt > 0
+                && (entry.value("firstReceivedAt").toLongLong() <= 0
+                    || source.receivedAt < entry.value("firstReceivedAt").toLongLong())) {
+                entry["firstReceivedAt"] = source.receivedAt;
+                entry["firstReceivedText"] = utc8Text(source.receivedAt);
+            }
+            if (source.receivedAt >= entry.value("lastReceivedAt").toLongLong()) {
+                entry["lastReceivedAt"] = source.receivedAt;
+                if (source.receivedAt > 0) entry["lastReceivedText"] = utc8Text(source.receivedAt);
+            }
+            entry["reportCount"] = entry.value("reportCount").toInt() + 1;
+            if (!source.rawJson.isEmpty()) entry["rawJson"] = source.rawJson;
+        }
+    }
+    // 归档为空（升级前的旧库、或只拿到 catalog 标签）时也要显示来源，只是没有时间/原文。
+    // 主来源若 events 行上还留着原文（进程内更新过但未落库），也一并展示。
+    const QString primaryTag = displaySourceTags.isEmpty() ? QString() : displaySourceTags.first();
+    const QString eventRaw = QString::fromStdString(detailEvent_.rawJson);
+    for (const QString& tag : std::as_const(displaySourceTags)) {
+        if (tag.isEmpty() || bySource.contains(tag)) continue;
+        QVariantMap entry;
+        entry["tag"] = tag;
+        entry["sourceId"] = QString::fromStdString(detailEvent_.sourceId);
+        entry["firstReceivedAt"] = detailEvent_.receivedAt;
+        entry["lastReceivedAt"] = detailEvent_.receivedAt;
+        entry["firstReceivedText"] = detailEvent_.receivedAt > 0
+                                         ? utc8Text(detailEvent_.receivedAt)
+                                         : QStringLiteral("--");
+        entry["lastReceivedText"] = entry.value("firstReceivedText");
+        entry["reportCount"] = synthesizedReports ? 1 : 0;
+        entry["rawJson"] = (tag == primaryTag) ? eventRaw : QString();
+        bySource.insert(tag, entry);
+    }
+    QVariantList sources;
+    sources.reserve(bySource.size());
+    for (auto it = bySource.constBegin(); it != bySource.constEnd(); ++it) {
+        QVariantMap entry = it.value();
+        entry["hasRaw"] = !entry.value("rawJson").toString().isEmpty();
+        sources.push_back(entry);
+    }
+    detail["sources"] = sources;
+
+    // ── 报数：实时预警逐报在前，情报按发布时刻在后；每条右上角带全部来源标签。
+    QVariantList reports;
+    reports.reserve(ordered.size());
+    for (const ReportRecord& report : ordered) {
+        QVariantMap entry;
+        entry["reportNum"] = report.reportNum;
+        entry["isInfo"] = report.isInfo;
+        // 情报没有「第 N 报」：上游一条电文就是一次定稿，解析器给的 reportNum 恒为 1，
+        // 直接显示「第 1 报」会让人以为后面还有第 2 报。
+        if (report.isInfo) {
+            entry["numText"] = report.isCanceled ? QStringLiteral("取消情报")
+                                                 : QStringLiteral("情报");
+        } else {
+            entry["numText"] = report.isCanceled && report.reportNum >= 999999
+                                   ? QStringLiteral("取消报")
+                                   : QStringLiteral("第 %1 报").arg(report.reportNum);
+        }
+        const long long stamp = report.reportTime > 0 ? report.reportTime : report.timestamp;
+        entry["timeText"] = utc8Text(stamp);
+        entry["magnitudeText"] = QString::number(report.magnitude, 'f', 1);
+        entry["depthText"] = QString::number(report.depth, 'f', 0);
+        entry["location"] = report.location;
+        entry["maxIntensityText"] = report.maxIntensityText;
+        // 测定状态只对情报有意义：正式测定覆盖自动测定是同一场地震的两次定稿，
+        // 两条都留着，靠这个标签区分，否则看起来像重复条目。
+        QString determinationText;
+        if (report.isInfo) {
+            if (report.determination == QLatin1String("reviewed"))
+                determinationText = QStringLiteral("正式测定");
+            else if (report.determination == QLatin1String("automatic"))
+                determinationText = QStringLiteral("自动测定");
+        }
+        entry["determinationText"] = determinationText;
+        QString reportStatus;
+        if (report.isCanceled) reportStatus = QStringLiteral("已取消");
+        else if (report.isInfo) reportStatus = QString();
+        else if (report.isFinal) reportStatus = QStringLiteral("最终报");
+        entry["statusText"] = reportStatus;
+        QStringList tags;
+        for (const ReportSourceRecord& source : report.sources) {
+            const QString tag = source.sourceTag.isEmpty() ? source.sourceId : source.sourceTag;
+            if (!tag.isEmpty() && !tags.contains(tag)) tags.push_back(tag);
+        }
+        entry["sourceTags"] = tags;
+        reports.push_back(entry);
+    }
+    detail["reports"] = reports;
+
+    // ── 周边区县烈度：只保留 ≥1 度（低于 1 度对读者没有意义，且会铺满整张表）。
+    const QString districtSignature = QStringLiteral("%1|%2|%3|%4")
+                                          .arg(detailEvent_.magnitude)
+                                          .arg(detailEvent_.depth)
+                                          .arg(detailEvent_.latitude)
+                                          .arg(detailEvent_.longitude);
+    if (detailDistrictSignature_ != districtSignature) {
+        detailDistrictSignature_ = districtSignature;
+        detailDistrictsCache_.clear();
+        if (detailEvent_.magnitude > 0.0) {
+            if (!districtData_) {
+                auto data = std::make_shared<VectorMapData>();
+                if (data->loadFromFile((assetRoot_ + QStringLiteral("/map_bounds.kvb")).toStdString()))
+                    districtData_ = std::move(data);
+            }
+            if (districtData_) {
+                const QVariantMap all = computeDistrictIntensity(
+                    *districtData_, detailEvent_.magnitude, detailEvent_.depth,
+                    detailEvent_.latitude, detailEvent_.longitude);
+                for (auto it = all.constBegin(); it != all.constEnd(); ++it) {
+                    const double raw = it.value().toDouble();
+                    if (raw < 1.0) continue;
+                    QVariantMap entry;
+                    entry["name"] = it.key();
+                    entry["raw"] = raw;
+                    entry["intensityText"] =
+                        QString::fromStdString(IntensityCalculator::formatCsis(raw));
+                    entry["color"] = SeismicColors::intensityColor(raw).name();
+                    detailDistrictsCache_.push_back(entry);
+                }
+                std::sort(detailDistrictsCache_.begin(), detailDistrictsCache_.end(),
+                          [](const QVariant& a, const QVariant& b) {
+                              const QVariantMap left = a.toMap();
+                              const QVariantMap right = b.toMap();
+                              if (left.value("raw").toDouble() != right.value("raw").toDouble())
+                                  return left.value("raw").toDouble()
+                                         > right.value("raw").toDouble();
+                              return left.value("name").toString()
+                                     < right.value("name").toString();
+                          });
+            }
+        }
+    }
+    detail["districts"] = detailDistrictsCache_;
+
+    eventDetailCache_ = detail;
+    emit eventDetailChanged();
 }
 
 void AppController::syncEventModelFocus() {

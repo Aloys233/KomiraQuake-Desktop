@@ -24,6 +24,7 @@
 #include "prefs/settings_store.h"
 #include "service/autostart.h"
 #include "service/update_service.h"
+#include "store/history_store.h"
 
 namespace komira {
 class LocationService;
@@ -57,7 +58,11 @@ class AppController : public QObject {
     Q_PROPERTY(double userLatitude READ userLatitude NOTIFY locationChanged)
     Q_PROPERTY(double userLongitude READ userLongitude NOTIFY locationChanged)
     Q_PROPERTY(QString locationStatusText READ locationStatusText NOTIFY locationChanged)
-    /// 逐数据源的状态列表：`[{ id, name, enabled, configured, status, statusTag, latency, directory, directoryLatency, description }]`。
+    /// 逐数据源的状态列表：`[{ id, name, enabled, configured, status, statusTag,
+    /// latencyMs, latencyText, directory, directoryStatusTag, directoryLatencyMs,
+    /// directoryLatencyText, description, region, subSources }]`。
+    /// 延迟以**数值 + 文本**两路给出：`*Ms` 为 -1 表示未测出（QML 判空/排序用它），
+    /// `*Text` 在未测出时是空串（不要显示「— ms」，它对用户是噪声）。
     /// 左下角徽章据此逐源着色（只取 enabled && configured）。
     Q_PROPERTY(QVariantList sources READ sources NOTIFY statusChanged)
     /// 校时状态：`{ enabled, state, detail }`。设置页展示；地震时间语义走 NtpClock::now()。
@@ -117,6 +122,10 @@ class AppController : public QObject {
     Q_PROPERTY(QVariantMap sourceEstimateInfo READ sourceEstimateInfo NOTIFY sourceEstimateChanged)
     /// 地图叠加层载荷；`{ visible, latitude, longitude, uncertaintyKm, family, magnitude, ... }`
     Q_PROPERTY(QVariantMap sourceEstimateMarker READ sourceEstimateMarker NOTIFY sourceEstimateChanged)
+    /// 侧栏详情页载荷。空 map = 未打开；打开期间随目录/报次更新自动重算。
+    /// `{ id, location, timeText, magnitudeText, depthText, distanceText, ..., sources: [...],
+    ///    reports: [...], districts: [...] }`
+    Q_PROPERTY(QVariantMap eventDetail READ eventDetail NOTIFY eventDetailChanged)
 
 public:
     explicit AppController(QObject* parent = nullptr, bool startServices = true);
@@ -178,6 +187,7 @@ public:
     QVariantList stationSources() const;
     QVariantMap sourceEstimateInfo() const;
     QVariantMap sourceEstimateMarker() const;
+    QVariantMap eventDetail() const { return eventDetailCache_; }
 
     /// HUD 左右切换：在全部活动事件间循环（按发震时刻倒序，0 为最新）。
     Q_INVOKABLE void hudPrev();
@@ -186,6 +196,9 @@ public:
     /// 列表卡片按钮：命中当前焦点则取消，否则把这次地震设为焦点。
     Q_INVOKABLE void toggleMapFocus(const QString& id);
     Q_INVOKABLE bool isMapFocused(const QString& id) const;
+    /// 详情页：按侧栏行 id（identity）打开 / 关闭右侧详情面板。
+    Q_INVOKABLE void showEventDetail(const QString& id);
+    Q_INVOKABLE void closeEventDetail();
 
     Q_INVOKABLE void requestLocation();
     Q_INVOKABLE void setManualLocation(double latitude, double longitude, const QString& label = QString());
@@ -228,6 +241,7 @@ signals:
     void districtIntensityChanged();
     void stationIntensityChanged();
     void sourceEstimateChanged();
+    void eventDetailChanged();
     /// 实时 EEW 到达：请求把地图移到该震中。
     void centerMapRequested(double latitude, double longitude);
     /// 取消焦点（再次点击同一事件）：请求把镜头还原到默认视野。
@@ -239,6 +253,8 @@ private:
     void wireSettings();
     /// 数据源/凭据/开发者模式变化：重推凭据并按门控重启或停止各源。
     void applySourceSettings();
+    /// 把当前的子数据源禁用集合推给各源（解析与目录轮询按它过滤）。
+    void applySubSourceFilters();
     /// inDirectory：事件来自 HTTP 目录（进入列表/历史）；否则为 WS 实时预警（只告警不入列表）。
     /// source：发出该帧的源，用于把仓库层的处置结果回传给需要它的数据源（见 EarthquakeSource::onAdmission）。
     void handleEvent(const EarthquakeEvent& event, bool replay, bool inDirectory,
@@ -326,11 +342,95 @@ private:
     static QVariantMap computeDistrictIntensity(const VectorMapData& data, double magnitude,
                                                 double depthKm, double lat, double lon);
     void refreshEventModel();
-    /// 侧栏当前应显示的事件（目录 + 实时预警合并、按发震时刻倒序）及 isActive 标记。
-    /// 供 `eventList()`（兼容调试/测试）与 `refreshEventModel()`（行模型）共用一次合并。
-    std::vector<std::pair<EarthquakeEvent, bool>> mergedEvents() const;
+    /// 报次归档的一条来源记录（一个聚合源收到的那一报）。
+    struct ReportSourceRecord {
+        QString sourceId;
+        QString sourceTag;
+        long long receivedAt = 0;
+        QString rawJson;
+    };
+    /// 一场地震的一报。同一报可能经多个聚合源送达，sources 保留全部来源。
+    struct ReportRecord {
+        /// 组内报次槽：实时预警 `n:<报数>`、情报 `i:<发布时刻>`。同一场地震的预警
+        /// 与情报各自从 1 开始编号，只看 reportNum 会把它们叠成一条。
+        QString reportKey;
+        int reportNum = 1;
+        long long timestamp = 0;
+        long long reportTime = 0;
+        double magnitude = 0.0;
+        double depth = 0.0;
+        double latitude = 0.0;
+        double longitude = 0.0;
+        QString location;
+        QString maxIntensityText;
+        bool isFinal = false;
+        bool isCanceled = false;
+        /// 情报/速报行（相对实时预警的一报）：详情页标「情报」而不是「第 N 报」。
+        bool isInfo = false;
+        /// 测定状态：`reviewed`（正式测定）/ `automatic`（自动测定）/ 空。
+        QString determination;
+        QVector<ReportSourceRecord> sources;
+    };
+    struct ReportGroup {
+        QVector<ReportRecord> reports;
+        long long lastReceivedAt = 0;
+        /// 本组的参照震源（首个归档的报次）：候选键命中后还要用它复核「确实同一场
+        /// 地震」，否则相邻网格/相邻分钟的两场小震会被并成一组。
+        long long timestamp = 0;
+        double latitude = 0.0;
+        double longitude = 0.0;
+    };
+    /// 归档组候选键：机构 + 发震时刻分钟桶 + 震中 0.1° 网格（见 core/quake_key.h）。
+    /// 返回空表示该事件无法按机构/时刻归档，调用方退回 identity 单组。
+    static QStringList reportCandidateKeys(const EarthquakeEvent& event);
+    /// 组内报次槽。预警按报数（同报被多源收到要合成一行），情报按发布时刻+测定状态
+    /// （同一场地震会先出自动测定、再出正式测定，两条都得留下）。
+    static QString reportSlotKey(const EarthquakeEvent& event);
+    /// 结合组内已有报次解决槽冲突：报数相同但起点时刻相差 2 s 以上的是**另一场**地震
+    /// （相邻两场小震的报到数都从 1 开始），给槽加稳定后缀避免互相覆盖。
+    static QString resolveReportSlot(const ReportGroup& group, const EarthquakeEvent& event);
+    /// 报次归属键：**机构 + 分钟桶 + 震中网格**（见 core/quake_key.h）。候选键里若已有
+    /// **校验通过**（时刻差 ≤ 90 s、震中 ≤ 25 km）的组就并进去，否则落在事件自己的
+    /// 主键上 —— 分钟进位、网格跨格、以及「秒被截断到分钟」都靠这一步兜住。
+    QString resolveReportGroupKey(const EarthquakeEvent& event) const;
+    /// 收到一帧就归档：在去重门控之前调用，另一路聚合源送来的重复报也要留下来源。
+    void recordReport(const EarthquakeEvent& event);
+    /// 归档变更合并进历史写回（与事件同一 80 ms 批次）。
+    void queueReportWrite(const QString& groupKey, const ReportRecord& record,
+                          const ReportSourceRecord& source);
+    /// 打开详情时按需从库里补历史报次（进程内已有的优先）。
+    void mergeStoredReports(const QString& groupKey);
+    /// 从库里读回某一个归档键的记录，并入 targetKey 这一组（mergeStoredReports 逐个键调用）。
+    void mergeStoredReportsOf(const QString& targetKey, const QString& sourceKey);
+    /// 用当前 detailEvent_ 与归档重建 eventDetailCache_。
+    void rebuildEventDetail();
+    /// 某组归档有新报时刷新详情：详情正看着同一场地震就重建（键可能不同，按物理同一性判）。
+    void refreshDetailIfShowing(const QString& groupKey);
+    /// 目录/预警更新后刷新详情载荷（详情未打开时是空操作）。
+    void refreshOpenEventDetail();
+    /// 归档过多时按最后接收时间淘汰最旧的一组（纯 UI 数据，无需落盘）。
+    void pruneReportGroups();
+    /// 侧栏的一条目录事件：由**同一份上游报文**的（可能多条）聚合记录归并而来。
+    struct CatalogEntry {
+        EarthquakeEvent event;
+        /// 有同 identity 的实时预警会话。只用于行上的活动圆点，不改变行的来源与生命周期。
+        bool active = false;
+        /// 归并前所有记录的来源标签，不能随着「最佳记录」选择而丢失。
+        QStringList sourceTags;
+        /// 任一归并记录通过逐源震级过滤即展示：同一条上游报文可能经多路聚合源送达，
+        /// 只要还有一路没有被用户关掉，这条目录就不该消失。
+        bool passesInfoFilter = true;
+    };
+
+    /// 侧栏当前应显示的**历史目录**（按发震时刻倒序）。
+    ///
+    /// 只来自 `history_`：实时会话（`sessions_.active`）不产生行。它们只把 identity 相同的
+    /// 目录行标成 active —— 否则预警生命周期会让列表条目忽增忽减、过期消失、目录到达后
+    /// 又重新合并。供 `eventList()`（兼容调试/测试）与 `refreshEventModel()`（行模型）共用。
+    std::vector<CatalogEntry> catalogEvents() const;
     /// 把一条事件装进侧栏行（只填 delegate 真正会读的字段）。
-    EventListModel::Row makeRow(const EarthquakeEvent& event, bool active) const;
+    EventListModel::Row makeRow(const EarthquakeEvent& event, bool active,
+                                const QStringList& sourceTags) const;
     /// 焦点变化后只刷新受影响的两行（旧的与新的），不重建整表。
     void syncEventModelFocus();
     void scheduleDirectoryUiRefresh();
@@ -419,6 +519,20 @@ private:
     /// 待落盘的墓碑：identity -> endedAt。
     std::map<std::string, long long> pendingTombstones_;
 
+    /// 待写库的报次记录：key = `group|num|sourceId`，同键覆盖。
+    std::map<QString, StoredReport> pendingReportWrites_;
+    /// 报次归档：quakeKey -> 该场地震的全部报次（进程内热数据）。
+    QHash<QString, ReportGroup> reportGroups_;
+    /// 已打开详情的事件与所属归档键；空 = 详情未打开。
+    QString detailId_;
+    QString detailKey_;
+    EarthquakeEvent detailEvent_;
+    QStringList detailSourceTags_;
+    bool detailActive_ = false;
+    QVariantMap eventDetailCache_;
+    /// 详情页区县表的缓存：只有震级/深度/震中变了才重算（连发多报时每报都重算太浪费）。
+    QString detailDistrictSignature_;
+    QVariantList detailDistrictsCache_;
     /// 地图焦点：用户从列表选中，或被实时 EEW 自动接管。
     EarthquakeEvent mapFocus_;
     bool hasMapFocus_ = false;

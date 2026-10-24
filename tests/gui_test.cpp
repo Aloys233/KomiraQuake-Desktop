@@ -10,6 +10,8 @@
 #include <QTemporaryDir>
 #include <QSettings>
 #include <QDir>
+#include <QFontDatabase>
+#include <QFontInfo>
 #include <functional>
 #include <cmath>
 #include "core/intensity_calculator.h"
@@ -21,16 +23,20 @@
 #include <QQuickStyle>
 #include <QSGRendererInterface>
 #include <QQmlEngine>
+#include <QWebSocketServer>
 #include "map/vector_map_item.h"
 #include "map/station_map_item.h"
 #include "model/station_snapshot.h"
-#include "source/wolfx_source.h"
 #include "store/history_store.h"
+// wolfx_source.h 进 #define private public 段：延迟用例要按真实接线方式挂 socket 回调
+// （running_ / generation_ / attempt_ 与 attachSocketHandlers），这是头文件里唯一的
+// 放宽访问范围之处，其余生产头一律不改。
 #define private public
 #include "app/app_controller.h"
 #include "service/source_estimation_service.h"
 #include "service/alert_announcer.h"
 #include "service/tray_controller.h"
+#include "source/wolfx_source.h"
 #undef private
 
 using namespace komira;
@@ -134,6 +140,18 @@ private slots:
         // qrc 资源没有可靠的 mtime，Qt 的 QML 磁盘缓存会跨重建复用旧字节码，
         // 让本用例静默地跑在旧 QML 上。测试必须始终执行本次构建的 QML。
         qputenv("QML_DISABLE_DISK_CACHE", "1");
+    }
+
+    /// 字体必须来自 qrc，而不是系统 fontconfig：换到没装这些字体的机器上也要一致。
+    void bundledFontsAreEmbedded() {
+        QQmlEngine engine;
+        configureNativeUi(engine);
+        QCOMPARE(QFontInfo(QFont(QStringLiteral("Source Han Sans SC"))).family(),
+                 QStringLiteral("Source Han Sans SC"));
+        QCOMPARE(QFontInfo(QFont(QStringLiteral("JetBrains Mono"))).family(),
+                 QStringLiteral("JetBrains Mono"));
+        QCOMPARE(QFontInfo(QFont(QStringLiteral("Google Sans"))).family(),
+                 QStringLiteral("Google Sans"));
     }
     void controllerAndWindow() {
         QTemporaryDir isolated;
@@ -465,6 +483,17 @@ private slots:
                 const auto rect = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
                 QVERIFY2(rect.left() >= 0 && rect.right() <= window->width() + 1, qPrintable(item->property("text").toString()));
             }
+            // 数据源是唯一靠内部分栏的版面：窄屏必须退回「下拉框 + 单栏详情」，
+            // 而不是把两栏硬压进 390 px。留一张图作为证据。
+            if (section == 6) {
+                auto* navCard = window->findChild<QQuickItem*>("sourceNavCard");
+                QVERIFY(navCard);
+                QVERIFY(!navCard->isVisible());
+                auto* selector = window->findChild<QQuickItem*>("sourceSelectorCombo");
+                QVERIFY(selector);
+                QVERIFY(selector->isVisible());
+                QVERIFY(screenshot("10b-settings-source-narrow"));
+            }
         }
         settingsPage->setProperty("currentSection", 0);
         QVERIFY(screenshot("11-appearance-narrow"));
@@ -647,7 +676,17 @@ private slots:
         QVERIFY2(district->z() < pWave->z(), "P wave must be above district intensity shading");
         QVERIFY2(district->z() < sFill->z(), "S wave fill must be above district intensity shading");
         QVERIFY2(district->z() < sWave->z(), "S wave must be above district intensity shading");
-        QVERIFY2(district->z() < hypocenter->z(), "hypocenter must be above district intensity shading");
+        // 十字已提到 mapRenderLayer **之外**（否则整片盖不过测站层，见
+        // epicenterAndUserMarkerStayAboveStationLayer）。跨子树后 z 不能直接比：
+        // 判据改成「所在标记层是 mapRenderLayer 的兄弟，且 z 更高」——
+        // 那正是「压在区县着色与波前之上」在场景图里的等价说法。
+        auto* markerLayer = window->findChild<QQuickItem*>("mapMarkerLayer");
+        QVERIFY2(markerLayer, "mapMarkerLayer");
+        QVERIFY2(hypocenter->parentItem() == markerLayer,
+                 "hypocenter must live in mapMarkerLayer");
+        QVERIFY2(markerLayer->parentItem() == renderLayer->parentItem()
+                     && markerLayer->z() > renderLayer->z(),
+                 "震中标记层必须是 mapRenderLayer 的兄弟且压在其上");
         // 世界/区县层始终参与渲染；省级分界线只在拉近后画（见下个断言）。
         QVERIFY(window->findChild<QQuickItem*>("vectorWorldLayer")->property("visible").toBool());
         QVERIFY(window->findChild<QQuickItem*>("vectorDistrictLayer")->property("visible").toBool());
@@ -1648,6 +1687,370 @@ private slots:
         QCOMPARE(controller.historyStore_->loadRecent(10)[0].magnitude, 9.9);
     }
 
+    /// 右上角测站卡：收起时**堆叠**、悬停展开成一排、离开收回，且前排优先级正确。
+    ///
+    /// 用 StationStackScene.qml 夹具直接喂数据（不联网）：
+    ///  - 收起态：只露前 3 张（peekCount），后卡沿**左下**各错开 peekX / peekY，
+    ///    z 由槽位决定，第 4 张起 opacity = 0；
+    ///  - 展开态：卡间距 = 卡宽 + gap，整排宽度 = n·卡宽 + (n-1)·gap，且前排仍贴右缘；
+    ///  - 优先级：优先「读数变过」的源，同级按跨制式折算后的读数从高到低，
+    ///    都没有变化、也都没有读数时回落到数据源注册顺序（NIED 最前）；
+    ///  - reduceMotion 打开时没有过渡动画（几何直接到位）。
+    void stationStackExpandsOnHoverAndOrdersFrontByChangeAndValue() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        AppController controller(nullptr, false);
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl::fromLocalFile(QStringLiteral(KOMIRA_SOURCE_DIR "/tests/StationStackScene.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        auto* stack = window->findChild<QQuickItem*>("fixtureStack");
+        QVERIFY(stack);
+        auto* map = window->findChild<QQuickItem*>("fixtureMap");
+        QVERIFY(map);
+        // 把容器尺寸/位置从 QML 的 Item 坐标换算成场景坐标用。
+        auto sceneCenterOf = [&](QQuickItem* item) {
+            return item->mapToScene(QPointF(item->width() / 2, item->height() / 2)).toPoint();
+        };
+        auto cardOf = [&](const QString& id) {
+            return findVisualItem(window, "stationCard-" + id);
+        };
+        auto feed = [&](const std::function<void(QVariantList&)>& mutate) {
+            QVariantList list = stack->property("sources").toList();
+            mutate(list);
+            stack->setProperty("sources", list);
+            // sync() 在 sourcesChanged 里同步跑，但排序动画/布局要等一次事件循环。
+            QCoreApplication::processEvents();
+        };
+
+        const QStringList ids{ "kmoni", "snet", "kma_station", "pancakes_seis", "wolfx_seis" };
+        QCOMPARE(stack->property("count").toInt(), ids.size());
+        for (const QString& id : ids) QVERIFY2(cardOf(id), qPrintable("缺少卡片 " + id));
+
+        // 1. 默认：五路都无数据 → 前排回落注册顺序第一个（NIED），unexpanded。
+        QCOMPARE(stack->property("frontId").toString(), QStringLiteral("kmoni"));
+        QVERIFY(!stack->property("expanded").toBool());
+        const qreal cardWidth = stack->property("cardWidth").toReal();
+        // 卡高要等 delegate 量过之后才是真实值（首帧回落到默认 74），这里取稳定值。
+        QTRY_VERIFY(stack->property("cardHeight").toReal() >= 40);
+        const qreal cardHeight = stack->property("cardHeight").toReal();
+        QVERIFY(cardWidth >= 80);
+
+        // 2. 收起态几何：**左下堆叠**（每张卡向左、向下各错开一小步），且只露前 3 张。
+        {
+            QCOMPARE(stack->property("peekCount").toInt(), 3);
+            QCOMPARE(stack->property("collapsedCount").toInt(), 3);
+            const qreal peekX = stack->property("peekX").toReal();
+            const qreal peekY = stack->property("peekY").toReal();
+            QVERIFY(peekX > 1 && peekY > 1);
+            // 尺寸只覆盖 3 张纸边：不是 5 张全错开。
+            QVERIFY2(std::abs(stack->width() - (cardWidth + peekX * 2)) < 0.5,
+                     qPrintable(QStringLiteral("收起态应只露 3 张: %1").arg(stack->width())));
+            QVERIFY2(std::abs(stack->height() - (cardHeight + peekY * 2)) < 0.5,
+                     qPrintable(QStringLiteral("收起态应只露 3 张的高度: %1").arg(stack->height())));
+            bool sawSecond = false;
+            for (int slot = 0; slot < 3; ++slot) {
+                auto* card = cardOf(ids.at(stack->property("order").toList().at(slot).toInt()));
+                QVERIFY(card);
+                QVERIFY2(card->isVisible() && card->opacity() > 0.99,
+                         "前 3 张必须完整可见");
+                QVERIFY2(std::abs(card->x() - (stack->width() - cardWidth - slot * peekX)) < 0.5,
+                         qPrintable(QStringLiteral("槽位 %1 的卡没有向左错开").arg(slot)));
+                QVERIFY2(std::abs(card->y() - slot * peekY) < 0.5,
+                         qPrintable(QStringLiteral("槽位 %1 的卡没有向下错开").arg(slot)));
+                if (slot == 1) sawSecond = true;
+            }
+            QVERIFY(sawSecond);
+            // 「看得出是叠着的」靠**一条发丝边 + 一点点压暗**：靠后的几张纸边比前排深一档，
+            // 但底下的磨砂玻璃仍然透得出来（用户要求「底下的两张也要有模糊，不能是纯色」）。
+            // 所以：**不要**盖不透明纸、**不要**压白，也**不要**加深描边或投影 ——
+            // 那几版要么把模糊糊成平色，要么在浅色地图上很脏（用户原话「好丑」）。
+            double lastShade = 0;
+            for (int slot = 0; slot < 3; ++slot) {
+                auto* card = cardOf(ids.at(stack->property("order").toList().at(slot).toInt()));
+                QVERIFY(card);
+                // z == 50 是发丝边框（必须 **color 透明**，否则会把模糊盖成平色）；
+                // z == 51 是「越深越暗」的那层极薄压暗。
+                double paper = -1, shade = 0;
+                bool frameTransparent = false;
+                for (auto* item : visualItems(card)) {
+                    if (item->parentItem() != card) continue;
+                    const qreal z = item->property("z").toReal();
+                    if (z >= 50 && z < 51) {
+                        paper = item->opacity();
+                        frameTransparent = item->property("color").value<QColor>().alpha() == 0;
+                    }
+                    if (z >= 51 && z < 100) shade = item->opacity();
+                }
+                if (slot == 0) {
+                    QVERIFY2(paper <= 0.001, "前排不该有纸边层（纸边要最亮）");
+                } else {
+                    QVERIFY2(paper > 0.99, "靠后的卡没有纸边层，纸边读不出层次");
+                    QVERIFY2(frameTransparent,
+                             "纸边层必须 color 透明：盖了实色纸/压白会把模糊糊成平色");
+                }
+                // 靠后的卡必须把玻璃底衬调薄：底衬太厚时，64 px 的模糊只剩一片均值，
+                // 9 px 的纸边看上去就是纯色（用户：「底下的两张没有模糊」）。
+                // 浅色主题才调薄底衬；深色主题的底衬本来是深的，调薄会变灰板。
+                auto* testTheme = stack->property("theme").value<QObject*>();
+                QVERIFY(testTheme);
+                const bool dark = testTheme->property("dark").toBool();
+                if (slot == 0 || dark) {
+                    QCOMPARE(card->property("tintOpacity").toReal(), 1.0);
+                } else {
+                    QVERIFY2(card->property("tintOpacity").toReal() < 0.9,
+                             "靠后的卡没有把玻璃底衬调薄，模糊透不出来");
+                }
+                // 压暗必须逐级变重，否则后两张会糊成同一块。
+                if (slot == 0) {
+                    QVERIFY2(shade <= 0.001, "前排不该压暗");
+                } else {
+                    QVERIFY2(shade > 0.001, "靠后的卡没有压暗，纸边与卡面分不开");
+                    QVERIFY2(shade > lastShade, "纸边压暗没有随深度递进");
+                }
+                lastShade = shade;
+            }
+            // 第 4、5 张在收起态必须完全隐藏（用户只要「看得出是叠着的」）。
+            for (int slot = 3; slot < ids.size(); ++slot) {
+                auto* card = cardOf(ids.at(stack->property("order").toList().at(slot).toInt()));
+                QVERIFY(card);
+                QVERIFY2(!card->isVisible() || card->opacity() < 0.01,
+                         qPrintable(QStringLiteral("第 %1 张在收起态不该露出").arg(slot + 1)));
+            }
+            // 前排压在后面那些卡的上面。
+            auto* first = cardOf(ids.at(stack->property("order").toList().at(0).toInt()));
+            auto* second = cardOf(ids.at(stack->property("order").toList().at(1).toInt()));
+            QVERIFY2(first->z() > second->z(), "前排必须压在后面的卡上面");
+        }
+
+        // 「热」是按时间窗口算的；用例把窗口压到 250 ms，否则要真等 20 秒。
+        stack->setProperty("hotWindowMs", 250);
+
+        // 3. 读数高者优先（都冷下来之后）：跨制式折算 —— CSIS 6.0 > JMA 4.6（≈5.9）
+        //    > KMA 3（=2）> 无数据。Pancakes 应排前排。
+        feed([](QVariantList& list) {
+            for (QVariant& entry : list) {
+                QVariantMap m = entry.toMap();
+                if (m["standard"].toString() == "jma") {
+                    // 日本两路保持缺测：前排应由有读数的那几路里最高的占。
+                    m["hasData"] = false; m["raw"] = -3.0; m["text"] = "--";
+                } else if (m["standard"].toString() == "kma") {
+                    m["hasData"] = true; m["raw"] = 3.0; m["text"] = "3";
+                } else {
+                    m["hasData"] = true; m["raw"] = 2.0; m["text"] = "2";
+                }
+                entry = m;
+            }
+            QVariantMap pancakes = list.at(3).toMap();
+            pancakes["raw"] = 6.0; pancakes["text"] = "6";
+            list[3] = pancakes;
+        });
+        QTRY_COMPARE_WITH_TIMEOUT(stack->property("frontId").toString(),
+                                  QStringLiteral("pancakes_seis"), 3000);
+        QCOMPARE(cardOf("pancakes_seis")->z(), ids.size());   // 槽位 0 → z 最大
+        // priority() 是函数而非属性：读属性拿不到值（防把它改成两边不同步的缓存）。
+        QVERIFY(!stack->property("priority").isValid());
+
+        // 4. 迟滞：新读数只高 0.1 度时前排不让位（否则读数抖动会每帧换卡）。
+        //    NIED 4.6（JMA）≈ CSIS 5.9，比 Pancakes 6.0 低一点。
+        auto setSource = [&](int index, double raw, const QString& text) {
+            feed([&](QVariantList& list) {
+                QVariantMap m = list.at(index).toMap();
+                m["hasData"] = true; m["raw"] = raw; m["text"] = text;
+                list[index] = m;
+            });
+        };
+        // 先等 Pancakes 也冷下来：两路都在「热」窗口内时比的是读数，不是变化。
+        QTest::qWait(1200);
+        setSource(0, 4.6, QStringLiteral("5弱"));
+        // 刚变过 → 立刻浮到前排（此时 Pancakes 已冷）。
+        QTRY_COMPARE_WITH_TIMEOUT(stack->property("frontId").toString(),
+                                  QStringLiteral("kmoni"), 1000);
+        // 冷下来后：Pancakes 6.0 只高 0.1，落在 0.3 的迟滞带内 → NIED 继续占前排。
+        QTest::qWait(1200);
+        QCOMPARE(stack->property("frontId").toString(), QStringLiteral("kmoni"));
+        // 明显更高（0.4 ≥ 0.3）才换人。
+        setSource(3, 6.4, "6");
+        QTRY_COMPARE_WITH_TIMEOUT(stack->property("frontId").toString(),
+                                  QStringLiteral("pancakes_seis"), 3000);
+
+        // 5. 「读数变过的优先」：读数最低的那一路刚刚变过，也要浮到前排；冷却后按读数沉回去。
+        QTest::qWait(1200);
+        QCOMPARE(stack->property("frontId").toString(), QStringLiteral("pancakes_seis"));
+        setSource(2, 2.5, "3");   // KMA：变化 0.5 > changeEpsilon，读数却是最低的
+        QTRY_COMPARE_WITH_TIMEOUT(stack->property("frontId").toString(),
+                                  QStringLiteral("kma_station"), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(stack->property("frontId").toString(),
+                                  QStringLiteral("pancakes_seis"), 4000);
+
+        // 5b. 全部静稳（有数据但没有读数）：前排必须回落到 NIED（注册顺序第一个）。
+        //     守的是「安静时别让恒报基线的源霸占前排」与「都静稳就显示 nied」两条口径。
+        feed([](QVariantList& list) {
+            for (QVariant& entry : list) {
+                QVariantMap m = entry.toMap();
+                if (m["standard"].toString() == "jma") {
+                    m["hasData"] = true; m["raw"] = 0.0; m["text"] = "0";
+                } else if (m["standard"].toString() == "kma") {
+                    m["hasData"] = true; m["raw"] = 1.0; m["text"] = "1";
+                } else {
+                    m["hasData"] = true; m["raw"] = 0.0; m["text"] = "0";
+                }
+                entry = m;
+            }
+        });
+        QTRY_COMPARE_WITH_TIMEOUT(stack->property("frontId").toString(),
+                                  QStringLiteral("kmoni"), 3000);
+
+        // 6. 悬停展开：卡间距变成 卡宽 + gap，整排变宽，前排仍贴右缘；离开后收回。
+        //    过渡期间卡片的玻璃底必须切到 live 逐帧重采样，否则采样纹理不随卡片移动，
+        //    观感是「模糊被卡片拖着走、落定那一刻跳回去」（用户实测反馈的问题）。
+        QCOMPARE(stack->property("cardBackdropLive").toBool(), false);
+        QCOMPARE(stack->property("cardBackdropLive").toBool(), stack->property("backdropLive").toBool());
+        // 把动画拉慢到 1.2 s：`grabWindow` 本身要十几毫秒，220 ms 的动画常常
+        // 「一抓就已经落定」，取证图便抓不到真正的过渡帧（也就无法肉眼核对模糊）。
+        stack->setProperty("durationOverride", 1200);
+        QTest::mouseMove(window, QPoint(0, 0));
+        QTest::qWait(30);
+        QTest::mouseMove(window, sceneCenterOf(stack));
+        QTRY_VERIFY_WITH_TIMEOUT(stack->property("expanded").toBool(), 1500);
+        // 动画一起步就必须 live；终点落定 180 ms 后才关回去（关的那一帧纹理是旧的，
+        // 立刻关会在终点闪一下）。
+        QTRY_VERIFY_WITH_TIMEOUT(stack->property("animating").toBool(), 1000);
+        QVERIFY(stack->property("cardBackdropLive").toBool());
+        // 动画中途抓一帧留证：背景是竖条纹，模糊若被卡片「拖走」或中途闪断，
+        // 取证图上一眼可见。动画已被拉慢到 1.2 s，抓图本身（十几毫秒）不会让它落定。
+        {
+            QTRY_VERIFY_WITH_TIMEOUT(
+                stack->property("progress").toReal() > 0.25
+                && stack->property("progress").toReal() < 0.95, 2000);
+            window->grabWindow().save(evidenceDirectory(window)
+                                      + "/59f-station-stack-mid.png");
+        }
+        // 断言要一路落到**卡片自己**的模糊采样源上：root 的派生属性对，
+        // 不代表 GlassCard::backdropLive 透传下去、更不代表 ShaderEffectSource 真的 live。
+        {
+            auto* card = cardOf(stack->property("frontId").toString());
+            QVERIFY(card);
+            QVERIFY2(card->property("backdropLive").toBool(),
+                     "展开动画期间卡片的玻璃底没有切到 live 逐帧重采样");
+            const bool software = window->rendererInterface()->graphicsApi()
+                                  == QSGRendererInterface::Software;
+            if (!software) {
+                QQuickItem* sample = nullptr;
+                for (auto* item : visualItems(card)) {
+                    if (item->objectName() == QLatin1String("backdropSample")) sample = item;
+                }
+                QVERIFY(sample);
+                QVERIFY2(sample->property("live").toBool(),
+                         "展开动画期间采样纹理没有逐帧重采样（模糊会跟在卡片后面拖影）");
+            }
+        }
+        const qreal gap = stack->property("gap").toReal();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            std::abs(stack->property("progress").toReal() - 1.0) < 0.001, 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(!stack->property("animating").toBool(), 3000);
+        QCOMPARE(stack->property("cardBackdropLive").toBool(),
+                 stack->property("backdropLive").toBool());
+        stack->setProperty("durationOverride", -1);   // 之后按真实时长继续验收回
+        // progress 读数是浮点：容 0.5 px，不从像素级对比几何。
+        QVERIFY2(std::abs(stack->property("width").toReal()
+                          - (cardWidth * ids.size() + gap * (ids.size() - 1))) < 0.5,
+                 qPrintable(QStringLiteral("展开宽度不对：%1")
+                                .arg(stack->property("width").toReal())));
+        {
+            auto* front = cardOf(stack->property("frontId").toString());
+            QVERIFY(front);
+            QVERIFY(std::abs(front->x() - (stack->width() - cardWidth)) < 0.5);
+            QSet<int> seen;
+            for (const QString& id : ids) {
+                auto* card = cardOf(id);
+                QVERIFY(card);
+                const int slot = card->property("slot").toInt();
+                seen.insert(slot);
+                QVERIFY(std::abs(card->y()) < 0.5);
+                // 槽位间隔 = 卡宽 + gap：展开后每张卡都完整可读、互不压叠。
+                QVERIFY2(std::abs(card->x() - (stack->width() - cardWidth
+                                               - slot * (cardWidth + gap))) < 0.5,
+                         qPrintable(QStringLiteral("%1 展开后位置不对：%2")
+                                        .arg(id).arg(card->x())));
+            }
+            QCOMPARE(seen.size(), ids.size());   // 槽位唯一，没有两张卡挤在同一格
+            // 展开态 5 张全部可见（收起态被隐藏的第 4、5 张必须淡回来）。
+            for (const QString& id : ids) {
+                auto* card = cardOf(id);
+                QVERIFY2(card->isVisible() && card->opacity() > 0.99,
+                         qPrintable(QStringLiteral("%1 展开后没有淡入").arg(id)));
+            }
+        }
+        window->grabWindow().save(evidenceDirectory(window) + "/59-station-stack-expanded.png");
+
+        // 7. 收回：指针移开后回到堆叠（320 ms 收起延迟 + 220 ms 动画）。
+        QTest::mouseMove(window, QPoint(0, 0));
+        QTRY_VERIFY_WITH_TIMEOUT(!stack->property("expanded").toBool(), 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            std::abs(stack->property("progress").toReal()) < 0.001, 2000);
+        // 收回后仍然只露 3 张：宽度 = 卡宽 + 2 个纸条边，第 4、5 张重新淡出。
+        QVERIFY(std::abs(stack->property("width").toReal()
+                         - (cardWidth + stack->property("peekX").toReal() * 2)) < 0.5);
+        QTRY_VERIFY(cardOf(ids.at(3)) && cardOf(ids.at(3))->opacity() < 0.01);
+        {
+            auto* front = cardOf(stack->property("frontId").toString());
+            QVERIFY(front);
+            QVERIFY(std::abs(front->x() - (stack->width() - cardWidth)) < 0.5);
+        }
+        window->grabWindow().save(evidenceDirectory(window) + "/59b-station-stack-collapsed.png");
+
+        // 8. 关动画：reduceMotion 打开后展开/收回没有过渡（一次几何直接到位）。
+        //    而且「无动画」这条路径也必须把 animating 收回去 —— 否则 5 张卡会永远
+        //    逐帧重采样背景（每帧重绘整棵地图子树）。
+        window->setProperty("testReduceMotion", true);
+        QTRY_COMPARE(stack->property("expandDuration").toInt(), 0);
+        QTest::mouseMove(window, sceneCenterOf(stack));
+        QTRY_VERIFY_WITH_TIMEOUT(stack->property("expanded").toBool(), 1500);
+        QCOMPARE(stack->property("progress").toReal(), 1.0);
+        QTest::mouseMove(window, QPoint(0, 0));
+        QTRY_VERIFY_WITH_TIMEOUT(!stack->property("expanded").toBool(), 2000);
+        QCOMPARE(stack->property("progress").toReal(), 0.0);
+        QTRY_VERIFY_WITH_TIMEOUT(!stack->property("animating").toBool(), 1500);
+
+        // 9. 窄窗口放不下一整排时退回**竖向**展开：不裁切、不顶出地图左缘。
+        window->resize(500, 480);
+        QTest::qWait(200);
+        QVERIFY2(stack->property("expandVertical").toBool(), "窄窗口应改为竖向展开");
+        QTest::mouseMove(window, sceneCenterOf(stack));
+        QTRY_VERIFY_WITH_TIMEOUT(stack->property("expanded").toBool(), 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            std::abs(stack->property("progress").toReal() - 1.0) < 0.001, 1500);
+        const qreal stackCardHeight = stack->property("cardHeight").toReal();
+        QVERIFY(std::abs(stack->property("width").toReal() - cardWidth) < 0.5);
+        for (const QString& id : ids) {
+            auto* card = cardOf(id);
+            QVERIFY(card);
+            const int slot = card->property("slot").toInt();
+            QVERIFY(std::abs(card->x()) < 0.5);
+            QVERIFY2(std::abs(card->y() - slot * (stackCardHeight + gap)) < 0.5,
+                     qPrintable(QStringLiteral("%1 竖向展开位置不对：%2").arg(id).arg(card->y())));
+            // 右缘不得顶出容器（容器本身贴着地图右缘 16 px 边距）。
+            QVERIFY(card->x() + card->width() <= stack->width() + 0.5);
+        }
+        window->grabWindow().save(evidenceDirectory(window) + "/59c-station-stack-narrow.png");
+        window->resize(900, 480);
+        QTest::qWait(200);
+        QTest::mouseMove(window, QPoint(0, 0));
+        QTRY_VERIFY_WITH_TIMEOUT(!stack->property("expanded").toBool(), 2000);
+
+        // 10. 关掉测站图层 / 没有源时整块不许占位。
+        stack->setProperty("sources", QVariantList());
+        QTRY_COMPARE(stack->width(), 0.0);
+        QTRY_COMPARE(stack->height(), 0.0);
+    }
+
     /// 回归：地图上的 UI 浮层必须盖住测站层（测站层 z=2）。
     /// 曾经右侧工具条没有写 z（默认 0），测站直接画在按钮上面。
     void mapOverlaysStayAboveStationLayer() {
@@ -1673,6 +2076,239 @@ private slots:
         auto* toolbar = window->findChild<QQuickItem*>("mapToolbar");
         QVERIFY(station && toolbar);
         QVERIFY2(toolbar->z() > station->z(), "右侧工具条被测站层盖住");
+
+        // 真实主窗口里也要能悬停展开：地图的 MouseArea 铺满整个视口，
+        // 若它抢走 hover，右上角那摞就永远展不开（夹具用例测不到这一层）。
+        auto* stack = window->findChild<QQuickItem*>("stationStack");
+        QVERIFY(stack);
+        QVERIFY2(stack->z() > station->z(), "测站卡被测站层盖住");
+        QCOMPARE(stack->property("count").toInt(), 5);
+        QCOMPARE(stack->property("frontId").toString(), QStringLiteral("kmoni"));
+        const qreal collapsedWidth = stack->width();
+        const QPoint stackCenter =
+            stack->mapToScene(QPointF(stack->width() / 2, stack->height() / 2)).toPoint();
+        QTest::mouseMove(window, QPoint(0, 0));
+        QTest::qWait(30);
+        QTest::mouseMove(window, stackCenter);
+        QTRY_VERIFY_WITH_TIMEOUT(stack->property("expanded").toBool(), 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(stack->width() > collapsedWidth + 100, 2000);
+        QTest::qWait(150);
+        window->grabWindow().save(evidenceDirectory(window) + "/59d-map-stack-expanded.png");
+        // 指针离开测站卡区域（移到地图中部）→ 收回。
+        QTest::mouseMove(window, QPoint(window->width() / 2, window->height() * 3 / 4));
+        QTRY_VERIFY_WITH_TIMEOUT(!stack->property("expanded").toBool(), 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(stack->width() - collapsedWidth) < 0.5, 2000);
+        QTest::qWait(150);
+        window->grabWindow().save(evidenceDirectory(window) + "/59e-map-stack-collapsed.png");
+    }
+
+    /// 回归：地图上的「震源中心」X 十字与「我的位置」圆点必须压在测站层**之上**。
+    ///
+    /// 用户报告：日本区震中附近测站密，红色十字被整块测站方标盖住，看不出震源中心；
+    /// 中国/韩国同样会中招，只是台网密度低、恰好压在震中的概率小。
+    ///
+    /// 根因不是「z 写小了」，而是 QML 的 z 只在与**同一个父项的兄弟**之间比较：
+    /// 十字与用户点原先都住在 `mapRenderLayer` 里（z:3），而 `StationMapItem` 是该
+    /// 容器的**兄弟**（z:2）。容器内的 z 再大也压不过后绘制的兄弟 —— 上千个测站整片
+    /// 盖在十字上面。给十字加 z、或给测站层减 z 都没有用，只能把它们提出容器。
+    void epicenterAndUserMarkerStayAboveStationLayer() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EpicenterAboveStationsTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+        controller.settings()->setShowStationLayer(true);
+        // 偏开震中 1° 左右：既在取景范围内，又不与 40 px 的十字、38 px 的用户点叠在一起。
+        controller.setManualLocation(31.5, 105.5, "测试定位");
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        auto* layer = window->findChild<komira::StationMapItem*>("stationIntensityLayer");
+        QVERIFY(map && layer);
+
+        EarthquakeEvent e;
+        e.id = e.eventId = "OCCLUDE-A";
+        e.sourceProvider = "Wolfx"; e.sourceAgency = "CENC"; e.source = "中国地震台网";
+        e.timestamp = now - 20'000;
+        e.latitude = 30.0; e.longitude = 104.0;
+        e.depth = 10.0; e.magnitude = 6.0; e.location = "四川雅安";
+        controller.handleEvent(e, false, false);
+        QTRY_VERIFY(map->property("hasEvent").toBool());
+        QTest::qWait(900);   // 等入场取景补间结束
+
+        // 相机钉死到整数层级、进入手动模式：波前逐帧跟随会把镜头带走，像素判据就失效了。
+        QVERIFY(QMetaObject::invokeMethod(map, "moveCamera",
+                                          Q_ARG(QVariant, QVariant(30.6)), Q_ARG(QVariant, QVariant(104.6)),
+                                          Q_ARG(QVariant, QVariant(6.0)), Q_ARG(QVariant, QVariant(0)),
+                                          Q_ARG(QVariant, QVariant())));
+        map->setProperty("following", false);
+        QTest::qWait(200);
+
+        // 震中与我的位置各压一个 CSIS 方标（烈度 4 = 亮蓝 #3FAFFF）：方标是 16–24 px 的
+        // 实心块，恰好整块盖住 40 px 十字的中心与用户点的圆芯 —— 与日本区 NIED 密网同观感。
+        komira::StationSnapshot snapshot;
+        auto stationAt = [](double lat, double lon) {
+            komira::StationSnapshot::Entry s;
+            s.lat = lat; s.lon = lon; s.csis = true; s.raw = 4.0;
+            return s;
+        };
+        snapshot.setEntries({stationAt(30.0, 104.0), stationAt(31.5, 105.5)});
+        layer->setProperty("snapshot", QVariant::fromValue(static_cast<QObject*>(&snapshot)));
+        QTest::qWait(150);
+
+        const QImage img = window->grabWindow();
+        QVERIFY(!img.isNull());
+        const double scale = window->width() > 0
+            ? static_cast<double>(img.width()) / window->width() : 1.0;
+        auto pixel = [&](const QPointF& scenePoint) {
+            const int x = qRound(scenePoint.x() * scale);
+            const int y = qRound(scenePoint.y() * scale);
+            if (x < 0 || y < 0 || x >= img.width() || y >= img.height()) return QColor();
+            return img.pixelColor(x, y);
+        };
+        // 十字的红色描边（#E21D1D）与用户点的实心圆（theme.severity("NORMAL")，浅色 #006874）。
+        auto isCrossRed = [](const QColor& c) {
+            return c.isValid() && c.red() > 170 && c.green() < 90 && c.blue() < 90;
+        };
+        auto isUserTeal = [](const QColor& c) {
+            return c.isValid() && c.red() < 90 && c.green() > 70 && c.blue() > 80;
+        };
+        auto isStationBlue = [](const QColor& c) {
+            return c.isValid() && c.blue() > 200 && c.red() < 130;
+        };
+
+        const double hx = map->property("hypocenterX").toDouble();
+        const double hy = map->property("hypocenterY").toDouble();
+        double ux = 0.0, uy = 0.0;
+        QVERIFY(QMetaObject::invokeMethod(map, "screenX", Q_RETURN_ARG(double, ux),
+                                          Q_ARG(double, 105.5)));
+        QVERIFY(QMetaObject::invokeMethod(map, "screenY", Q_RETURN_ARG(double, uy),
+                                          Q_ARG(double, 31.5)));
+        const QPointF epicenter = map->mapToScene(QPointF(hx, hy));
+        const QPointF userPoint = map->mapToScene(QPointF(ux, uy));
+        // 自检：两个标记都要在窗口内，否则下面的采样会取到窗口外（恒失败但不说明问题）。
+        const QRectF viewport(0, 0, window->width(), window->height());
+        QVERIFY2(viewport.contains(epicenter), "震中不在视口内，用例前提不成立");
+        QVERIFY2(viewport.contains(userPoint), "我的位置不在视口内，用例前提不成立");
+
+        // 十字的两条对角线在中心 ±7 px 处仍是 6 px 红描边；被方标盖住时这里会变成蓝色。
+        // 先自检「确实有测站被画出来」：把方标挪走后该处不能是蓝的（否则判据形同虚设）。
+        const QList<QPointF> probes{
+            epicenter + QPointF(-7, -7), epicenter + QPointF(7, 7),
+            epicenter + QPointF(-7, 7), epicenter + QPointF(7, -7)};
+        int redProbes = 0;
+        int blueProbes = 0;
+        for (const QPointF& p : probes) {
+            const QColor c = pixel(p);
+            if (isCrossRed(c)) ++redProbes;
+            if (isStationBlue(c)) ++blueProbes;
+        }
+        QVERIFY2(redProbes == probes.size(),
+                 qPrintable(QStringLiteral("震中十字被测站盖住：%1/%2 个采样点是红色（蓝 %3）")
+                                .arg(redProbes).arg(probes.size()).arg(blueProbes)));
+        // 用户点同理：圆心必须还是主题自己的颜色，而不是压在它上面的测站方标。
+        QVERIFY2(isUserTeal(pixel(userPoint)),
+                 qPrintable(QStringLiteral("我的位置被测站盖住：圆心像素 %1")
+                                .arg(pixel(userPoint).name())));
+
+        window->grabWindow().save(evidenceDirectory(window) + "/61-epicenter-above-stations.png");
+
+        // 对照：关掉测站层后同一批采样点仍应是红色/主题色 —— 证明判据测的是「谁画在上面」，
+        // 而不是「恰好那里是红的」。
+        controller.settings()->setShowStationLayer(false);
+        QTest::qWait(150);
+        const QImage noStations = window->grabWindow();
+        const double scale2 = window->width() > 0
+            ? static_cast<double>(noStations.width()) / window->width() : 1.0;
+        auto pixel2 = [&](const QPointF& scenePoint) {
+            const int x = qRound(scenePoint.x() * scale2);
+            const int y = qRound(scenePoint.y() * scale2);
+            if (x < 0 || y < 0 || x >= noStations.width() || y >= noStations.height()) return QColor();
+            return noStations.pixelColor(x, y);
+        };
+        for (const QPointF& p : probes) {
+            QVERIFY2(isCrossRed(pixel2(p)),
+                     qPrintable(QStringLiteral("无测站时震中十字也不红：%1").arg(pixel2(p).name())));
+        }
+        QVERIFY2(isUserTeal(pixel2(userPoint)),
+                 qPrintable(QStringLiteral("无测站时我的位置也不可见：%1").arg(pixel2(userPoint).name())));
+
+        // 用户报的是「日本区域」，中国只是同源缺陷的另一处现场：再跑一遍日本震中，
+        // 证明修复与经纬度无关（日本恰好在 GCJ-02 纠偏 bbox 之外，坐标不做平移）。
+        controller.settings()->setShowStationLayer(true);
+        EarthquakeEvent jp;
+        jp.id = jp.eventId = "OCCLUDE-B";
+        jp.sourceProvider = "Wolfx"; jp.sourceAgency = "JMA"; jp.source = "NIED";
+        jp.timestamp = now + 60'000;
+        jp.latitude = 35.68; jp.longitude = 139.76;   // 東京湾北部
+        jp.depth = 80.0; jp.magnitude = 5.4; jp.location = "東京都千代田区";
+        controller.handleEvent(jp, false, false);
+        QTRY_VERIFY(map->property("hasEvent").toBool());
+        QTest::qWait(900);
+        QVERIFY(QMetaObject::invokeMethod(map, "moveCamera",
+                                          Q_ARG(QVariant, QVariant(35.9)), Q_ARG(QVariant, QVariant(139.9)),
+                                          Q_ARG(QVariant, QVariant(7.0)), Q_ARG(QVariant, QVariant(0)),
+                                          Q_ARG(QVariant, QVariant())));
+        map->setProperty("following", false);
+        QTest::qWait(200);
+
+        komira::StationSnapshot jpSnapshot;
+        // 复刻日本现场：NIED 圆点本身只有 5 px，单独一个盖不满十字；日本区的问题是
+        // **密网**——0.05° 间距（z7 约 4.5 px）的 K-NET/KiK-net 阵列铺满整片，圆点
+        // 互相叠成实心色块，十字整根消失。用 9×9 阵列而不是单站，判据才对得上用户看到的现象。
+        std::vector<komira::StationSnapshot::Entry> jpEntries;
+        for (int i = -4; i <= 4; ++i) {
+            for (int j = -4; j <= 4; ++j) {
+                komira::StationSnapshot::Entry s;
+                s.lat = 35.68 + i * 0.05;
+                s.lon = 139.76 + j * 0.05;
+                s.csis = false;   // NIED 连续震度 → 色阶圆点
+                s.raw = 4.5;
+                jpEntries.push_back(s);
+            }
+        }
+        jpSnapshot.setEntries(std::move(jpEntries));
+        layer->setProperty("snapshot", QVariant::fromValue(static_cast<QObject*>(&jpSnapshot)));
+        QTest::qWait(150);
+
+        const QImage jpImage = window->grabWindow();
+        const double jpScale = window->width() > 0
+            ? static_cast<double>(jpImage.width()) / window->width() : 1.0;
+        auto jpPixel = [&](const QPointF& scenePoint) {
+            const int x = qRound(scenePoint.x() * jpScale);
+            const int y = qRound(scenePoint.y() * jpScale);
+            if (x < 0 || y < 0 || x >= jpImage.width() || y >= jpImage.height()) return QColor();
+            return jpImage.pixelColor(x, y);
+        };
+        const QPointF jpEpicenter = map->mapToScene(
+            QPointF(map->property("hypocenterX").toDouble(),
+                    map->property("hypocenterY").toDouble()));
+        QVERIFY2(viewport.contains(jpEpicenter), "日本震中不在视口内，用例前提不成立");
+        int jpRed = 0;
+        for (const QPointF& p : probes) {
+            if (isCrossRed(jpPixel(jpEpicenter + (p - epicenter)))) ++jpRed;
+        }
+        QVERIFY2(jpRed == probes.size(),
+                 qPrintable(QStringLiteral("日本区震中十字被测站盖住：%1/%2 个采样点是红色")
+                                .arg(jpRed).arg(probes.size())));
+        window->grabWindow().save(evidenceDirectory(window) + "/61b-epicenter-japan-above-stations.png");
     }
 
     /// 回归：测站图层必须真的画出内容，且与 QML 的 screenX/screenY 同源。
@@ -3392,6 +4028,90 @@ private slots:
         QVERIFY2(qmlErrors.isEmpty(), qPrintable(qmlErrors.join('\n')));
     }
 
+    // 侧栏只展示稳定的历史目录：实时预警不产生行（它只留在 HUD/地图）。
+    // 同时验收卡片信息层级（距离列）与无定位时「500 km 内」不可选。
+    void catalogListShowsStableHistoryOnly() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("CatalogListTest");
+        AppController controller(nullptr, false);
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+
+        EarthquakeEvent live;
+        live.id = live.eventId = "LIVE-1";
+        live.sourceAgency = "JMA";
+        live.source = "JMA 紧急地震速报";
+        live.timestamp = now;
+        live.reportTime = now;
+        live.latitude = 36.0; live.longitude = 140.0;
+        live.magnitude = 6.0;
+        live.location = "实时测试预警";
+        controller.handleEvent(live, false, false);
+
+        EarthquakeEvent catalog;
+        catalog.id = catalog.eventId = "CAT-1";
+        catalog.sourceAgency = "CENC";
+        catalog.source = "中国地震台网 地震信息";
+        catalog.timestamp = now;
+        catalog.reportTime = now;
+        catalog.latitude = 30.0; catalog.longitude = 104.0;
+        catalog.magnitude = 4.6;
+        catalog.location = "四川测试震中";
+        controller.handleEvent(catalog, false, true);
+
+        QQmlApplicationEngine engine;
+        QStringList qmlErrors;
+        connect(&engine, &QQmlEngine::warnings, this, [&](const QList<QQmlError>& warnings) {
+            for (const auto& warning : warnings) {
+                const auto message = warning.toString();
+                if (message.contains("EventTile.qml") || message.contains("EventListSidebar.qml")
+                    || message.contains("TypeError") || message.contains("ReferenceError")
+                    || message.contains("Binding loop"))
+                    qmlErrors.append(message);
+            }
+        });
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showList", true);
+        QTRY_COMPARE(controller.eventModel()->rowCount(), 1);
+        QTest::qWait(150);
+
+        auto* sidebar = window->findChild<QQuickItem*>("eventSidebar");
+        QVERIFY(sidebar);
+        bool sawCatalog = false;
+        bool sawLive = false;
+        for (auto* item : visualItems(sidebar)) {
+            const QString text = item->property("text").toString();
+            if (text == QStringLiteral("四川测试震中")) sawCatalog = true;
+            if (text == QStringLiteral("实时测试预警")) sawLive = true;
+        }
+        QVERIFY(sawCatalog);
+        QVERIFY2(!sawLive, "实时预警不应出现在历史列表里");
+        QString offender;
+        QVERIFY2(timesFullyShown(sidebar, &offender),
+                 qPrintable("列表发震时刻被截断: " + offender));
+        // 无定位：「500 km 内」禁用（行上根本没有距离，选它只会得到空列表）。
+        QQuickItem* within = nullptr;
+        for (auto* item : visualItems(sidebar)) {
+            if (item->property("text").toString() == QStringLiteral("500 km 内")) within = item;
+        }
+        QVERIFY(within);
+        QVERIFY(!within->isEnabled());
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/12-event-list-catalog.png"));
+        QVERIFY2(qmlErrors.isEmpty(), qPrintable(qmlErrors.join('\n')));
+    }
+
     // 分级提醒信号：同一帧实时事件按是否达到本地门槛归入 alert / eew；目录事件归 info。
     void notificationTiersEmitPerEventKind() {
         QTemporaryDir isolated;
@@ -3446,7 +4166,8 @@ private slots:
         controller.handleEvent(info, false, true);
         QCOMPARE(tiers.count(), 3);
 
-        // 逐源震级过滤：Wolfx 设为「不接收」后，它的目录事件不入库、不通知。
+        // 逐源震级过滤在展示层求值：Wolfx 设为「不接收」后，目录照常入库（改回阈值能
+        // 立刻重新出现），只是不进列表、不通知。
         WolfxSource probe;
         controller.settings()->setInfoMagnitudeFilter(QStringLiteral("wolfx"), -1.0);
         EarthquakeEvent filtered = makeEvent("FILTERED-1", 3.0);
@@ -3454,16 +4175,26 @@ private slots:
         filtered.longitude = 110.0;
         filtered.timestamp = now + 2000;
         filtered.reportTime = now;
-        const int before = controller.eventList().size();
+        const auto displayed = [&controller](const QString& eventId) {
+            for (const QVariant& entry : controller.eventList()) {
+                if (entry.toMap().value(QStringLiteral("id")).toString() ==
+                    QStringLiteral("TEST|") + eventId)
+                    return true;
+            }
+            return false;
+        };
         controller.handleEvent(filtered, false, true, &probe);
-        QCOMPARE(controller.eventList().size(), before);
+        QVERIFY(!displayed(QStringLiteral("FILTERED-1")));
+        // 行模型同样要重筛（展示层过滤 + 0 ms 合并刷新）。
+        QTRY_COMPARE(controller.eventModel()->rowCount(), 1);   // 只剩 INFO-1
         QCOMPARE(tiers.count(), 3);
 
-        // 回到不过滤后同一条事件重新入库并通知一次。
+        // 改回不过滤：同一条记录立即重新出现在列表里。它是已入库的旧闻，
+        // 不补发提醒（否则调低阈值会被历史事件刷屏）。
         controller.settings()->setInfoMagnitudeFilter(QStringLiteral("wolfx"), 0.0);
-        controller.handleEvent(filtered, false, true, &probe);
-        QCOMPARE(tiers.count(), 4);
-        QCOMPARE(tiers.at(3).at(1).toString(), QStringLiteral("info"));
+        QTRY_COMPARE(controller.eventModel()->rowCount(), 2);
+        QVERIFY(displayed(QStringLiteral("FILTERED-1")));
+        QCOMPARE(tiers.count(), 3);
     }
 
     // 新增控件必须真的写回设置：提醒矩阵、播报分轨、关闭到托盘各点一次。
@@ -3525,12 +4256,293 @@ private slots:
         QVERIFY(click("closeToTraySwitch"));
         QTRY_VERIFY(!controller.settings()->closeToTray());
 
+        // 数据源 → 子数据源（索引 6）：默认折叠，展开后逐项落盘且跨源同名频道互不影响。
+        page->setProperty("currentSection", 6);
+        QTest::qWait(80);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/56-settings-sources-split.png"));
+        QVERIFY(controller.settings()->isSubSourceEnabled("wolfx", "jma_eew"));
+        QVERIFY(click("wolfxSubHeader"));
+        QTRY_VERIFY(findVisualItem(window, "wolfxSub-jma_eew"));
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/57-settings-sources-subs.png"));
+        QVERIFY(click("wolfxSub-jma_eew"));
+        QTRY_VERIFY(!controller.settings()->isSubSourceEnabled("wolfx", "jma_eew"));
+        QVERIFY(controller.settings()->isSubSourceEnabled("whews", "jma_eew"));
+        // 分组「全开」恢复整组；展开状态不因 app.sources 重建而丢失（按钮仍可找到）。
+        QVERIFY(click("wolfxSubAll-live"));
+        QTRY_VERIFY(controller.settings()->isSubSourceEnabled("wolfx", "jma_eew"));
+        QVERIFY(findVisualItem(window, "wolfxSub-jma_eew"));
+
+        // 左右分栏：左栏点选源，右栏详情随之切换；密钥与子源仍在该源自己的详情里。
+        QVERIFY(findVisualItem(window, "sourceNav-wolfx"));
+        QVERIFY(click("sourceNav-pancakes"));
+        QTRY_VERIFY(findVisualItem(window, "pancakesSwitch"));
+        QVERIFY(!findVisualItem(window, "wolfxSwitch"));
+        QVERIFY(click("sourceNav-jian"));
+        QTRY_VERIFY(findVisualItem(window, "jianLoginField"));
+        // 切回 Wolfx：换源会收起子源面板，展开后仍可操作。
+        QVERIFY(click("sourceNav-wolfx"));
+        QTRY_VERIFY(findVisualItem(window, "wolfxSwitch"));
+        QVERIFY(!findVisualItem(window, "wolfxSub-jma_eew")->isVisible());
+
+        // 版面必须读成**一整块**：左右两列住在同一张卡里，卡高由两列较高者决定。
+        // 旧版是「独立的左栏卡 + 独立的右栏卡」：两卡各长各的，接缝处两条描边对不齐、
+        // 左栏下面空出一截 —— 那正是「分栏没弄好」的观感来源。
+        auto* navCard = findVisualItem(window, "sourceNavCard");
+        auto* detail = findVisualItem(window, "sourceDetailCard");
+        auto* splitRow = findVisualItem(window, "sourceSplitRow");
+        auto* splitCard = findVisualItem(window, "sourceSplitCard");
+        auto* divider = findVisualItem(window, "sourceSplitDivider");
+        QVERIFY(navCard && detail && splitRow && splitCard && divider);
+        QVERIFY(navCard->isVisible());
+        QVERIFY(divider->isVisible());
+        const QPointF navTop = navCard->mapToScene(QPointF(0, 0));
+        const QPointF detailTop = detail->mapToScene(QPointF(0, 0));
+        QVERIFY(navTop.x() < detailTop.x());
+        QCOMPARE(navTop.y(), detailTop.y());
+        QCOMPARE(navCard->height(), detail->height());
+        QCOMPARE(detail->mapToItem(splitRow, QPointF(detail->width(), 0)).x(),
+                 splitRow->width());
+        // 两列都在卡内、都被卡的圆角包住：任何一列的边缘越出卡就是「卡中卡」。
+        for (auto* column : {navCard, detail}) {
+            const QRectF inside(column->mapToItem(splitCard, QPointF(0, 0)),
+                                QSizeF(column->width(), column->height()));
+            QVERIFY2(inside.left() >= -0.5 && inside.right() <= splitCard->width() + 0.5
+                         && inside.top() >= -0.5 && inside.bottom() <= splitCard->height() + 0.5,
+                     qPrintable(QStringLiteral("列越出卡片: %1 x %2 @ (%3,%4) / 卡 %5 x %6")
+                                    .arg(inside.width()).arg(inside.height())
+                                    .arg(inside.left()).arg(inside.top())
+                                    .arg(splitCard->width()).arg(splitCard->height())));
+        }
+        // 分隔线落在两列之间、且与两列等高（它划出边界，不能只画一半）。
+        QVERIFY(divider->mapToItem(splitRow, QPointF(0, 0)).x() > navCard->width() - 1);
+        QCOMPARE(divider->height(), splitRow->height());
+        // 卡外不该再有第二张「事件源」卡：整块分栏只有 sourceSplitCard 一张。
+        int sourceCards = 0;
+        for (auto* item : visualItems(window->contentItem())) {
+            if (item->objectName() == "sourceSplitCard" && item->isVisible()) ++sourceCards;
+        }
+        QCOMPARE(sourceCards, 1);
+
+        // 长内容不靠「把卡片和页面一起撑长」：Whews 有近 40 个子源，展开后必须落在
+        // 卡片内部滚动，卡片高度封顶（否则整页会被拉成几千像素的滚动条）。
+        QVERIFY(click("sourceNav-whews"));
+        QTRY_VERIFY(findVisualItem(window, "whewsSwitch"));
+        QVERIFY(click("whewsSubHeader"));
+        auto* detailScroll = findVisualItem(window, "sourceDetailScroll");
+        QVERIFY(detailScroll);
+        QTRY_VERIFY(detailScroll->property("contentHeight").toReal()
+                    > detailScroll->height() + 50);
+        QVERIFY2(detail->height() <= 560,
+                 qPrintable(QStringLiteral("右栏高度未封顶: %1").arg(detail->height())));
+        QCOMPARE(navCard->height(), detail->height());
+        // 滚动条是「下面还有内容」的唯一提示，必须真的存在且落在卡片内。
+        auto* detailBar = findVisualItem(window, "sourceDetailScrollBar");
+        QVERIFY(detailBar);
+        QVERIFY(detailBar->width() > 0);
+        QVERIFY(detailBar->mapToItem(detail, QPointF(0, 0)).x() < detail->width());
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/57b-settings-sources-whews.png"));
+        QVERIFY(click("sourceNav-wolfx"));
+        QTRY_VERIFY(findVisualItem(window, "wolfxSwitch"));
+
+        // ── 延迟显示 ────────────────────────────────────────────────────────
+        // 设置页此前对四个源永远看不到延迟（只有 Wolfx 曾经 ping 过，其余三个源连
+        // pong 都没接）。链路层由 qt_business 的 everyEventSourceMeasuresLinkLatency
+        // 覆盖；这里断言的是**显示层**：有了延迟数值之后，左栏行与右栏状态行都要出现，
+        // 没有时不占位（不显示「— ms」，那对用户只是噪声）。
+        auto* section = findVisualItem(window, "settingsPanel-source");
+        auto* latencyLabel = findVisualItem(window, "sourceLatencyLabel");
+        auto* navLatency = findVisualItem(window, "sourceNavLatency-wolfx");
+        QVERIFY(section && latencyLabel && navLatency);
+
+        // 快照里必须是**数值**字段：字符串比较（`latency !== "— ms"`）既脆弱又拿不到
+        // 数值，做不了「只在一个区间内才算良好」这类判断。
+        bool sawLatencyKeys = false;
+        for (const auto& item : controller.sources()) {
+            const QVariantMap map = item.toMap();
+            if (map["id"].toString() != "wolfx") continue;
+            sawLatencyKeys = map.contains("latencyMs") && map.contains("directoryLatencyMs")
+                && map["latencyMs"].toLongLong() < 0 == (map["latencyText"].toString().isEmpty());
+        }
+        QVERIFY2(sawLatencyKeys, "源快照缺少 latencyMs / directoryLatencyMs 数值字段");
+
+        // 用一张假的源快照直接驱动详情卡：不依赖真实网络状态，断言的是排版逻辑。
+        QVariantMap fakeSource;
+        fakeSource["id"] = "wolfx";
+        fakeSource["name"] = "Wolfx";
+        fakeSource["enabled"] = true;
+        fakeSource["configured"] = true;
+        fakeSource["status"] = "在线";
+        fakeSource["statusTag"] = "CONNECTED";
+        fakeSource["latencyMs"] = 42;
+        fakeSource["latencyText"] = "42 ms";
+        fakeSource["directoryLatencyMs"] = 118;
+        fakeSource["directoryLatencyText"] = "118 ms";
+        fakeSource["directory"] = "目录刷新成功";
+        fakeSource["directoryStatusTag"] = "NORMAL";
+        fakeSource["description"] = "Wolfx all_eew 聚合（CENC/SC/JMA/CWA/FJ/CQ）";
+        fakeSource["region"] = "全球";
+        fakeSource["subSources"] = QVariantList{};
+
+        // 左栏行的文案由 SourceSection.sourceLatencyText 统一生成（两处口径必须一致）。
+        QVariant leftText;
+        QVERIFY(QMetaObject::invokeMethod(section, "sourceLatencyText",
+                                          Q_RETURN_ARG(QVariant, leftText),
+                                          Q_ARG(QVariant, fakeSource)));
+        QCOMPARE(leftText.toString(), QStringLiteral("实时 42 ms · 目录 118 ms"));
+
+        // 详情卡：把 source 换掉后，状态行右侧必须出现同样的延迟文本。
+        auto* detailItem = findVisualItem(window, "sourceDetailCard");
+        QVERIFY(detailItem);
+        QQuickItem* detailCardItem = nullptr;
+        for (auto* child : detailItem->childItems()) {
+            if (child->property("source").isValid()) { detailCardItem = child; break; }
+        }
+        QVERIFY(detailCardItem);
+        const QVariant savedSource = detailCardItem->property("source");
+        detailCardItem->setProperty("source", fakeSource);
+        QTRY_VERIFY(latencyLabel->isVisible());
+        QCOMPARE(latencyLabel->property("text").toString(),
+                 QStringLiteral("实时 42 ms · 目录 118 ms"));
+        // 只测出实时、目录还没刷新过：只显示实时那一段。
+        fakeSource["directoryLatencyMs"] = -1;
+        fakeSource["directoryLatencyText"] = "";
+        detailCardItem->setProperty("source", fakeSource);
+        QTRY_COMPARE(latencyLabel->property("text").toString(), QStringLiteral("实时 42 ms"));
+        // 一个都没测出（-1 = 未测出）：整行不占位，不能写成「— ms」。
+        fakeSource["latencyMs"] = -1;
+        fakeSource["latencyText"] = "";
+        detailCardItem->setProperty("source", fakeSource);
+        QTRY_VERIFY(!latencyLabel->isVisible());
+        QVERIFY(latencyLabel->property("text").toString().isEmpty());
+        // 还原真实快照，后面的取证与断言继续按真实状态走。
+        detailCardItem->setProperty("source", savedSource);
+
+        // 退化路径：没有延迟时整行隐藏，左栏那一行也不出现 —— 两处都不得留一格空白。
+        QVERIFY(QMetaObject::invokeMethod(section, "sourceLatencyText",
+                                          Q_RETURN_ARG(QVariant, leftText),
+                                          Q_ARG(QVariant, QVariantMap(fakeSource))));
+        QVERIFY(leftText.toString().isEmpty());
+
+        // 深色主题下的取证：分栏卡的底色必须跟着主题走。若卡片自己没注入 theme，
+        // 深色主题下会挂着一张浅色卡（浅字 + 白底，几乎全糊）——只能靠看图发现。
+        controller.settings()->setThemeMode("dark");
+        QTest::qWait(120);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/56b-settings-sources-dark.png"));
+        controller.settings()->setThemeMode("light");
+        QTest::qWait(120);
+
         // 恢复默认后全部回到初始值。
         controller.settings()->resetToDefaults();
         QVERIFY(controller.settings()->notifyAlert());
         QVERIFY(!controller.settings()->raiseAlert());
         QVERIFY(controller.settings()->announceCountdown());
         QVERIFY(controller.settings()->closeToTray());
+        QVERIFY(controller.settings()->disabledSubSources().isEmpty());
+    }
+
+    // 「数据源」分区的延迟必须真的显示出来。
+    //
+    // 端到端链路：本机 QWebSocketServer（按 RFC 6455 自动回 pong）→ 真实 WolfxSource →
+    // AppController 快照 → QML 左栏行 + 右栏状态行。断言两处文本是同一组数字，格式为
+    // 「实时 N ms」，而**不是**恒空的占位。
+    //
+    // 钉住的原缺陷：`latencyMs` 此前对除 Wolfx 以外的源恒为 -1（没人 ping），而 QML 用
+    // 字符串 `!== "— ms"` 判空 —— 于是「延迟」这一栏在设置页里从来没见过。
+    //
+    // **踩坑**：左栏行是 Repeater 的 delegate，`app.sources` 一变整批 delegate 就被销毁
+    // 重建。任何 `qWait`/`QTRY_*` 之后都不能复用之前抓到的指针（会 SEGV），必须重新
+    // `findVisualItem`。这条经验对设置页里所有 Repeater 委托都成立。
+    void sourceLatencyIsVisibleInSettings() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("SourceLatencyTest");
+
+        // 本机对端：只做 ping/pong，不收发业务帧。
+        QWebSocketServer server(QStringLiteral("komira-latency-ui-test"),
+                                QWebSocketServer::NonSecureMode);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QObject::connect(&server, &QWebSocketServer::newConnection, &server, [&server]() {
+            while (server.hasPendingConnections()) {
+                auto* peer = server.nextPendingConnection();
+                QObject::connect(peer, &QWebSocket::disconnected, peer, &QWebSocket::deleteLater);
+            }
+        });
+        const QUrl url(QStringLiteral("ws://127.0.0.1:%1").arg(server.serverPort()));
+
+        AppController controller(nullptr, false);
+        auto* wolfx = controller.sources_.at(0);
+        QCOMPARE(wolfx->id(), QStringLiteral("wolfx"));
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showSettings", true);
+        auto* page = window->findChild<QQuickItem*>("settingsPage");
+        QVERIFY(page);
+        page->setProperty("currentSection", 6);
+        QTest::qWait(150);
+
+        QVERIFY(findVisualItem(window, "settingsPanel-source"));
+        // 未连接时：没有延迟可显示，左栏那一行必须隐藏（不留空白、也不写「— ms」）。
+        {
+            auto* navLatency = findVisualItem(window, "sourceNavLatency-wolfx");
+            QVERIFY(navLatency);
+            QVERIFY(!navLatency->isVisible());
+        }
+
+        // 真连一条本机链路：探针拿到 pong 后，源快照的 `latencyMs` 变成 >= 0。
+        auto* source = static_cast<WolfxSource*>(wolfx);
+        source->running_ = true;
+        source->generation_ = 1;
+        auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, source);
+        source->socket_ = socket;
+        source->attachSocketHandlers(socket, /*generation*/ 1, ++source->attempt_);
+        socket->open(url);
+        QTRY_VERIFY_WITH_TIMEOUT(source->info().latencyMs >= 0, 6000);
+
+        // 走到这里 `app.sources` 已随 250 ms 合并定时器重建过若干次，之前抓的 item 全部
+        // 失效 —— 一律重新查（见函数头的踩坑说明）。
+        QTest::qWait(400);   // 等一次 statusChanged 落地
+        auto* navLatency = findVisualItem(window, "sourceNavLatency-wolfx");
+        QVERIFY(navLatency);
+        QTRY_VERIFY(navLatency->isVisible());
+        const QString navText = navLatency->property("text").toString();
+        QVERIFY2(navText.startsWith(QStringLiteral("实时 ")),
+                 qPrintable(QStringLiteral("左栏延迟文案不对: %1").arg(navText)));
+        QVERIFY2(navText.contains(QStringLiteral(" ms")), qPrintable(navText));
+        QVERIFY2(!navText.contains(QStringLiteral("—")), qPrintable(navText));
+
+        // 右栏状态行同一组数字：两处口径必须一致，不能「一边有、一边空」。
+        auto* detailLabel = findVisualItem(window, "sourceLatencyLabel");
+        QVERIFY(detailLabel);
+        QTRY_VERIFY(detailLabel->isVisible());
+        QCOMPARE(detailLabel->property("text").toString(), navText);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/58-settings-sources-latency.png"));
+
+        // 关掉源：延迟必须立刻收起（旧值不能冒充当前状况）。
+        source->stop();
+        QVERIFY(source->info().latencyMs < 0);
+        QTest::qWait(400);
+        // delegate 已重建，重新查。
+        auto* detailLabel2 = findVisualItem(window, "sourceLatencyLabel");
+        auto* navLatency2 = findVisualItem(window, "sourceNavLatency-wolfx");
+        QVERIFY(detailLabel2 && navLatency2);
+        QTRY_VERIFY(!detailLabel2->isVisible());
+        QVERIFY(!navLatency2->isVisible());
+        QVERIFY(detailLabel2->property("text").toString().isEmpty());
     }
 
     void mapLayerSettingsAndVectorOverlay() {
@@ -3924,22 +4936,25 @@ private slots:
         QCOMPARE(focusedId(), QString::fromStdString(jma2.identity()));
     }
 
-    /// USGS 与 GQ 的同一场地震被权威机构同报时，目录合并必须保留权威那一条。
-    void mergedDirectoryPrefersAuthoritativeAgency() {
+    /// 目录去重只认「同一份上游报文的重复聚合链路」：同机构 + 同一上游事件 ID。
+    /// 同机构、震中邻近但事件 ID 不同的记录必须各自保留 —— 附近连续两场小地震
+    /// 不能被压成一条，也不能让「最佳记录」覆盖掉另一条的时间/震级。
+    void catalogKeepsDistinctSourceRecords() {
         QTemporaryDir isolated;
         QVERIFY(isolated.isValid());
         qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
         QCoreApplication::setOrganizationName("KomiraQuakeTest");
-        QCoreApplication::setApplicationName("MergePriorityTest");
+        QCoreApplication::setApplicationName("CatalogDedupTest");
         AppController controller(nullptr, false);
         const long long now = 1'800'000'000'000LL;
         controller.nowProvider_ = [&] { return now; };
         controller.settings()->setEnableSoundAlert(false);
 
         EarthquakeEvent usgs;
-        usgs.id = usgs.eventId = "USGS-SAME";
+        usgs.id = "pancakes_usgs_A";
+        usgs.eventId = "usgs:us7000abcd";
         usgs.sourceProvider = "Pancakes"; usgs.sourceAgency = "USGS";
         usgs.source = "USGS 地震信息";
         usgs.timestamp = now; usgs.reportTime = now;
@@ -3947,28 +4962,205 @@ private slots:
         usgs.location = "四川";
         controller.handleEvent(usgs, false, true);
 
-        // 同一次地震（同发震时刻 + 同震中），JMA 的报更早推送，但机构更权威。
+        // 同一份上游报文的另一条聚合链路：eventId 只差频道前缀，仍应合成一条并保留两个来源。
+        EarthquakeEvent relayed = usgs;
+        relayed.id = "wolfx_usgs_A";
+        relayed.eventId = "us7000abcd";
+        relayed.sourceProvider = "Wolfx";
+        relayed.reportTime = now - 5000;
+        relayed.magnitude = 5.5;
+        controller.handleEvent(relayed, false, true);
+
+        // 同机构、20 s 后、约 4 km 外的另一场地震：事件 ID 不同 → 必须独立保留。
+        EarthquakeEvent nearby = usgs;
+        nearby.id = "pancakes_usgs_B";
+        nearby.eventId = "usgs:us7000abce";
+        nearby.timestamp = now + 20'000;
+        nearby.reportTime = now + 20'000;
+        nearby.latitude = 30.04; nearby.longitude = 104.0;
+        nearby.magnitude = 4.1;
+        controller.handleEvent(nearby, false, true);
+
+        // 不同机构即使时间和震中相同，也要保留为独立记录。
         EarthquakeEvent jma = usgs;
-        jma.id = jma.eventId = "JMA-SAME";
+        jma.id = "wolfx_jma_A";
+        jma.eventId = "jma_eqlist:20240101";
+        jma.sourceProvider = "Wolfx";
         jma.sourceAgency = "JMA";
         jma.source = "JMA 地震情报";
-        jma.reportTime = now - 5000;
+        jma.reportTime = now - 4000;
         jma.magnitude = 5.5;
         controller.handleEvent(jma, false, true);
 
         const QVariantList list = controller.eventList();
-        int matches = 0;
-        QString picked;
+        QCOMPARE(list.size(), 3);
+
+        QVariantMap merged;
+        QVariantMap nearbyRow;
         for (const QVariant& entry : list) {
             const QVariantMap map = entry.toMap();
-            if (std::abs(map.value("latitude").toDouble() - 30.0) < 0.2) {
-                ++matches;
-                picked = map.value("source").toString();
-            }
+            if (map.value("magnitude").toDouble() == 5.6) merged = map;
+            if (map.value("magnitude").toDouble() == 4.1) nearbyRow = map;
         }
-        QCOMPARE(matches, 1);   // 同一场地震只保留一条
-        // 权威机构的条目胜出（USGS 那条被合并掉）。
-        QCOMPARE(picked, QStringLiteral("JMA 地震情报"));
+        QVERIFY(!merged.isEmpty());
+        QVERIFY(!nearbyRow.isEmpty());
+        const QStringList sourceTags = merged.value("sourceTags").toStringList();
+        QVERIFY(sourceTags.contains(QStringLiteral("Pancakes·USGS")));
+        QVERIFY(sourceTags.contains(QStringLiteral("Wolfx·USGS")));
+        // 邻近事件没有被并入上面那条：时刻、震级都是它自己的。
+        QCOMPARE(nearbyRow.value("timestamp").toLongLong(), now + 20'000);
+        QCOMPARE(nearbyRow.value("sourceTags").toStringList(),
+                 QStringList{QStringLiteral("Pancakes·USGS")});
+    }
+
+    /// CENC 会按分发链路给同一场地震不同的 EventID（中段是各链路的报文时刻，不是发震
+    /// 时刻）：2026-10-22 22:33:39 的 M7.0 在 Wolfx 是 `AU.20261022223344.0`、在 Jian 是
+    /// `CC.20261022224454.0`。ID 对不上，但同机构 + 同发震时刻 + 同震中仍是同一事件，
+    /// 必须合成一条；同秒却震中相距很远的记录照旧各占一行。
+    void catalogMergesCencCrossChannelIds() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("CatalogCencIdTest");
+        AppController controller(nullptr, false);
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+
+        EarthquakeEvent wolfx;
+        wolfx.id = "cenc_AU.20261022223344.0";
+        wolfx.eventId = "AU.20261022223344.0";
+        wolfx.source = "中国地震台网 地震信息";
+        wolfx.sourceProvider = "Wolfx";
+        wolfx.sourceAgency = "CENC";
+        wolfx.sourceId = "wolfx";
+        wolfx.timestamp = now;
+        wolfx.reportTime = now - 600'000;
+        wolfx.latitude = 32.40;
+        wolfx.longitude = 93.79;
+        wolfx.depth = 10.0;
+        wolfx.magnitude = 7.0;
+        wolfx.location = "西藏那曲市巴青县";
+        wolfx.maxIntensityRaw = 9.0;
+        wolfx.maxIntensityText = "IX";
+        controller.handleEvent(wolfx, false, true);
+
+        // 同一份报文的另一条链路：只有上游 ID 不同。
+        EarthquakeEvent jian = wolfx;
+        jian.id = "cenc_CC.20261022224454.0";
+        jian.eventId = "CC.20261022224454.0";
+        jian.sourceProvider = "Jian";
+        jian.sourceId = "jian";
+        jian.maxIntensityRaw = 0.0;
+        jian.maxIntensityText.clear();
+        controller.handleEvent(jian, false, true);
+
+        // 同机构、同一秒、但震中 700 km 外：不是同一场地震，必须独立成行。
+        EarthquakeEvent other = wolfx;
+        other.id = "cenc_AU.20261022223344.7";
+        other.eventId = "AU.20261022223344.7";
+        other.latitude = 39.20;
+        other.longitude = 100.10;
+        other.magnitude = 3.2;
+        controller.handleEvent(other, false, true);
+
+        const QVariantList list = controller.eventList();
+        QCOMPARE(list.size(), 2);
+
+        QVariantMap merged;
+        QVariantMap otherRow;
+        for (const QVariant& entry : list) {
+            const QVariantMap map = entry.toMap();
+            if (map.value("magnitude").toDouble() == 7.0) merged = map;
+            if (map.value("magnitude").toDouble() == 3.2) otherRow = map;
+        }
+        QVERIFY(!merged.isEmpty());
+        QVERIFY(!otherRow.isEmpty());
+        const QStringList tags = merged.value("sourceTags").toStringList();
+        QCOMPARE(tags.size(), 2);
+        QVERIFY(tags.contains(QStringLiteral("Wolfx·CENC")));
+        QVERIFY(tags.contains(QStringLiteral("Jian·CENC")));
+        QCOMPARE(otherRow.value("sourceTags").toStringList(),
+                 QStringList{QStringLiteral("Wolfx·CENC")});
+    }
+
+    /// 同一条速报在两条链路里的秒数处理不同：Wolfx 的 cenc_eqlist 保留秒
+    /// （`16:47:57`），Whews / Jian 只到分钟（`16:47:00`），上游 ID 也各不相同。
+    /// 列表里必须仍然是**一行**（来源标签两条），否则同一场地震会被显示两次。
+    /// 分钟相同但震中相距 100 km 的另一场地震照旧独立。
+    void catalogMergesMinuteTruncatedInfoLinks() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("CatalogMinuteMergeTest");
+        AppController controller(nullptr, false);
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+        const long long minute = (now / 60'000) * 60'000;
+
+        EarthquakeEvent wolfx;
+        wolfx.id = "cenc_CD.20261024164757.9";
+        wolfx.eventId = "CD.20261024164757.9";
+        wolfx.source = "中国地震台网 地震信息";
+        wolfx.sourceProvider = "Wolfx";
+        wolfx.sourceAgency = "CENC";
+        wolfx.sourceId = "wolfx";
+        wolfx.timestamp = minute + 57'000;   // 16:47:57，带秒
+        wolfx.reportTime = minute + 60'000;
+        wolfx.latitude = 32.54;
+        wolfx.longitude = 94.00;
+        wolfx.depth = 10.0;
+        wolfx.magnitude = 3.4;
+        wolfx.location = "青海玉树州杂多县";
+        wolfx.isInfo = true;
+        wolfx.determination = "reviewed";
+        controller.handleEvent(wolfx, false, true);
+
+        // 同一条报文的另一条链路：ID 不同、发震时刻被截断到分钟、震中小幅抖动。
+        EarthquakeEvent whews = wolfx;
+        whews.id = "whews_20261024164700000";
+        whews.eventId = "20261024164700000";
+        whews.sourceProvider = "Whews";
+        whews.sourceId = "whews";
+        whews.timestamp = minute;
+        whews.latitude = 32.56;
+        whews.longitude = 94.02;
+        controller.handleEvent(whews, false, true);
+
+        // 同一分钟、同一机构，但震中相距约 110 km：不是同一场地震。
+        EarthquakeEvent other = wolfx;
+        other.id = "cenc_AU.20261024164758.0";
+        other.eventId = "AU.20261024164758.0";
+        other.latitude = 33.5;
+        other.longitude = 94.0;
+        other.magnitude = 4.2;
+        controller.handleEvent(other, false, true);
+
+        const QVariantList list = controller.eventList();
+        QCOMPARE(list.size(), 2);
+        QVariantMap merged;
+        QVariantMap far;
+        for (const QVariant& entry : list) {
+            const QVariantMap map = entry.toMap();
+            if (map.value("magnitude").toDouble() == 3.4) merged = map;
+            if (map.value("magnitude").toDouble() == 4.2) far = map;
+        }
+        QVERIFY(!merged.isEmpty());
+        QVERIFY(!far.isEmpty());
+        const QStringList tags = merged.value("sourceTags").toStringList();
+        QCOMPARE(tags.size(), 2);
+        QVERIFY(tags.contains(QStringLiteral("Wolfx·CENC")));
+        QVERIFY(tags.contains(QStringLiteral("Whews·CENC")));
+        // 情报在列表里不带「第 N 报」，而是标「情报」。
+        QCOMPARE(merged.value("reportNumText").toString(), QStringLiteral("情报"));
+        QCOMPARE(far.value("sourceTags").toStringList(), QStringList{QStringLiteral("Wolfx·CENC")});
     }
 
     /// 普通事件的波前保持实线；震中下方浮动信息照旧。虚线只属于推算（见
@@ -4213,6 +5405,503 @@ private slots:
         QCOMPARE(controller.mapEvent().toMap().value("id").toString(),
                  QString::fromStdString(jma.identity()));
         QVERIFY(controller.hudEvent().isValid());
+    }
+
+    /// 详情页数据：同一报经两路聚合源送达只算一报、来源全部保留；后报按报数排序；
+    /// 原始 JSON 与「≥1 度」的区县表都要能直接给 QML 用。
+    void eventDetailAggregatesReportsAndSources() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EventDetailTest");
+        AppController controller(nullptr, false);
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+
+        const auto make = [&](const QString& provider, const QString& id, int reportNum,
+                              const QString& raw) {
+            EarthquakeEvent e;
+            e.id = "wolfx_" + id.toStdString();
+            e.eventId = id.toStdString();
+            e.sourceProvider = provider.toStdString();
+            e.sourceAgency = "CENC";
+            e.source = "中国地震台网 地震信息";
+            e.timestamp = now;
+            e.reportTime = now;
+            e.reportNum = reportNum;
+            e.magnitude = reportNum == 1 ? 5.5 : 6.0;
+            e.depth = 10.0;
+            e.latitude = 30.0;
+            e.longitude = 103.0;
+            e.location = "四川测试震中";
+            e.distanceKm = -1.0;
+            e.estimatedIntensity = "--";
+            e.rawJson = raw.toStdString();
+            e.sourceId = provider == "Wolfx" ? "wolfx" : "pancakes";
+            return e;
+        };
+
+        const EarthquakeEvent first = make("Wolfx", "A", 1, R"({"src":"wolfx","n":1})");
+        controller.handleEvent(first, false, true);
+        // 同一份报文经 Pancakes 再送一次：EventGate 会判重复，但归档仍要留下这一路来源。
+        controller.handleEvent(make("Pancakes", "A", 1, R"({"src":"pancakes","n":1})"),
+                               false, true);
+        controller.handleEvent(make("Wolfx", "A", 2, R"({"src":"wolfx","n":2})"), false, true);
+
+        const QString id = QString::fromStdString(first.identity());
+        controller.showEventDetail(id);
+        const QVariantMap detail = controller.eventDetail();
+        QCOMPARE(detail.value("id").toString(), id);
+        QCOMPARE(detail.value("location").toString(), QStringLiteral("四川测试震中"));
+
+        const QVariantList sources = detail.value("sources").toList();
+        QCOMPARE(sources.size(), 2);
+        bool wolfxHasRaw = false;
+        bool pancakesHasRaw = false;
+        for (const QVariant& value : sources) {
+            const QVariantMap source = value.toMap();
+            const QString tag = source.value("tag").toString();
+            QVERIFY2(!source.value("firstReceivedText").toString().isEmpty(),
+                     "每个来源都要有接收时间");
+            if (tag == QStringLiteral("Wolfx·CENC")) {
+                wolfxHasRaw = source.value("hasRaw").toBool()
+                              && source.value("rawJson").toString().contains("\"n\":2");
+                QCOMPARE(source.value("reportCount").toInt(), 2);
+            }
+            if (tag == QStringLiteral("Pancakes·CENC")) {
+                pancakesHasRaw = source.value("hasRaw").toBool();
+                QCOMPARE(source.value("reportCount").toInt(), 1);
+            }
+        }
+        QVERIFY2(wolfxHasRaw, "Wolfx 应保留最新一报的原始 JSON");
+        QVERIFY2(pancakesHasRaw, "Pancakes 的重复报也应留下来源与原文");
+
+        const QVariantList reports = detail.value("reports").toList();
+        QCOMPARE(reports.size(), 2);   // 同一报的两路来源合并，不重复计数
+        QCOMPARE(reports.at(0).toMap().value("numText").toString(), QStringLiteral("第 1 报"));
+        QCOMPARE(reports.at(0).toMap().value("sourceTags").toStringList().size(), 2);
+        QCOMPARE(reports.at(1).toMap().value("numText").toString(), QStringLiteral("第 2 报"));
+        QCOMPARE(reports.at(1).toMap().value("statusText").toString(), QString());
+
+        // 区县烈度表只保留 ≥1 度（0.x 一律不出现）。
+        const QVariantList districts = detail.value("districts").toList();
+        QVERIFY2(!districts.isEmpty(), "M6.0 四川震中周边应有 ≥1 度区县");
+        for (const QVariant& value : districts)
+            QVERIFY(value.toMap().value("raw").toDouble() >= 1.0);
+
+        controller.closeEventDetail();
+        QVERIFY(controller.eventDetail().isEmpty());
+    }
+
+    /// 同一场地震的**实时预警**与**地震情报**是两条链路，必须落进同一份报次归档：
+    /// 预警按报数逐条排，情报单独标「情报」并区分自动/正式测定。发震时刻口径不同
+    /// （预警到秒、情报截断到分钟）不能把它们拆成两组。
+    void eventDetailMergesEewAndInfoReports() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EventDetailMergeTest");
+        AppController controller(nullptr, false);
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        // 预警发震时刻带秒（16:29:58），情报只有分钟（16:29:00）。
+        const long long origin = 1'800'000'000'000LL;
+        const long long minute = (origin / 60'000) * 60'000;
+
+        const auto make = [&](bool isInfo, int reportNum, long long stamp, double latitude,
+                              const QString& id) {
+            EarthquakeEvent e;
+            e.id = "wolfx_" + id.toStdString();
+            e.eventId = id.toStdString();
+            e.sourceProvider = "Wolfx";
+            e.sourceAgency = "CENC";
+            e.source = isInfo ? "中国地震台网 地震信息" : "中国地震预警网 地震预警";
+            e.timestamp = stamp;
+            e.reportTime = stamp + 30'000;
+            e.reportNum = reportNum;
+            e.magnitude = 5.0 + reportNum * 0.1;
+            e.depth = 10.0;
+            e.latitude = latitude;
+            e.longitude = 103.0;
+            e.location = "合并测试震中";
+            e.distanceKm = -1.0;
+            e.estimatedIntensity = "--";
+            e.isInfo = isInfo;
+            e.isFinal = isInfo;
+            e.rawJson = QByteArray(R"({"id":"")") + id.toUtf8() + QByteArray("\"}");
+            e.sourceId = "wolfx";
+            return e;
+        };
+
+        controller.handleEvent(make(false, 1, origin, 30.0, "M1"), false, false);
+        controller.handleEvent(make(false, 2, origin, 30.0, "M1"), false, false);
+        // 情报：同一场地震，发震时刻被截断到分钟，震中抖动 0.03°。
+        EarthquakeEvent automatic = make(true, 1, minute, 30.03, "M1");
+        automatic.determination = "automatic";
+        controller.handleEvent(automatic, false, true);
+        // 正式测定：同一份情报的第二次定稿，发布时刻更晚 → 单独一行。
+        EarthquakeEvent reviewed = make(true, 1, minute, 30.03, "M1");
+        reviewed.determination = "reviewed";
+        reviewed.reportTime += 600'000;
+        reviewed.magnitude = 5.3;
+        controller.handleEvent(reviewed, false, true);
+
+        const QString id = QString::fromStdString(make(false, 1, origin, 30.0, "M1").identity());
+        controller.showEventDetail(id);
+        const QVariantMap detail = controller.eventDetail();
+        QCOMPARE(detail.value("id").toString(), id);
+
+        const QVariantList reports = detail.value("reports").toList();
+        QVERIFY2(reports.size() == 4,
+                 qPrintable(QStringLiteral("预警 2 报 + 情报 2 条应各自成行，实际 %1 行")
+                                .arg(reports.size())));
+        // 预警在前，按报数升序。
+        QCOMPARE(reports.at(0).toMap().value("numText").toString(), QStringLiteral("第 1 报"));
+        QCOMPARE(reports.at(1).toMap().value("numText").toString(), QStringLiteral("第 2 报"));
+        QCOMPARE(reports.at(1).toMap().value("isInfo").toBool(), false);
+        // 情报不带报数，标「情报」并用测定状态区分自动/正式。
+        for (int i = 2; i < 4; ++i) {
+            QCOMPARE(reports.at(i).toMap().value("numText").toString(), QStringLiteral("情报"));
+            QCOMPARE(reports.at(i).toMap().value("isInfo").toBool(), true);
+        }
+        QCOMPARE(reports.at(2).toMap().value("determinationText").toString(),
+                 QStringLiteral("自动测定"));
+        QCOMPARE(reports.at(3).toMap().value("determinationText").toString(),
+                 QStringLiteral("正式测定"));
+
+        // 另一场地震（同时刻、震中差 0.5°≈55 km）不得并进来。
+        controller.handleEvent(make(true, 1, minute, 30.5, "M2"), false, true);
+        controller.showEventDetail(id);
+        QCOMPARE(controller.eventDetail().value("reports").toList().size(), 4);
+
+        // QML：展开「报数」后必须真的画出「情报」与测定状态，而不是四条「第 N 报」。
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showList", true);
+        QTRY_VERIFY(controller.eventModel()->rowCount() >= 1);
+        auto* sidebar = window->findChild<QQuickItem*>("eventSidebar");
+        QVERIFY(sidebar);
+        sidebar->setProperty("detailEventId", id);
+        auto* panel = window->findChild<QQuickItem*>("eventDetailPanel");
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        panel->setProperty("reportsExpanded", true);
+        QTest::qWait(150);
+        int infoLabels = 0;
+        bool sawReviewText = false;
+        bool sawAutoText = false;
+        for (auto* item : visualItems(panel)) {
+            const QString text = item->property("text").toString();
+            if (text == QStringLiteral("情报")) ++infoLabels;
+            if (text == QStringLiteral("正式测定")) sawReviewText = true;
+            if (text == QStringLiteral("自动测定")) sawAutoText = true;
+        }
+        QCOMPARE(infoLabels, 2);
+        QVERIFY2(sawReviewText, "情报行缺少「正式测定」标注");
+        QVERIFY2(sawAutoText, "情报行缺少「自动测定」标注");
+        // 取证：把「报数」区滚进视口（报数在页尾，直接拉到 contentHeight 会越界成空白）。
+        auto* scroll = window->findChild<QQuickItem*>("eventDetailScroll");
+        QVERIFY(scroll);
+        QQuickItem* infoRow = nullptr;
+        for (auto* item : visualItems(panel)) {
+            if (item->property("text").toString() == QStringLiteral("自动测定")) {
+                infoRow = item;
+                break;
+            }
+        }
+        QVERIFY(infoRow);
+        const QPointF rowY = infoRow->mapToItem(scroll->property("contentItem").value<QQuickItem*>(),
+                                                QPointF(0, 0));
+        const double maxY = scroll->property("contentHeight").toReal()
+                            - scroll->property("height").toReal();
+        scroll->setProperty("contentY", qBound(0.0, rowY.y() - 260.0, qMax(0.0, maxY)));
+        QTest::qWait(120);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/60-event-detail-eew-and-info.png"));
+
+        controller.closeEventDetail();
+    }
+
+    /// 交互：悬停卡片浮出两个按钮；「查看详情」切到详情面板，返回键回到列表。
+    void eventCardHoverButtonsOpenDetailAndBack() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EventDetailUiTest");
+        AppController controller(nullptr, false);
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        EarthquakeEvent catalog;
+        catalog.id = "wolfx_HOVER";
+        catalog.eventId = "HOVER";
+        catalog.sourceProvider = "Wolfx";
+        catalog.sourceAgency = "CENC";
+        catalog.source = "中国地震台网 地震信息";
+        catalog.timestamp = now;
+        catalog.reportTime = now;
+        catalog.latitude = 30.0;
+        catalog.longitude = 103.0;
+        catalog.magnitude = 5.2;
+        catalog.location = "悬停测试震中";
+        catalog.rawJson = R"({"type":"cenc_eew","ReportNum":1,"Magnitude":5.2,"isFinal":false,"location":"四川雅安","depth":10,"stations":[{"name":"A","value":1.2}]})";
+        controller.handleEvent(catalog, false, true);
+        const QString identity = QString::fromStdString(catalog.identity());
+
+        QQmlApplicationEngine engine;
+        QStringList qmlErrors;
+        connect(&engine, &QQmlEngine::warnings, this, [&](const QList<QQmlError>& warnings) {
+            for (const auto& warning : warnings) {
+                const auto message = warning.toString();
+                if (message.contains("EventDetailPanel.qml") || message.contains("EventTile.qml")
+                    || message.contains("TypeError") || message.contains("ReferenceError")
+                    || message.contains("Binding loop"))
+                    qmlErrors.append(message);
+            }
+        });
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showList", true);
+        QTRY_COMPARE(controller.eventModel()->rowCount(), 1);
+        QTest::qWait(120);
+
+        auto* sidebar = window->findChild<QQuickItem*>("eventSidebar");
+        QVERIFY(sidebar);
+        QQuickItem* tile = nullptr;
+        for (auto* item : visualItems(sidebar)) {
+            if (item->property("eventId").toString() == identity) {
+                tile = item;
+                break;
+            }
+        }
+        QVERIFY(tile);
+        QTest::mouseMove(window, QPoint(0, 0));
+        QTest::mouseMove(window, tile->mapToScene(QPointF(tile->width() / 2, tile->height() / 2))
+                                    .toPoint());
+        QQuickItem* detailButton = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            detailButton = nullptr;
+            for (auto* item : visualItems(sidebar)) {
+                if (item->objectName() == QStringLiteral("eventDetailAction") && item->isVisible())
+                    detailButton = item;
+            }
+            return detailButton != nullptr;
+        })(), 1000);
+        QTest::qWait(120);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/49-event-card-hover-actions.png"));
+        const QPoint clickPos =
+            detailButton->mapToScene(QPointF(detailButton->width() / 2, detailButton->height() / 2))
+                .toPoint();
+        QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, clickPos);
+        QTRY_COMPARE(sidebar->property("detailEventId").toString(), identity);
+        QTRY_COMPARE(controller.eventDetail().value("id").toString(), identity);
+        auto* panel = window->findChild<QQuickItem*>("eventDetailPanel");
+        QVERIFY(panel && panel->isVisible());
+        QTest::qWait(120);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window) + "/50-event-detail.png"));
+        panel->setProperty("reportsExpanded", true);
+        QTest::qWait(120);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/51-event-detail-reports.png"));
+
+        QQuickItem* rawButton = nullptr;
+        for (auto* item : visualItems(panel)) {
+            if (item->property("accessibleName").toString().endsWith(QStringLiteral("的原始 JSON"))
+                && item->isVisible()) {
+                rawButton = item;
+                break;
+            }
+        }
+        QVERIFY(rawButton);
+        QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                          rawButton->mapToScene(QPointF(rawButton->width() / 2,
+                                                        rawButton->height() / 2)).toPoint());
+        QObject* rawPopup = panel->findChild<QObject*>("rawJsonPopup");
+        QVERIFY(rawPopup);
+        QTRY_VERIFY(rawPopup->property("visible").toBool());
+        QTest::qWait(120);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window) + "/52-raw-json.png"));
+        QMetaObject::invokeMethod(rawPopup, "close");
+
+        auto* detailScroll = window->findChild<QQuickItem*>("eventDetailScroll");
+        QVERIFY(detailScroll);
+        detailScroll->setProperty("contentY",
+                                  detailScroll->property("contentHeight").toReal()
+                                      - detailScroll->height());
+        QTest::qWait(150);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/53-district-intensity.png"));
+
+        QQuickItem* backButton = nullptr;
+        for (auto* item : visualItems(panel)) {
+            if (item->property("accessibleName").toString() == QStringLiteral("返回事件列表")
+                && item->isVisible()) {
+                backButton = item;
+                break;
+            }
+        }
+        QVERIFY(backButton);
+        QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                          backButton->mapToScene(QPointF(backButton->width() / 2,
+                                                         backButton->height() / 2)).toPoint());
+        QTRY_COMPARE(sidebar->property("detailEventId").toString(), QString());
+        QVERIFY(panel->isVisible() == false);
+        QVERIFY2(qmlErrors.isEmpty(), qPrintable(qmlErrors.join('\n')));
+    }
+
+    /// 报次归档要跨进程重启存活：目录每场地震只留最新一报，历史报次全靠 event_reports。
+    void eventDetailReportsSurviveRestart() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EventDetailPersistTest");
+        const long long now = 1'800'000'000'000LL;
+        QString identity;
+        {
+            AppController controller(nullptr, false);
+            controller.nowProvider_ = [&] { return now; };
+            EarthquakeEvent event;
+            event.id = "wolfx_PERSIST";
+            event.eventId = "PERSIST";
+            event.sourceProvider = "Wolfx";
+            event.sourceAgency = "CENC";
+            event.source = "中国地震台网 地震信息";
+            event.timestamp = now;
+            event.reportTime = now;
+            event.reportNum = 1;
+            event.magnitude = 4.8;
+            event.depth = 12.0;
+            event.latitude = 31.0;
+            event.longitude = 104.0;
+            event.location = "重启测试震中";
+            event.rawJson = R"({"ReportNum":1})";
+            event.sourceId = "wolfx";
+            identity = QString::fromStdString(event.identity());
+            controller.handleEvent(event, false, true);
+            event.reportNum = 2;
+            event.magnitude = 5.0;
+            event.isFinal = true;
+            event.rawJson = R"({"ReportNum":2})";
+            controller.handleEvent(event, false, true);
+            controller.flushHistoryWrites();
+        }
+        {
+            AppController controller(nullptr, false);
+            controller.nowProvider_ = [&] { return now; };
+            controller.showEventDetail(identity);
+            const QVariantMap detail = controller.eventDetail();
+            QCOMPARE(detail.value("id").toString(), identity);
+            const QVariantList reports = detail.value("reports").toList();
+            QCOMPARE(reports.size(), 2);
+            QCOMPARE(reports.at(1).toMap().value("numText").toString(), QStringLiteral("第 2 报"));
+            QCOMPARE(reports.at(1).toMap().value("statusText").toString(),
+                     QStringLiteral("最终报"));
+            const QVariantList sources = detail.value("sources").toList();
+            QCOMPARE(sources.size(), 1);
+            QVERIFY(sources.at(0).toMap().value("hasRaw").toBool());
+            QVERIFY(sources.at(0).toMap().value("rawJson").toString().contains("ReportNum"));
+        }
+    }
+
+    /// 升级前的历史记录没有报次归档，也没有原始报文：详情仍要能打开，
+    /// 用 events 行里的最后一报合成一条报次，并明确告知原文未保存。
+    void eventDetailFallsBackForLegacyRecords() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EventDetailLegacyTest");
+        AppController controller(nullptr, false);
+        const long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+
+        // 旧库形态：没有 provider/agency/eventId，也没有 event_reports。
+        EarthquakeEvent legacy;
+        legacy.id = "cenc_legacy";
+        legacy.source = "中国地震台网 地震信息";
+        legacy.timestamp = now;
+        legacy.magnitude = 4.1;
+        legacy.depth = 8.0;
+        legacy.latitude = 29.5;
+        legacy.longitude = 102.0;
+        legacy.location = "旧库测试震中";
+        legacy.reportNum = 1;
+        legacy.isFinal = true;
+        controller.history_.push_back(legacy);
+        controller.rebuildHistory();
+
+        const QString id = QString::fromStdString(legacy.identity());
+        controller.showEventDetail(id);
+        const QVariantMap detail = controller.eventDetail();
+        QCOMPARE(detail.value("id").toString(), id);
+        QCOMPARE(detail.value("location").toString(), QStringLiteral("旧库测试震中"));
+        QCOMPARE(detail.value("reportsSynthesized").toBool(), true);
+
+        // 没有 provider/agency 时退回 event.source 作为来源名，而不是「暂无来源记录」。
+        const QVariantList sources = detail.value("sources").toList();
+        QCOMPARE(sources.size(), 1);
+        QCOMPARE(sources.at(0).toMap().value("tag").toString(),
+                 QStringLiteral("中国地震台网 地震信息"));
+        QCOMPARE(sources.at(0).toMap().value("hasRaw").toBool(), false);
+
+        // 最后一报仍可查看（默认折叠由 QML 控制），但没有原文可开。
+        const QVariantList reports = detail.value("reports").toList();
+        QCOMPARE(reports.size(), 1);
+        QCOMPARE(reports.at(0).toMap().value("numText").toString(), QStringLiteral("第 1 报"));
+        QCOMPARE(reports.at(0).toMap().value("statusText").toString(),
+                 QStringLiteral("最终报"));
+
+        // QML：旧数据也要真的画出详情，并说明原文未保存。
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showList", true);
+        QTRY_COMPARE(controller.eventModel()->rowCount(), 1);
+        auto* sidebar = window->findChild<QQuickItem*>("eventSidebar");
+        QVERIFY(sidebar);
+        sidebar->setProperty("detailEventId", id);
+        auto* panel = window->findChild<QQuickItem*>("eventDetailPanel");
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        QTest::qWait(120);
+        bool sawLegacyHint = false;
+        bool sawSourceFallback = false;
+        for (auto* item : visualItems(panel)) {
+            const QString text = item->property("text").toString();
+            if (text == QStringLiteral("旧数据仅保留最后一报，原始报文未保存。")) sawLegacyHint = true;
+            if (text == QStringLiteral("中国地震台网 地震信息")) sawSourceFallback = true;
+        }
+        QVERIFY2(sawLegacyHint, "旧数据详情缺少「原文未保存」说明");
+        QVERIFY2(sawSourceFallback, "旧数据详情缺少来源名回退");
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/54-legacy-event-detail.png"));
     }
 };
 QTEST_MAIN(GuiTest)

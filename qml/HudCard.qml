@@ -61,7 +61,9 @@ GlassCard {
                     elide: Text.ElideRight
                 }
                 Text {
-                    text: root.event ? (root.event.isCanceled ? "取消报" : "第 " + root.event.reportNum + " 报") : ""
+                    // 文案由 toMap 成型：情报标「情报」，预警标「第 N 报」，取消单列。
+                    text: root.event ? (root.event.reportNumText !== undefined
+                                        ? String(root.event.reportNumText) : "") : ""
                     color: root.theme.outline; font.pixelSize: 11
                 }
             }

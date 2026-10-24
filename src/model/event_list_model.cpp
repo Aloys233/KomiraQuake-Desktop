@@ -11,10 +11,12 @@ bool EventListModel::Row::operator==(const Row& other) const {
     return id == other.id && location == other.location && source == other.source
            && magnitudeText == other.magnitudeText && depthText == other.depthText
            && timeText == other.timeText && sourceTag == other.sourceTag
+           && sourceTags == other.sourceTags
            && intensity == other.intensity && intensityLabel == other.intensityLabel
            && intensityColor == other.intensityColor && levelTag == other.levelTag
            && timestamp == other.timestamp && magnitude == other.magnitude
-           && distance == other.distance && hasDistance == other.hasDistance
+           && distance == other.distance && distanceText == other.distanceText
+           && hasDistance == other.hasDistance
            && isActive == other.isActive && focused == other.focused;
 }
 
@@ -37,11 +39,13 @@ QVariant EventListModel::data(const QModelIndex& index, int role) const {
     case EventDepthTextRole: return row->depthText;
     case EventTimeTextRole: return row->timeText;
     case EventSourceTagRole: return row->sourceTag;
+    case EventSourceTagsRole: return row->sourceTags;
     case EventIntensityRole: return row->intensity;
     case EventIntensityLabelRole: return row->intensityLabel;
     case EventIntensityColorRole: return row->intensityColor;
     case EventActiveRole: return row->isActive;
     case EventFocusedRole: return row->focused;
+    case EventDistanceTextRole: return row->distanceText;
     default: return {};
     }
 }
@@ -54,11 +58,13 @@ QHash<int, QByteArray> EventListModel::roleNames() const {
         {EventDepthTextRole, QByteArrayLiteral("eventDepthText")},
         {EventTimeTextRole, QByteArrayLiteral("eventTimeText")},
         {EventSourceTagRole, QByteArrayLiteral("eventSourceTag")},
+        {EventSourceTagsRole, QByteArrayLiteral("eventSourceTags")},
         {EventIntensityRole, QByteArrayLiteral("eventIntensity")},
         {EventIntensityLabelRole, QByteArrayLiteral("eventIntensityLabel")},
         {EventIntensityColorRole, QByteArrayLiteral("eventIntensityColor")},
         {EventActiveRole, QByteArrayLiteral("eventActive")},
         {EventFocusedRole, QByteArrayLiteral("eventFocused")},
+        {EventDistanceTextRole, QByteArrayLiteral("eventDistanceText")},
     };
 }
 
@@ -163,6 +169,19 @@ void EventListModel::setFocusedId(const QString& id) {
 
 EventFilterModel::EventFilterModel(QObject* parent) : QSortFilterProxyModel(parent) {
     setDynamicSortFilter(true);
+    // 「近 24h」随时间滑走：只有该筛选生效时才需要重算（200 行，代价可忽略）。
+    // 行内容本身不变，所以不能指望 setRows / dataChanged 来触发这次过期。
+    recencyTimer_.setInterval(60'000);
+    connect(&recencyTimer_, &QTimer::timeout, this, [this]() {
+        if (filter_ != QLatin1String("RECENT_24H")) return;
+        beginFilterChange();
+        endFilterChange();
+    });
+    recencyTimer_.start();
+}
+
+long long EventFilterModel::nowMs() const {
+    return nowProvider_ ? nowProvider_() : QDateTime::currentMSecsSinceEpoch();
 }
 
 void EventFilterModel::setFilter(const QString& filter, const QString& searchQuery) {
@@ -171,7 +190,8 @@ void EventFilterModel::setFilter(const QString& filter, const QString& searchQue
     if (filter_ == normalizedFilter && searchQuery_ == normalizedQuery) return;
     filter_ = normalizedFilter;
     searchQuery_ = normalizedQuery;
-    invalidateFilter();
+    beginFilterChange();
+    endFilterChange();
 }
 
 bool EventFilterModel::filterAcceptsRow(int sourceRow, const QModelIndex& sourceParent) const {
@@ -185,13 +205,28 @@ bool EventFilterModel::filterAcceptsRow(int sourceRow, const QModelIndex& source
         && !(row->hasDistance && row->distance <= 500.0))
         return false;
     if (filter_ == QLatin1String("M4_PLUS") && row->magnitude < 4.0) return false;
-    if (filter_ == QLatin1String("RECENT_24H")
-        && QDateTime::currentMSecsSinceEpoch() - row->timestamp > 24LL * 3600LL * 1000LL)
-        return false;
+    if (filter_ == QLatin1String("RECENT_24H")) {
+        // 区间必须**双向**判定：只判 `now - ts > 24h` 会把未来时间戳（校时漂移、
+        // 源侧时间错误）当成「最近」，它们会永远钉在列表最前面。留 60 s 容差，
+        // 与 EarthquakeEvent::expired() 对「未来」的容忍度一致。
+        const long long now = nowMs();
+        constexpr long long kFutureToleranceMs = 60'000;
+        constexpr long long kWindowMs = 24LL * 3600LL * 1000LL;
+        if (row->timestamp > now + kFutureToleranceMs) return false;
+        if (now - row->timestamp > kWindowMs) return false;
+    }
     if (!searchQuery_.isEmpty()) {
         // 只在需要时做一次大小写折叠；预转换放进行构建期（见 EventListModel::Row::source）。
-        if (!row->location.contains(searchQuery_, Qt::CaseInsensitive)
-            && !row->source.contains(searchQuery_, Qt::CaseInsensitive)) {
+        bool sourceMatched = row->source.contains(searchQuery_, Qt::CaseInsensitive);
+        if (!sourceMatched) {
+            for (const QString& tag : row->sourceTags) {
+                if (tag.contains(searchQuery_, Qt::CaseInsensitive)) {
+                    sourceMatched = true;
+                    break;
+                }
+            }
+        }
+        if (!row->location.contains(searchQuery_, Qt::CaseInsensitive) && !sourceMatched) {
             return false;
         }
     }
