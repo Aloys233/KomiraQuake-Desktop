@@ -16,6 +16,10 @@ QtObject {
     readonly property int motionDuration: reduceMotion ? 0 : 150
     // 打包的 Google Sans（拉丁）；中文由应用字体的 families 回退到系统 CJK。
     readonly property string fontFamily: "Google Sans"
+    /// 中文（思源黑体）。随应用打包，拉丁仍走 Google Sans / JetBrains Mono。
+    readonly property string hanFamily: "Source Han Sans SC"
+    /// 等宽场景（原始 JSON 等）的字体。随应用打包，见 fonts/JetBrainsMono-Regular.ttf。
+    readonly property string monoFamily: "JetBrains Mono"
     // 数字与正文同族。Google Sans 默认是比例数字，应用字体已显式开启 tnum（等宽数字），
     // 因此无需换成 monospace，否则「M 5.6」这类数字会与旁边的说明文字不同字体、看起来不对齐。
     readonly property string numberFamily: Qt.application.font.family

@@ -74,16 +74,17 @@ private:
 };
 
 inline void configureNativeUi(QQmlEngine& engine) {
-    // 打包的 Google Sans 静态拉丁子集（见 tools/import_google_sans.py）。中文字形不在其中，
-    // 由 families 回退到系统 CJK；字重由各实例的 OS/2 决定。
-    const QStringList fontDirEntries =
-        QDir(QStringLiteral(":/fonts")).entryList({QStringLiteral("*.ttf")}, QDir::Files);
+    // 打包字体：Google Sans（拉丁）、Source Han Sans SC（中文，思源黑体）、
+    // JetBrains Mono（原始 JSON）。全部内嵌，不依赖系统是否装了同名/同语言字体。
+    const QStringList fontDirEntries = QDir(QStringLiteral(":/fonts"))
+                                           .entryList({QStringLiteral("*.ttf"), QStringLiteral("*.otf")},
+                                                      QDir::Files);
     for (const QString& file : fontDirEntries)
         QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/") + file);
     QFont font;
-    font.setFamilies({QStringLiteral("Google Sans"), QStringLiteral("Noto Sans SC"),
-                      QStringLiteral("Noto Sans CJK SC"), QStringLiteral("PingFang SC"),
-                      QStringLiteral("sans-serif")});
+    font.setFamilies({QStringLiteral("Google Sans"), QStringLiteral("Source Han Sans SC"),
+                      QStringLiteral("Noto Sans SC"), QStringLiteral("Noto Sans CJK SC"),
+                      QStringLiteral("PingFang SC"), QStringLiteral("sans-serif")});
     font.setPixelSize(14);
     font.setWeight(QFont::Normal);
     // Google Sans 默认是比例数字；显式开启等宽数字，避免时钟/震级宽度抖动。

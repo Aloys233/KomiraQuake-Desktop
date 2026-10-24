@@ -280,7 +280,7 @@ qt_add_resources(komiraquake lucide_icons PREFIX "/icons" BASE "qml/icons" FILES
 
 
 # Google Sans（OFL）静态拉丁子集，见 tools/import_google_sans.py；打包进二进制避免依赖系统字体。
-file(GLOB KOMIRA_FONT_FILES CONFIGURE_DEPENDS fonts/*.ttf fonts/OFL.txt)
+file(GLOB KOMIRA_FONT_FILES CONFIGURE_DEPENDS fonts/*.ttf fonts/*.otf fonts/OFL*.txt)
 qt_add_resources(komiraquake komira_fonts PREFIX "/fonts" BASE "fonts" FILES ${KOMIRA_FONT_FILES})
 
 # 资源（travel_times.json / sounds）拷贝到可执行文件旁的 assets/
