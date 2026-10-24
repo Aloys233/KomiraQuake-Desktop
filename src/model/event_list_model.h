@@ -104,6 +104,9 @@ protected:
 
 private:
     long long nowMs() const;
+    /// 重算筛选。Qt 6.9 起用 begin/endFilterChange（6.8 LTS 与 CI 上的 Qt 都没有，
+    /// 项目最低要求 6.5），旧版本退回 invalidateFilter()。
+    void refreshFilter();
 
     QString filter_ = QStringLiteral("ALL");
     QString searchQuery_;

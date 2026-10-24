@@ -174,10 +174,18 @@ EventFilterModel::EventFilterModel(QObject* parent) : QSortFilterProxyModel(pare
     recencyTimer_.setInterval(60'000);
     connect(&recencyTimer_, &QTimer::timeout, this, [this]() {
         if (filter_ != QLatin1String("RECENT_24H")) return;
-        beginFilterChange();
-        endFilterChange();
+        refreshFilter();
     });
     recencyTimer_.start();
+}
+
+void EventFilterModel::refreshFilter() {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+    beginFilterChange();
+    endFilterChange();
+#else
+    invalidateFilter();
+#endif
 }
 
 long long EventFilterModel::nowMs() const {
@@ -190,8 +198,7 @@ void EventFilterModel::setFilter(const QString& filter, const QString& searchQue
     if (filter_ == normalizedFilter && searchQuery_ == normalizedQuery) return;
     filter_ = normalizedFilter;
     searchQuery_ = normalizedQuery;
-    beginFilterChange();
-    endFilterChange();
+    refreshFilter();
 }
 
 bool EventFilterModel::filterAcceptsRow(int sourceRow, const QModelIndex& sourceParent) const {
