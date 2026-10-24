@@ -43,7 +43,7 @@ GlassCard {
             horizontalAlignment: Text.AlignHCenter
             text: root.sourceName
             color: root.theme.textPrimary
-            font.family: root.theme.fontFamily
+            // 不显式指定 Google Sans：继承应用字体，中文才会落到内嵌的思源黑体。
             // 10px 在 1.3/1.5 分数缩放下 i/s 容易粘连（「i 看起来像 ii」），11px 明显更稳。
             font.pixelSize: 11
             font.weight: Font.Bold
@@ -59,7 +59,6 @@ GlassCard {
             horizontalAlignment: Text.AlignHCenter
             text: root.caption
             color: root.theme.outline
-            font.family: root.theme.fontFamily
             font.pixelSize: 8
         }
         Text {
@@ -68,7 +67,6 @@ GlassCard {
             text: root.valueText
             color: root.hasData ? root.theme.stationTextColorFor(root.raw, root.standard)
                                 : root.theme.outline
-            font.family: root.theme.fontFamily
             font.pixelSize: 17
             font.weight: Font.Bold
         }

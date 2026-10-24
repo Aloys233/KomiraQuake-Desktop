@@ -1181,55 +1181,6 @@ Item {
         }
     }
 
-    // 震中 X 十字。参考 kanameishi eqlistCross.svg：10px 米黄描边打底 + 6px 红描边。
-    Canvas {
-        id: hypocenter
-        objectName: "hypocenterMarker"
-        z: 3
-        visible: root.hasEvent
-        x: root.hypocenterX - width / 2
-        y: root.hypocenterY - height / 2
-        width: 40
-        height: 40
-        onPaint: {
-            const ctx = getContext("2d");
-            ctx.reset();
-            ctx.lineCap = "round";
-            const cross = (color, lineWidth) => {
-                ctx.strokeStyle = color;
-                ctx.lineWidth = lineWidth;
-                ctx.beginPath();
-                ctx.moveTo(5, 5);
-                ctx.lineTo(35, 35);
-                ctx.moveTo(35, 5);
-                ctx.lineTo(5, 35);
-                ctx.stroke();
-            };
-            cross(root.theme.hypocenterHalo, 10);
-            cross(root.theme.hypocenterCross, 6);
-        }
-    }
-
-    // 用户位置（带纠偏）
-    Item {
-        z: 3
-        visible: root.hasUser
-        x: root.screenX(root.shiftedUser.lon) - 19
-        y: root.screenY(root.shiftedUser.lat) - 19
-        width: 38; height: 38
-        Rectangle {
-            anchors.centerIn: parent
-            width: 38; height: 38; radius: 19
-            color: Qt.rgba(root.theme.severity("NORMAL").r, root.theme.severity("NORMAL").g,
-                           root.theme.severity("NORMAL").b, 0.18)
-        }
-        Rectangle {
-            anchors.centerIn: parent
-            width: 16; height: 16; radius: 8
-            color: root.theme.severity("NORMAL")
-        }
-    }
-
     } // mapRenderLayer
 
     // 震中下方的浮动信息（对齐 kanameishi）：震中地名 + M/深度/烈度 + 数据源。
@@ -1267,7 +1218,9 @@ Item {
         anchorY: root.hypocenterY
         viewportWidth: root.width
         viewportHeight: root.height
-        z: 3
+        // z:4 —— 与 markerLayer（z:3）同为 root 的兄弟，但标记层声明在后会压过 z 相同的
+        // 兄弟；卡片是文字标签，必须盖在十字上面。
+        z: 4
     }
 
     // ---- 测站强度层 ------------------------------------------------------
@@ -1291,6 +1244,72 @@ Item {
         csisColors: root.theme.csisColorBand
         kmaColors: root.theme.kmaColorBand
         kmaDotColors: root.theme.kmaDotColorBand
+    }
+
+    // ---- 震中 / 我的位置标记（必须压在测站层之上）--------------------------
+    // 用户报告（2026-10）：日本区震中附近的测站方标会把红色 X 十字整个盖住，看不出
+    // 震源中心；中国、韩国同样会中招，只是台网密度低、测站恰好落在震中的概率小。
+    //
+    // 根因不是 z 值写小了，而是 QML 的 z **只在同一个父项的兄弟之间**比较：这两个标记
+    // 原先住在 `mapRenderLayer` 里（z:3），而 `StationMapItem` 是该容器的**兄弟**
+    // （z:2）。容器内部的 z 再大也压不过后绘制的兄弟 —— 上千个测站整片盖在十字上面，
+    // 给十字加 z、或给测站层减 z 都不会有任何变化。只能把它们提到容器外面。
+    //
+    // 放在测站层**之后**（与 EstimateMarker 同一套理由），同时也意味着它们不再被
+    // 玻璃卡的背景模糊采样进去：标记是"标注"，模糊采样的是地图内容。
+    Item {
+        id: markerLayer
+        objectName: "mapMarkerLayer"
+        anchors.fill: parent
+        z: 3
+
+        // 震中 X 十字。参考 kanameishi eqlistCross.svg：10px 米黄描边打底 + 6px 红描边。
+        Canvas {
+            id: hypocenter
+            objectName: "hypocenterMarker"
+            visible: root.hasEvent
+            x: root.hypocenterX - width / 2
+            y: root.hypocenterY - height / 2
+            width: 40
+            height: 40
+            onPaint: {
+                const ctx = getContext("2d");
+                ctx.reset();
+                ctx.lineCap = "round";
+                const cross = (color, lineWidth) => {
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = lineWidth;
+                    ctx.beginPath();
+                    ctx.moveTo(5, 5);
+                    ctx.lineTo(35, 35);
+                    ctx.moveTo(35, 5);
+                    ctx.lineTo(5, 35);
+                    ctx.stroke();
+                };
+                cross(root.theme.hypocenterHalo, 10);
+                cross(root.theme.hypocenterCross, 6);
+            }
+        }
+
+        // 用户位置（带纠偏）。与十字同一个毛病：压在密网测站下面就等于没有。
+        Item {
+            objectName: "userLocationMarker"
+            visible: root.hasUser
+            x: root.screenX(root.shiftedUser.lon) - 19
+            y: root.screenY(root.shiftedUser.lat) - 19
+            width: 38; height: 38
+            Rectangle {
+                anchors.centerIn: parent
+                width: 38; height: 38; radius: 19
+                color: Qt.rgba(root.theme.severity("NORMAL").r, root.theme.severity("NORMAL").g,
+                               root.theme.severity("NORMAL").b, 0.18)
+            }
+            Rectangle {
+                anchors.centerIn: parent
+                width: 16; height: 16; radius: 8
+                color: root.theme.severity("NORMAL")
+            }
+        }
     }
 
     // ---- 本地震源推算（Beta）：推定震中 ------------------------------------
@@ -1605,31 +1624,26 @@ Item {
         onTriggered: stationHover.query(stationHover.pending.x, stationHover.pending.y, true)
     }
 
-    // 右上角：各测站源的实时最大值（仅显示，不参与预警）；每个源一张小卡，横向排列。
-    RowLayout {
+    // 右上角：各测站源的实时最大值（仅显示，不参与预警）。收起时叠成一摞
+    // （前排优先显示「刚变过 / 读数高」的那一路，都没有就回落到 NIED），
+    // 指针放上去向左展开成一排。见 StationStack.qml。
+    StationStack {
+        id: stationStack
+        objectName: "stationStack"
         anchors.right: parent.right
         anchors.rightMargin: 16
         anchors.top: parent.top
         anchors.topMargin: 16
-        spacing: 8
         z: 10
+        // 没有任何启用的测站源时整块不占位（否则右上角留一块看不见却能吃悬停的区域）。
         visible: !root.pickingLocation && app.settings.showStationLayer
-        // model 用**长度**而不是数组本身：stationSources 每 100 ms 全量重建，
-        // 若直接当 model，Repeater 会把三张玻璃卡（含模糊层）反复销毁重建。
-        Repeater {
-            model: app.stationSources.length
-            delegate: StationIntensityCard {
-                required property int index
-                Layout.alignment: Qt.AlignTop
-                theme: root.theme
-                backdropSource: mapRenderLayer
-                backdropLive: root.cameraMoving
-                maxInfo: app.stationSources[index] || ({})
-                sourceName: maxInfo.name
-                caption: maxInfo.caption
-                standard: maxInfo.standard
-            }
-        }
+                 && app.stationSources.length > 0
+        theme: root.theme
+        backdropSource: mapRenderLayer
+        backdropLive: root.cameraMoving
+        // 100 ms 全量重建的数组直接交给容器：容器内部按**长度**建 delegate，
+        // 不会因数组重建而销毁重造玻璃卡（含模糊层）。
+        sources: app.stationSources
     }
 
     MouseArea {
@@ -1758,13 +1772,8 @@ Item {
                 flat: !root.following; primary: root.following
                 onClicked: root.toggleFollowEvent()
             }
-            GlassButton {
-                theme: root.theme; iconName: "layers"; accessibleName: "切换底图"; flat: true
-                onClicked: {
-                    const list = ["amap_vector", "petal", "osm", "vector"];
-                    app.settings.basemapId = list[(list.indexOf(root.basemap) + 1) % list.length];
-                }
-            }
+            // 底图切换只留在设置页「地图」分区：工具条上少一个图标，
+            // 也避免「点错一下就把整张地图换掉」这种误操作。
             // 应用级导航（kanameishi 式单条工具条）：事件列表抽屉 / 设置页。
             Rectangle { width: 28; height: 1; x: 6; color: root.theme.glassBorder }
             GlassButton { theme: root.theme; iconName: "list"; accessibleName: "事件列表"; flat: !root.listExpanded; primary: root.listExpanded; onClicked: root.toggleListRequested() }

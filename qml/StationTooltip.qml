@@ -155,7 +155,6 @@ Item {
                     Layout.fillWidth: true
                     text: root.nameText
                     color: root.theme.textPrimary
-                    font.family: root.theme.fontFamily
                     font.pixelSize: 13
                     font.weight: Font.Medium
                     elide: Text.ElideRight

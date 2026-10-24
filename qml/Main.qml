@@ -153,11 +153,12 @@ ApplicationWindow {
     }
     // 左下角数据源状态：逐源展示各自的连接状态，不再把多个源名合并成一条同色。
     // 之前用聚合状态给整串源名上色，会出现「模拟源没连上、却因别的源在线而被染绿」。
+    // 位置：**贴屏幕下沿**，时钟徽章叠在它上面（用户要求两者互换位置）。
     GlassCard {
         id: sourceBadge
         objectName: "sourceBadge"
-        anchors.left: parent.left; anchors.bottom: clockBadge.top
-        anchors.leftMargin: 16; anchors.bottomMargin: 8
+        anchors.left: parent.left; anchors.bottom: parent.bottom
+        anchors.leftMargin: 16; anchors.bottomMargin: 16
         theme: appTheme; backdropSource: map ? map.renderLayer : null
         backdropLive: !!map && map.cameraMoving
         width: sourceRow.implicitWidth + 24; height: 34; radius: 10
@@ -209,7 +210,9 @@ ApplicationWindow {
     GlassCard {
         id: clockBadge
         objectName: "clockBadge"
-        anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 16
+        // 时钟在上、数据源在下：两者互换位置后，靠屏幕下沿的是数据源徽章。
+        anchors.left: parent.left; anchors.leftMargin: 16
+        anchors.bottom: sourceBadge.top; anchors.bottomMargin: 8
         theme: appTheme; backdropSource: map ? map.renderLayer : null
         backdropLive: !!map && map.cameraMoving
         width: badgeRow.implicitWidth + 24; height: 34; radius: 10

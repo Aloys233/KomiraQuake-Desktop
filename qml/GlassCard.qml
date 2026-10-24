@@ -9,6 +9,10 @@ Rectangle {
     property bool interactive: false
     property bool active: false
     property string accessibleName: ""
+    /// 玻璃底衬的**不透明度倍率**（1 = 主题本色）。堆叠里靠后的卡片用它把底衬调薄一点，
+    /// 让底下被模糊的地图颜色真正透出来 —— 底衬太厚时，64 px 的模糊在 9 px 的纸边上
+    /// 只剩一片平均值，看上去就是「纯色」，不像玻璃。
+    property real tintOpacity: 1
     readonly property bool hovered: interactive && mouseArea.containsMouse
     readonly property bool pressed: interactive && mouseArea.pressed
     readonly property bool windowVisible: Window.window ? Window.window.visible : true
@@ -19,8 +23,13 @@ Rectangle {
                                       && windowVisible
     signal clicked()
     radius: 16
+    /// 主题给的玻璃底衬，按 `tintOpacity` 缩放透明度（其余分支保持本色）。
+    readonly property color tintedBackdrop: {
+        const base = theme.backdropTint;
+        return Qt.rgba(base.r, base.g, base.b, base.a * Math.max(0, Math.min(1, root.tintOpacity)));
+    }
     color: pressed ? theme.glassCardPressed : hovered || active ? theme.glassCardHover
-         : backdropSource ? (blurActive ? theme.backdropTint : theme.backdropFallback) : theme.glassCard
+         : backdropSource ? (blurActive ? tintedBackdrop : theme.backdropFallback) : theme.glassCard
     border.width: activeFocus ? 2 : 1
     border.color: active || activeFocus ? theme.accent : hovered ? theme.glassBorderHover : theme.glassBorder
     activeFocusOnTab: interactive
