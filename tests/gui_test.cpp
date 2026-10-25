@@ -5633,6 +5633,240 @@ private slots:
         controller.closeEventDetail();
     }
 
+    /// 回归：详情面板里三处「没对齐」。
+    ///
+    /// 用户报的是三处像素级错位，成因却是三个不同的东西：
+    ///   ① 数据源行 `height: 52` 写死，而左侧「来源名 + 接收时间」需要 37px 内容高，
+    ///      加 12+12 边距共 61px。行矮了 9px，布局器只能把超高的子项钉在行顶，
+    ///      右侧 30px 按钮又按自己居中 —— 两个参照系，看着就是「原始 JSON 偏高」。
+    ///   ② 报数标题的折叠箭头被当成**独立**布局项、按整行（26px）Qt.AlignVCenter 居中，
+    ///      而文字是按基线摆的；15px 图标盒与 16px 文字盒各自居中差 1.3px，箭头看着偏高。
+    ///   ③ 报次抬头用 `Row`（定位器只顶对齐）混排 12px「情报」与 10px「正式测定」，
+    ///      盒高 18 对 15，顶对顶之后两条基线差 2.3px。
+    /// 这些都不是「差一两个像素」的审美问题：基线不共线，一行字就会读成两行。
+    /// 断言的是真实几何（mapToItem + baselineOffset），不是 QML 里写的对齐属性 ——
+    /// 属性写对了但布局器没照做，才是这三处 bug 的实际形态。
+    void eventDetailContentAlignsOnOneBaseline() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EventDetailAlignTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+
+        const auto make = [&](int reportNum, double magnitude, const QString& id) {
+            EarthquakeEvent e;
+            e.id = "wolfx_" + id.toStdString();
+            e.eventId = id.toStdString();
+            e.sourceProvider = "Wolfx";
+            e.sourceAgency = "CENC";
+            e.source = "中国地震台网 地震信息";
+            e.timestamp = now;
+            e.reportTime = now + reportNum * 60'000;
+            e.reportNum = reportNum;
+            e.magnitude = magnitude;
+            e.depth = 10.0;
+            e.latitude = 30.0;
+            e.longitude = 103.0;
+            e.location = "对齐测试震中";
+            e.distanceKm = -1.0;
+            e.estimatedIntensity = "--";
+            e.rawJson = R"({"type":"cenc_eew","ReportNum":1,"Magnitude":5.2,"depth":10})";
+            e.sourceId = "wolfx";
+            return e;
+        };
+        // 一条带原文的预警报 + 自动测定 / 正式测定两条情报：三种抬头文案都覆盖到。
+        controller.handleEvent(make(1, 5.2, "ALIGN"), false, false);
+        EarthquakeEvent automatic = make(1, 5.1, "ALIGN");
+        automatic.isInfo = true;
+        automatic.determination = "automatic";
+        controller.handleEvent(automatic, false, true);
+        EarthquakeEvent reviewed = make(1, 5.3, "ALIGN");
+        reviewed.isInfo = true;
+        reviewed.determination = "reviewed";
+        reviewed.reportTime += 600'000;
+        controller.handleEvent(reviewed, false, true);
+
+        const QString id = QString::fromStdString(make(1, 5.2, "ALIGN").identity());
+        controller.showEventDetail(id);
+        QCOMPARE(controller.eventDetail().value("id").toString(), id);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showList", true);
+        auto* sidebar = window->findChild<QQuickItem*>("eventSidebar");
+        QVERIFY(sidebar);
+        sidebar->setProperty("detailEventId", id);
+        auto* panel = window->findChild<QQuickItem*>("eventDetailPanel");
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        panel->setProperty("reportsExpanded", true);
+        QTRY_VERIFY_WITH_TIMEOUT(sidebar->width() > 200, 5000);
+        QTest::qWait(300);
+
+        // 基线/中心一律换算到面板坐标系再比，避免不同父项各自本地坐标混进来。
+        // 必须映射**中心点**而不是左上角：展开态的箭头带 `rotation: 180`，
+        // 绕中心旋转会把左上角映射到右下角，小角点算出来的 y 会凭空多出一个图标高
+        // （这正是这个用例第一版自己踩的坑）。中心点在绕中心旋转下不动。
+        const auto centerIn = [](QQuickItem* item, QQuickItem* space) {
+            return item->mapToItem(space, QPointF(item->width() / 2.0, item->height() / 2.0)).y();
+        };
+        const auto baselineIn = [&](QQuickItem* item, QQuickItem* space) {
+            return centerIn(item, space) - item->height() / 2.0 + item->baselineOffset();
+        };
+        const auto texts = [&](const QString& text) {
+            QList<QQuickItem*> hits;
+            for (auto* item : visualItems(panel)) {
+                if (item->property("text").toString() == text) hits.append(item);
+            }
+            return hits;
+        };
+
+        // ── ① 数据源行：高度要装得下内容，右侧按钮要和左侧文字块同心 ──────────
+        auto* sourceRow = findVisualItem(window, QStringLiteral("eventDetailSourceRow"));
+        QVERIFY2(sourceRow, "详情面板缺少数据源行");
+        QQuickItem* sourceInner = nullptr;
+        for (auto* child : sourceRow->childItems()) {
+            if (child->metaObject()->className() == QLatin1String("QQuickRowLayout"))
+                sourceInner = child;
+        }
+        QVERIFY2(sourceInner, "数据源行缺少内层 RowLayout");
+        QVERIFY2(sourceRow->height() + 0.5 >= sourceInner->implicitHeight() + 24.0,
+                 qPrintable(QStringLiteral("数据源行高 %1 装不下内容 %2 + 上下边距 24，"
+                                           "布局器会把子项钉在行顶")
+                                .arg(sourceRow->height())
+                                .arg(sourceInner->implicitHeight())));
+        auto* rawButton = findVisualItem(window, QStringLiteral("eventDetailSourceRawButton"));
+        QVERIFY2(rawButton && rawButton->isVisible(), "带原文的来源缺少「原始 JSON」按钮");
+        // 左侧文字块 = 内层布局里的 ColumnLayout。
+        QQuickItem* sourceText = nullptr;
+        for (auto* child : sourceInner->childItems()) {
+            if (child->metaObject()->className() == QLatin1String("QQuickColumnLayout"))
+                sourceText = child;
+        }
+        QVERIFY2(sourceText, "数据源行缺少左侧文字块");
+        QVERIFY2(rawButton->y() >= 0.0 && rawButton->y() + rawButton->height()
+                     <= sourceRow->height() + 0.01,
+                 "「原始 JSON」按钮被挤出了数据源行");
+        QVERIFY2(std::abs(centerIn(rawButton, panel) - centerIn(sourceText, panel)) <= 0.5,
+                 qPrintable(QStringLiteral("「原始 JSON」与左侧文字块不同心：差 %1 px")
+                                .arg(centerIn(rawButton, panel) - centerIn(sourceText, panel))));
+
+        // ── ⓪ 面板标题行：20px 标题与 11px「实时告警中」共基线 ─────────────────
+        // 同一类错误的第四处：两个 Text 都不写 alignment 时按行顶对齐，
+        // 字重/字形 ascent 不同，实测基线差 4.4px。
+        {
+            const auto titleHits = texts(QStringLiteral("地震详情"));
+            QVERIFY2(!titleHits.isEmpty(), "详情面板缺少「地震详情」标题");
+            QQuickItem* statusText = nullptr;
+            for (auto* item : visualItems(panel)) {
+                if (item->property("text").toString() == QStringLiteral("实时告警中"))
+                    statusText = item;
+            }
+            QVERIFY2(statusText, "活动预警时标题行缺少「实时告警中」");
+            QVERIFY2(std::abs(baselineIn(titleHits.first(), panel) - baselineIn(statusText, panel))
+                         <= 0.5,
+                     qPrintable(QStringLiteral("「地震详情」与「实时告警中」不在一条基线上：差 %1 px")
+                                    .arg(baselineIn(statusText, panel)
+                                         - baselineIn(titleHits.first(), panel))));
+        }
+
+        // ── ② 报数标题：折叠文字与「报数」共基线，箭头与文字同心 ───────────────
+        const auto titleHits = texts(QStringLiteral("报数"));
+        QVERIFY2(!titleHits.isEmpty(), "详情面板缺少「报数」标题");
+        QQuickItem* toggleLabel =
+            findVisualItem(window, QStringLiteral("eventDetailReportToggleLabel"));
+        QVERIFY2(toggleLabel, "报数标题缺少展开/收起文字");
+        QVERIFY2(std::abs(baselineIn(titleHits.first(), panel) - baselineIn(toggleLabel, panel))
+                     <= 0.5,
+                 qPrintable(QStringLiteral("「%1」与「报数」不在一条基线上：差 %2 px")
+                                .arg(toggleLabel->property("text").toString())
+                                .arg(baselineIn(toggleLabel, panel) - baselineIn(titleHits.first(), panel))));
+        auto* toggleIcon = findVisualItem(window, QStringLiteral("eventDetailReportToggleIcon"));
+        QVERIFY2(toggleIcon, "报数标题缺少折叠箭头");
+        QVERIFY2(std::abs(centerIn(toggleIcon, panel) - centerIn(toggleLabel, panel)) <= 0.5,
+                 qPrintable(QStringLiteral("折叠箭头与「%1」不同心：差 %2 px")
+                                .arg(toggleLabel->property("text").toString())
+                                .arg(centerIn(toggleIcon, panel) - centerIn(toggleLabel, panel))));
+
+        // ── ③ 报次抬头：「情报」与测定状态必须是同一条基线 ─────────────────────
+        const auto determinationHits = texts(QStringLiteral("正式测定"));
+        QVERIFY2(!determinationHits.isEmpty(), "展开后缺少「正式测定」标注");
+        int compared = 0;
+        for (auto* determination : determinationHits) {
+            QQuickItem* headerRow = determination->parentItem();
+            QVERIFY(headerRow);
+            QQuickItem* numText = nullptr;
+            for (auto* sibling : headerRow->childItems()) {
+                if (sibling == determination) continue;
+                const QString text = sibling->property("text").toString();
+                if (text == QStringLiteral("情报") || text.startsWith(QStringLiteral("第 ")))
+                    numText = sibling;
+            }
+            QVERIFY2(numText, "报次抬头缺少报数/情报文字");
+            ++compared;
+            QVERIFY2(std::abs(baselineIn(numText, panel) - baselineIn(determination, panel)) <= 0.5,
+                     qPrintable(QStringLiteral("「%1」与「正式测定」不在一条基线上：差 %2 px")
+                                    .arg(numText->property("text").toString())
+                                    .arg(baselineIn(numText, panel) - baselineIn(determination, panel))));
+        }
+        QVERIFY2(compared >= 1, "没有可比对的报次抬头");
+
+        // ── 报次卡片：高度同样由内容撑开，抬头两行不能被裁 ─────────────────────
+        QList<QQuickItem*> reportRows;
+        for (auto* item : visualItems(panel)) {
+            if (item->objectName() == QStringLiteral("eventDetailReportRow") && item->isVisible())
+                reportRows.append(item);
+        }
+        QVERIFY2(reportRows.size() >= 2, "展开后应至少有两个报次卡片");
+        for (auto* row : reportRows) {
+            // 卡片里是一列（x=12/y=10 的 Column），内容高度 + 上下各 10 必须装得下。
+            QQuickItem* column = nullptr;
+            for (auto* child : row->childItems()) {
+                if (child->metaObject()->className() == QLatin1String("QQuickColumn"))
+                    column = child;
+            }
+            QVERIFY2(column, "报次卡片缺少内层 Column");
+            QVERIFY2(row->height() + 0.5 >= column->implicitHeight() + 20.0,
+                     qPrintable(QStringLiteral("报次卡片高 %1 装不下内容 %2 + 上下边距 20")
+                                    .arg(row->height())
+                                    .arg(column->implicitHeight())));
+        }
+
+        // ── 摘要变长时不能把折叠开关挤出卡片 ───────────────────────────────────
+        auto* summary = window->findChild<QQuickItem*>("eventDetailReportSummary");
+        QVERIFY2(summary, "报数标题缺少测定状态摘要");
+        QVERIFY2(!summary->property("text").toString().isEmpty(), "摘要应显示测定状态");
+        const double summaryRight =
+            summary->mapToItem(panel, QPointF(summary->width(), 0)).x();
+        const double toggleLeft =
+            toggleLabel->mapToItem(panel, QPointF(0, 0)).x();
+        QVERIFY2(summaryRight <= toggleLeft + 0.01,
+                 qPrintable(QStringLiteral("摘要把折叠开关压出了原位：摘要右缘 %1 > 「%2」左缘 %3")
+                                .arg(summaryRight)
+                                .arg(toggleLabel->property("text").toString())
+                                .arg(toggleLeft)));
+        const QPointF toggleRight =
+            toggleIcon->mapToItem(panel, QPointF(toggleIcon->width(), 0));
+        QVERIFY2(toggleRight.x() <= panel->width() + 0.01,
+                 qPrintable(QStringLiteral("折叠开关被挤出面板：右缘 %1 > 面板宽 %2")
+                                .arg(toggleRight.x())
+                                .arg(panel->width())));
+
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/71c-detail-alignment.png"));
+        controller.closeEventDetail();
+    }
+
     /// 交互：悬停卡片浮出两个按钮；「查看详情」切到详情面板，返回键回到列表。
     void eventCardHoverButtonsOpenDetailAndBack() {
         QTemporaryDir isolated;

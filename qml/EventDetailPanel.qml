@@ -15,6 +15,30 @@ Item {
     readonly property var sources: d.sources ? d.sources : []
     readonly property var reports: d.reports ? d.reports : []
     readonly property var districts: d.districts ? d.districts : []
+    /// 报数区的**折叠态摘要**：用户不展开也要能看到「这一报是自动测定还是正式测定」。
+    /// 此前测定状态只印在展开后的每一行里，折叠时标题只剩「N 报」——同一场地震的自动
+    /// 测定与正式测定在列表里毫无区别（用户反馈「自动，你在报数那没有标注」）。
+    ///
+    /// 口径与行内文案同源（都读 C++ 成型的 `determinationText` / `numText`），不在 QML
+    /// 里再判断一次 `reviewed`/`automatic`：两处各写一遍必然有一处忘了加。
+    readonly property string reportSummary: {
+        const list = reports
+        if (!list || list.length === 0) return ""
+        const parts = []
+        const push = (text) => {
+            if (text && text.length && parts.indexOf(text) < 0) parts.push(text)
+        }
+        for (let i = 0; i < list.length; ++i) {
+            const report = list[i]
+            if (!report) continue
+            push(report.determinationText ? String(report.determinationText) : "")
+            // 单条时报种类（情报 / 第 N 报）本身就是摘要；多条时不列，避免一行塞满。
+            if (list.length === 1)
+                push(report.numText ? String(report.numText) : "")
+        }
+        // 「共 N 报」只是计数器，标题左边已经有「N 报」，不重复写进摘要。
+        return parts.join(" · ")
+    }
     property bool reportsExpanded: false
     property string openDetailId: ""
     // 详情载荷会随目录/报次更新反复重建：只在切换到另一场地震时收起报数，
@@ -77,10 +101,15 @@ Item {
                 flat: true
                 implicitWidth: 36
                 implicitHeight: 32
+                Layout.alignment: Qt.AlignVCenter
                 accessibleName: "返回事件列表"
                 onClicked: root.back()
             }
+            // 20px 标题和 11px 的状态共用一条基线：两者都不写 alignment 时按行顶对齐，
+            // 而字重/字形的 ascent 不同，实测基线差 4.4px ——「实时告警中」会明显偏高。
+            // 这是同一类错误的第四处（另外三处在数据源行、报数标题、报次抬头）。
             Text {
+                Layout.alignment: Qt.AlignBaseline
                 text: "地震详情"
                 color: root.theme.textPrimary
                 font.pixelSize: 20
@@ -88,6 +117,7 @@ Item {
             }
             Item { Layout.fillWidth: true }
             Text {
+                Layout.alignment: Qt.AlignBaseline
                 visible: root.d.active === true
                 text: "实时告警中"
                 color: root.theme.accent
@@ -235,11 +265,18 @@ Item {
                             model: root.sources
                             delegate: Rectangle {
                                 required property var modelData
+                                objectName: "eventDetailSourceRow"
                                 width: parent.width
-                                height: 52
+                                // 高度由内容撑开，而不是写死 52：52 减掉上下各 12 的边距只剩
+                                // 28px，左侧「来源名(14) + 3 + 接收时间(15)」需要 32px，溢出的
+                                // 4px 被布局器居中后上下各裁 2px，右侧按钮又按 30px 居中 ——
+                                // 两边参照系不同，看起来就是「原始 JSON 和左边文字没对齐」
+                                // （用户反馈的第一处）。边距、行高都由内容算，改字号不会再塌。
+                                height: Math.max(52, sourceRow.implicitHeight + 24)
                                 radius: 10
                                 color: root.theme.surfaceContainer
                                 RowLayout {
+                                    id: sourceRow
                                     anchors.fill: parent
                                     anchors.margins: 12
                                     spacing: 10
@@ -264,18 +301,25 @@ Item {
                                         }
                                     }
                                     GlassButton {
+                                        objectName: "eventDetailSourceRawButton"
                                         visible: modelData.hasRaw === true
                                         theme: root.theme
                                         text: "原始 JSON"
                                         iconName: "eye"
                                         flat: true
                                         implicitHeight: 30
+                                        // 显式声明垂直居中，不依赖布局器的默认对齐：
+                                        // 行高不够时（见上面的 height 说明）布局器压根没法居中，
+                                        // 会把超高的子项钉在行顶，按钮就比左边文字高出一截。
+                                        // 写死意图，以后再有人压行高也会立刻在这里看出来。
+                                        Layout.alignment: Qt.AlignVCenter
                                         accessibleName: "查看 " + modelData.tag + " 的原始 JSON"
                                         onClicked: root.openRaw(modelData)
                                     }
                                     // 旧库/未归档的来源没有原始报文：说明原因，别放一个永远点不动的灰按钮。
                                     Text {
                                         visible: modelData.hasRaw !== true
+                                        Layout.alignment: Qt.AlignVCenter
                                         text: root.d.reportsSynthesized === true
                                               ? "旧数据未保存原文" : "无原始数据"
                                         color: root.theme.outline
@@ -321,21 +365,54 @@ Item {
                                     color: root.theme.outline
                                     font.pixelSize: 11
                                 }
-                                Item { Layout.fillWidth: true }
+                                // 折叠态也要能看出测定状态：不加这一行，用户必须先展开才
+                                // 知道这一条是「自动测定」还是「正式测定」（用户反馈的正是这点）。
                                 Text {
+                                    objectName: "eventDetailReportSummary"
                                     Layout.alignment: Qt.AlignBaseline
-                                    text: root.reportsExpanded ? "收起" : "展开"
-                                    color: root.theme.outline
+                                    visible: root.reportSummary.length > 0
+                                    text: root.reportSummary
+                                    color: root.theme.accent
                                     font.pixelSize: 11
+                                    elide: Text.ElideRight
                                 }
-                                AppIcon {
-                                    Layout.alignment: Qt.AlignVCenter
-                                    name: "chevron-down"
-                                    size: 15
-                                    color: root.theme.outline
-                                    rotation: root.reportsExpanded ? 180 : 0
-                                    Behavior on rotation {
-                                        NumberAnimation { duration: root.theme.motionDuration; easing.type: Easing.OutCubic }
+                                Item { Layout.fillWidth: true }
+                                // 「展开 + 箭头」是一个整体，必须当成**一个**布局项交给基线对齐。
+                                // 拆成两个布局项时：文字按基线摆，箭头只能按 26px 的整行居中
+                                // （Qt.AlignVCenter），而 15px 图标盒与 16px 文字盒各自居中会差
+                                // 1.3px，箭头看着偏高（用户反馈的第二处）。装进一个盒子后，
+                                // 箭头是相对文字盒居中，中心严格重合，图标/字号怎么改都不会再错。
+                                Item {
+                                    id: reportToggle
+                                    Layout.alignment: Qt.AlignBaseline
+                                    implicitWidth: toggleLabel.implicitWidth + 4 + toggleArrow.width
+                                    implicitHeight: toggleLabel.height
+                                    // 交给 RowLayout 的基线就是文字基线：整簇和「报数」「N 报」
+                                    // 共用一条线，右侧不会再飘。
+                                    baselineOffset: toggleLabel.baselineOffset
+                                    Text {
+                                        id: toggleLabel
+                                        objectName: "eventDetailReportToggleLabel"
+                                        anchors.left: parent.left
+                                        text: root.reportsExpanded ? "收起" : "展开"
+                                        color: root.theme.outline
+                                        font.pixelSize: 11
+                                    }
+                                    // 用 anchors.verticalCenter 而不是在 Row 里排：定位器会接管
+                                    // 子项坐标，把 anchors 顶掉（这正是原来看起来偏的来历）。
+                                    AppIcon {
+                                        id: toggleArrow
+                                        objectName: "eventDetailReportToggleIcon"
+                                        anchors.left: toggleLabel.right
+                                        anchors.leftMargin: 4
+                                        anchors.verticalCenter: toggleLabel.verticalCenter
+                                        name: "chevron-down"
+                                        size: 15
+                                        color: root.theme.outline
+                                        rotation: root.reportsExpanded ? 180 : 0
+                                        Behavior on rotation {
+                                            NumberAnimation { duration: root.theme.motionDuration; easing.type: Easing.OutCubic }
+                                        }
                                     }
                                 }
                             }
@@ -363,6 +440,7 @@ Item {
                                 model: root.reports
                                 delegate: Rectangle {
                                     required property var modelData
+                                    objectName: "eventDetailReportRow"
                                     width: parent.width
                                     height: reportColumn.implicitHeight + 20
                                     radius: 9
@@ -378,9 +456,15 @@ Item {
                                             ColumnLayout {
                                                 Layout.fillWidth: true
                                                 spacing: 2
-                                                Row {
+                                                // 必须是 RowLayout + 基线对齐：`Row` 只顶对齐，
+                                                // 12px 的「情报」盒高 18、10px 的「正式测定」盒高 15，
+                                                // 顶对顶之后两条基线差 2.3px，「正式测定」看起来明显偏上
+                                                // （用户反馈的第三处）。同步/测定/状态是同一句话，
+                                                // 只有共用一条基线才读得成一句。
+                                                RowLayout {
                                                     spacing: 6
                                                     Text {
+                                                        Layout.alignment: Qt.AlignBaseline
                                                         text: modelData.numText
                                                         color: root.theme.textPrimary
                                                         font.pixelSize: 12
@@ -389,6 +473,7 @@ Item {
                                                     // 情报的测定状态（正式/自动）：同一场地震会先后
                                                     // 出两条情报，没有这个标签会看起来像重复条目。
                                                     Text {
+                                                        Layout.alignment: Qt.AlignBaseline
                                                         visible: modelData.determinationText !== undefined
                                                                  && String(modelData.determinationText).length > 0
                                                         text: modelData.determinationText
@@ -396,6 +481,7 @@ Item {
                                                         font.pixelSize: 10
                                                     }
                                                     Text {
+                                                        Layout.alignment: Qt.AlignBaseline
                                                         visible: modelData.statusText.length > 0
                                                         text: modelData.statusText
                                                         color: root.theme.accent
