@@ -275,6 +275,8 @@ const QList<SettingsStore::KeySignal>& SettingsStore::keySignals() {
         {"sourceEstimationEnabled", &SettingsStore::sourceEstimationEnabledChanged},
         {"sourceEstimationHoldSeconds", &SettingsStore::sourceEstimationHoldSecondsChanged},
         {"themeMode", &SettingsStore::themeModeChanged},
+        {"updateChannel", &SettingsStore::updateChannelChanged},
+        {"updateCustomProxy", &SettingsStore::updateCustomProxyChanged},
         {"vectorOverlay", &SettingsStore::vectorOverlayChanged},
         {"whewsToken", &SettingsStore::whewsTokenChanged},
     };

@@ -16,6 +16,8 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QVector>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QWebSocket>
 #include <QWebSocketServer>
 #include <cmath>
@@ -34,6 +36,7 @@
 #include "model/event_list_model.h"
 #include "prefs/settings_store.h"
 #include "service/autostart.h"
+#include "service/update_service.h"
 #include "service/sentry_service.h"
 #include "source/eew_parser.h"
 #include "source/jian_parser.h"
@@ -1830,6 +1833,219 @@ private slots:
         // 非法值回落到跟随系统，不崩也不返回脏值。
         QSettings().setValue("themeMode", "nonsense");
         QCOMPARE(SettingsStore().themeMode(), QString("system"));
+    }
+
+    /// 更新检查的通道设置：默认、持久化、非法值回落、逐项信号隔离。
+    void updateChannelSettingsDefaultPersistAndValidate() {
+        QSettings().clear();
+        SettingsStore settings;
+        QSignalSpy channelSpy(&settings, &SettingsStore::updateChannelChanged);
+        QSignalSpy proxySpy(&settings, &SettingsStore::updateCustomProxyChanged);
+        QSignalSpy autoSpy(&settings, &SettingsStore::autoCheckUpdatesChanged);
+        QVERIFY(channelSpy.isValid() && proxySpy.isValid() && autoSpy.isValid());
+
+        // 默认「自动」：直连优先，失败再走内置加速代理 —— 用户什么都不用配。
+        QCOMPARE(settings.updateChannel(), QStringLiteral("auto"));
+        QCOMPARE(settings.updateCustomProxy(), QString());
+        // 已知通道都能落盘并读回；写同样的值必须静默。
+        for (const QString& id : {QStringLiteral("direct"), QStringLiteral("custom"),
+                                  QStringLiteral("gh-proxy"), QStringLiteral("gh-proxy-v4"),
+                                  QStringLiteral("gh-proxy-v6"), QStringLiteral("gh-proxy-cdn"),
+                                  QStringLiteral("gh-proxy-axisnow"), QStringLiteral("auto")}) {
+            settings.setUpdateChannel(id);
+            QCOMPARE(settings.updateChannel(), id);
+        }
+        // 8 次写入、8 次都是真变化（最后一次从 axisnow 写回 auto）→ 每次都必须发信号。
+        QCOMPARE(channelSpy.count(), 8);
+        // 写同样的值必须完全静默。
+        settings.setUpdateChannel(QStringLiteral("auto"));
+        QCOMPARE(channelSpy.count(), 8);
+        settings.setUpdateCustomProxy(QStringLiteral("https://mirror.example.com/gh"));
+        QCOMPARE(settings.updateCustomProxy(), QStringLiteral("https://mirror.example.com/gh"));
+        QCOMPARE(proxySpy.count(), 1);
+        // 自定义代理的原始输入原样保存：不回写 scheme，用户下次打开设置看到的还是自己打的。
+        settings.setUpdateCustomProxy(QStringLiteral("mirror.example.com"));
+        QCOMPARE(settings.updateCustomProxy(), QStringLiteral("mirror.example.com"));
+        // 通道变化不许惊动「自动检查」这种无关开关。
+        QCOMPARE(autoSpy.count(), 0);
+
+        // 非法通道 id 回落到 auto，而不是变成一个「什么都检查不到」的脏值。
+        settings.setUpdateChannel(QStringLiteral("nonsense"));
+        QCOMPARE(settings.updateChannel(), QStringLiteral("auto"));
+        QSettings().setValue("updateChannel", "nonsense");
+        QCOMPARE(SettingsStore().updateChannel(), QStringLiteral("auto"));
+        // 落盘往返。
+        settings.setUpdateChannel(QStringLiteral("gh-proxy-cdn"));
+        settings.setUpdateCustomProxy(QStringLiteral("https://example.com"));
+        {
+            SettingsStore reloaded;
+            QCOMPARE(reloaded.updateChannel(), QStringLiteral("gh-proxy-cdn"));
+            QCOMPARE(reloaded.updateCustomProxy(), QStringLiteral("https://example.com"));
+        }
+        // 恢复默认：两项都要回到初始值，且逐项信号必须发出（否则下拉停在旧值上）。
+        const int beforeChannel = channelSpy.count();
+        const int beforeProxy = proxySpy.count();
+        settings.resetToDefaults();
+        QVERIFY(channelSpy.count() > beforeChannel);
+        QVERIFY(proxySpy.count() > beforeProxy);
+        QCOMPARE(settings.updateChannel(), QStringLiteral("auto"));
+        QCOMPARE(settings.updateCustomProxy(), QString());
+    }
+
+    /// 更新检查的回退链路：第 1 条通道失败后必须自动试下一条，并在成功那一条上
+    /// 取回版本号与安装包链接。
+    ///
+    /// 这里用本机 QTcpServer 扮演两种通道：一个**没人监听**的端口（连接被拒，代表
+    /// 「直连打不开」）+ 一个真回 JSON 的端口（代表「代理通」）。这条用例要钉的是
+    /// 重试循环本身 —— 通道表的取舍在 core_engine 里已逐条覆盖。
+    void updaterFallsBackToNextRoute() {
+        // 固定的最新版本载荷：v9.9.9 一定比当前构建新。
+        //
+        // **用 QJsonObject 构造而不是裸字符串字面量**：moc 的词法分析会把 raw string
+        // 里的 `//`（URL 的 scheme）当成注释开头，于是它看不到本文件里的 Q_OBJECT
+        // —— 表现是 moc 输出 0 字节、链接期报「undefined reference to vtable」。
+        // 这条坑只在 raw string 里出现，普通字符串没有问题。
+        const QString assetPrefix =
+            QStringLiteral("https://github.com/Aloys233/KomiraQuake-Desktop/releases/download/v9.9.9/");
+        const QJsonObject payloadObject{
+            {"tag_name", "v9.9.9"},
+            {"html_url", "https://github.com/Aloys233/KomiraQuake-Desktop/releases/tag/v9.9.9"},
+            {"assets", QJsonArray{
+                           QJsonObject{{"name", "KomiraQuake-9.9.9-linux-x64.AppImage"},
+                                       {"size", 52428800},
+                                       {"browser_download_url",
+                                        assetPrefix + "KomiraQuake-9.9.9-linux-x64.AppImage"}},
+                           QJsonObject{{"name", "noise.txt"},
+                                       {"size", 12},
+                                       {"browser_download_url", "https://example.com/noise.txt"}},
+                       }},
+        };
+        const QByteArray payload = QJsonDocument(payloadObject).toJson(QJsonDocument::Compact);
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        const int servedPort = server.serverPort();
+        QObject::connect(&server, &QTcpServer::newConnection, &server, [&]() {
+            while (QTcpSocket* socket = server.nextPendingConnection()) {
+                QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, payload]() {
+                    socket->readAll(); // 请求行与头都不看：任何路径都回同一份 JSON。
+                    QByteArray response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n";
+                    response += "Content-Length: " + QByteArray::number(payload.size()) + "\r\n";
+                    response += "Connection: close\r\n\r\n";
+                    response += payload;
+                    socket->write(response);
+                    socket->disconnectFromHost();
+                });
+                QObject::connect(socket, &QTcpSocket::disconnected, socket,
+                                 &QObject::deleteLater);
+            }
+        });
+        const QString servedBase = QStringLiteral("http://127.0.0.1:%1").arg(servedPort);
+        // 「目标地址」= 本机服务的 /api；「代理前缀」= 本机服务的根，于是拼出来的
+        // 候选是 `<base>/<base>/api` —— 恰好以目标结尾，安装包前缀反推那条支路也能覆盖。
+        const QString target = servedBase + QStringLiteral("/api");
+        // 127.0.0.1:1 通常没人监听 → 连接立刻被拒（不走 6 s 超时，用例才跑得快）。
+        const QString deadRoute = QStringLiteral("http://127.0.0.1:1/https://api.github.com/x");
+
+        QSettings().clear();
+        SettingsStore settings;
+        UpdateService updater(&settings);
+        updater.setReleaseEndpointForTest(target);
+        updater.setAttemptsForTest({deadRoute, servedBase + "/" + target});
+        QSignalSpy changed(&updater, &UpdateService::changed);
+        QSignalSpy openSpy(&updater, &UpdateService::openUrlRequested);
+        QVERIFY(changed.isValid() && openSpy.isValid());
+
+        updater.check(false);
+        QTRY_COMPARE_WITH_TIMEOUT(updater.state(), QStringLiteral("updateAvailable"), 15000);
+        QCOMPARE(updater.latestVersion(), QStringLiteral("9.9.9"));
+        // 成功的是第 2 条通道（加速代理），不是第 1 条（直连）。
+        QCOMPARE(updater.routeLabel(), QStringLiteral("测试通道 2"));
+        QVERIFY(updater.usedProxy());
+        QCOMPARE(updater.releaseUrl(),
+                 QStringLiteral("https://github.com/Aloys233/KomiraQuake-Desktop/releases/tag/v9.9.9"));
+
+        // 安装包：链接必须套上**本次成功的**代理前缀，否则用户点了还是打不开 github。
+        const QVariantList assets = updater.assets();
+        QCOMPARE(assets.size(), 2);
+        const QVariantMap first = assets.at(0).toMap();
+        QCOMPARE(first.value("name").toString(),
+                 QStringLiteral("KomiraQuake-9.9.9-linux-x64.AppImage"));
+        QCOMPARE(first.value("sizeText").toString(), QStringLiteral("50.0 MB"));
+        QCOMPARE(first.value("downloadUrl").toString(),
+                 servedBase + "/"
+                     + QStringLiteral("https://github.com/Aloys233/KomiraQuake-Desktop/releases/download/v9.9.9/KomiraQuake-9.9.9-linux-x64.AppImage"));
+        QCOMPARE(first.value("url").toString(),
+                 QStringLiteral("https://github.com/Aloys233/KomiraQuake-Desktop/releases/download/v9.9.9/KomiraQuake-9.9.9-linux-x64.AppImage"));
+
+        // 打开外部地址只发信号，不碰系统浏览器（否则跑测试会弹出真窗口）。
+        updater.openReleasePage();
+        QCOMPARE(openSpy.count(), 1);
+        QCOMPARE(openSpy.at(0).at(0).toUrl().toString(), updater.releaseUrl());
+        updater.openUrl(first.value("downloadUrl").toString());
+        QCOMPARE(openSpy.count(), 2);
+
+        // 全部通道失败：非静默必须报错（而不是停在「正在检查」）。
+        updater.setAttemptsForTest({deadRoute, QStringLiteral("http://127.0.0.1:1/again")});
+        updater.check(false);
+        QTRY_COMPARE_WITH_TIMEOUT(updater.state(), QStringLiteral("error"), 15000);
+        QVERIFY2(!updater.message().isEmpty(), "失败必须给出可读的原因提示");
+        QVERIFY(updater.assets().isEmpty());
+        // 上一轮成功的通道不能留到失败态里：界面会显示「更新通道 · 测试通道 2」，
+        // 让人以为这次是走代理失败的（其实一条都没通）。
+        QVERIFY2(updater.routeLabel().isEmpty(), "失败后不得残留上一次的通道名");
+        QVERIFY(!updater.usedProxy());
+
+        // 静默检查失败保持静默（回到 idle，不打扰用户）。
+        updater.setAttemptsForTest({deadRoute});
+        updater.check(true);
+        QTRY_COMPARE_WITH_TIMEOUT(updater.state(), QStringLiteral("idle"), 15000);
+    }
+
+    /// 手动运行：`KOMIRA_LIVE_UPDATE=1 ./qt_business_test updaterLiveRouteResolves`
+    ///
+    /// 线上用例：走**真实** GitHub / gh-proxy，验证「默认 auto 通道确实能拿到版本号」。
+    /// 它不进 CI（需要外网，且第三方镜像可用性不该卡住构建）；但它是唯一能证明
+    /// 那五个前缀**今天**仍然有效的证据，改动通道表后应当手动跑一次。
+    void updaterLiveRouteResolves() {
+        if (qEnvironmentVariableIsEmpty("KOMIRA_LIVE_UPDATE")) {
+            QSKIP("设置 KOMIRA_LIVE_UPDATE=1 才跑线上用例（需要外网）");
+        }
+        QSettings().clear();
+        SettingsStore settings;
+        UpdateService updater(&settings);
+        QSignalSpy changed(&updater, &UpdateService::changed);
+        QVERIFY(changed.isValid());
+        updater.check(false);
+        // 一轮完整候选（直连 + 五个代理），单个 6 s、总预算 24 s，留足余量。
+        QTRY_VERIFY_WITH_TIMEOUT(updater.state() != QStringLiteral("checking")
+                                     && updater.state() != QStringLiteral("idle"),
+                                 40000);
+        QVERIFY2(updater.state() != QStringLiteral("error"),
+                 qPrintable(QStringLiteral("所有通道都失败：%1").arg(updater.message())));
+        // 版本号必须解析出来（哪怕「已是最新」也要有版本段）。
+        QVERIFY(!updater.latestVersion().isEmpty());
+        QVERIFY(!updater.releaseUrl().startsWith(QStringLiteral("about:")));
+        qInfo() << "[live-update] state" << updater.state() << "latest"
+                << updater.latestVersion() << "route" << updater.routeLabel() << "proxy"
+                << updater.usedProxy();
+
+        // 再单独验证五个内置代理**逐个**可用：auto 通道只要第一条通就会停，
+        // 通不过的代理会被静默跳过 —— 那正是「加了五条其实四条已死」的漏检方式。
+        for (const update_channel::Proxy& proxy : update_channel::builtinProxies()) {
+            settings.setUpdateChannel(QString::fromLatin1(proxy.id));
+            UpdateService probe(&settings);
+            probe.check(false);
+            QTRY_VERIFY_WITH_TIMEOUT(probe.state() != QStringLiteral("checking")
+                                         && probe.state() != QStringLiteral("idle"),
+                                     20000);
+            QVERIFY2(probe.state() != QStringLiteral("error"),
+                     qPrintable(QStringLiteral("代理 %1 不可用：%2")
+                                    .arg(QString::fromLatin1(proxy.id), probe.message())));
+            // 标签是 UTF-8（含「（IPv4）」这类全角括号），必须 fromUtf8，
+            // 用 fromLatin1 会把三个 UTF-8 字节当成三个字符，看起来像编码错乱。
+            QCOMPARE(probe.routeLabel(), QString::fromUtf8(proxy.label));
+            QVERIFY2(probe.usedProxy(), "指定代理时 usedProxy 必须为真");
+        }
     }
 
     void versionCompare() {

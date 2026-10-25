@@ -95,6 +95,52 @@ Item {
                 }
                 Item { Layout.fillHeight: true }
                 Rectangle { Layout.fillWidth: true; Layout.margins: 12; height: 1; color: root.theme.glassBorder }
+                // 仓库入口固定在侧栏最底部（在版本号**之上**）：用户说「左下角加 GitHub 地址」，
+                // 这里就是设置页唯一恒定的左下角位置。窄屏没有侧栏，所以同一入口在
+                // 「启动与更新」分区里再给一份（见 AboutSection），两边指向同一个 URL。
+                AbstractButton {
+                    id: repositoryLink
+                    objectName: "settingsRepositoryLink"
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 8; Layout.rightMargin: 8
+                    Layout.preferredHeight: 32
+                    hoverEnabled: true
+                    focusPolicy: Qt.StrongFocus
+                    Accessible.name: "在浏览器中打开项目仓库 " + app.updater.repositoryUrl
+                    ToolTip.visible: hovered
+                    ToolTip.text: app.updater.repositoryUrl
+                    ToolTip.delay: 400
+                    onClicked: app.openExternalUrl(app.updater.repositoryUrl)
+                    background: Rectangle {
+                        radius: 8
+                        color: repositoryLink.down ? root.theme.glassCardPressed
+                             : repositoryLink.hovered ? root.theme.glassCardHover : "transparent"
+                        border.width: repositoryLink.visualFocus ? 2 : 0
+                        border.color: root.theme.accent
+                    }
+                    contentItem: RowLayout {
+                        spacing: 8
+                        AppIcon {
+                            Layout.leftMargin: 6
+                            name: "github"; size: 14
+                            color: repositoryLink.hovered ? root.theme.accent : root.theme.outline
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            // 侧栏只有 220 px，放完整 URL 必然被截断；显示 `owner/repo`，
+                            // 完整地址交给 ToolTip 与无障碍名。
+                            text: "Aloys233/KomiraQuake-Desktop"
+                            color: repositoryLink.hovered ? root.theme.accent : root.theme.outline
+                            font.pixelSize: 11
+                            elide: Text.ElideRight
+                        }
+                        AppIcon {
+                            Layout.rightMargin: 6
+                            name: "external-link"; size: 12
+                            color: repositoryLink.hovered ? root.theme.accent : root.theme.outline
+                        }
+                    }
+                }
                 Text { Layout.leftMargin: 12; text: "KomiraQuake"; color: root.theme.textPrimary; font.pixelSize: 12; font.weight: Font.Medium }
                 Text {
                     objectName: "settingsVersionLabel"
@@ -217,6 +263,7 @@ Item {
                     AboutSection {
                         width: parent.width; theme: root.theme
                         visible: root.currentSection === 8; height: visible ? implicitHeight : 0
+                        onNotify: (message, success) => toast.show(message, success)
                     }
                 }
             }

@@ -4,6 +4,7 @@
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QDebug>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFileInfo>
 #include <QGuiApplication>
@@ -12,6 +13,7 @@
 #include <QStringList>
 #include <QStyleHints>
 #include <QTimeZone>
+#include <QUrl>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
@@ -382,7 +384,11 @@ AppController::AppController(QObject* parent, bool startServices)
             &AppController::onSourceEstimateChanged);
     clock_ = new NtpClock(this);
     autoStart_ = new AutoStartService(this);
-    updater_ = new UpdateService(this);
+    // 更新检查要读通道设置（直连 / 内置加速代理 / 自定义代理），故把设置注入进去。
+    updater_ = new UpdateService(settings_, this);
+    // 更新服务不直接开浏览器：统一转给 AppController 的出口，顺便让单测能屏敝它。
+    connect(updater_, &UpdateService::openUrlRequested, this,
+            [this](const QUrl& url) { openExternalUrl(url.toString()); });
 
     historyStore_ = new HistoryStore();
     const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
@@ -1846,6 +1852,21 @@ void AppController::setSimulatedUrl(const QString& url) {
 
 void AppController::refreshClock() {
     if (clock_) clock_->refresh();
+}
+
+void AppController::openExternalUrl(const QString& url) {
+    if (url.isEmpty()) return;
+    const QUrl target(url);
+    // 只放行 http(s)：更新/仓库地址都是网页，其余 scheme（file: / 自定义协议）不该由
+    // 数据驱动的文本随意触发系统处理器。
+    if (!target.isValid() || (target.scheme() != QLatin1String("https")
+                              && target.scheme() != QLatin1String("http"))) {
+        qInfo() << "[app] refuse to open non-http url:" << url;
+        return;
+    }
+    qInfo() << "[app] open external url:" << url;
+    emit externalUrlRequested(url);
+    QDesktopServices::openUrl(target);
 }
 
 QPointF AppController::wgs84ToGcj02(double lat, double lng) const {

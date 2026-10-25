@@ -213,6 +213,9 @@ public:
     Q_INVOKABLE void setSimulatedUrl(const QString& url);
     /// 立即重新校时一次（不打断周期调度）。
     Q_INVOKABLE void refreshClock();
+    /// 用系统浏览器打开外部地址（更新下载页、仓库主页…）。**全应用唯一的开网页出口**：
+    /// QML 不直接碰 QDesktopServices，测试也只需屏敝这一个函数即可断言「点了会开哪个地址」。
+    Q_INVOKABLE void openExternalUrl(const QString& url);
     Q_INVOKABLE QPointF wgs84ToGcj02(double lat, double lng) const;
     Q_INVOKABLE QPointF gcj02ToWgs84(double lat, double lng) const;
     Q_INVOKABLE void dismissWarningOverlay();
@@ -226,6 +229,10 @@ signals:
     /// 分级提醒：tier ∈ {alert, eew, info}。alert = 通过本地烈度过滤的预警，
     /// eew = 其余实时预警，info = 新入库的目录地震信息。托盘按设置决定通知/置顶。
     void notifiableEvent(const QVariantMap& event, const QString& tier);
+    /// 请求打开一个外部地址（在真正交给系统浏览器**之前**发出）。
+    /// 用途有二：回归可以断言「点了仓库入口会打开哪个 URL」而不必真的拉起浏览器；
+    /// 也方便将来把「最近打开过的链接」之类的反馈挂在这条链路上。
+    void externalUrlRequested(const QString& url);
     void statusChanged();
     void clockChanged();
     void locationChanged();

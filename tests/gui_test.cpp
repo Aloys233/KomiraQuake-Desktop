@@ -4147,6 +4147,182 @@ private slots:
         QVERIFY2(qmlErrors.isEmpty(), qPrintable(qmlErrors.join('\n')));
     }
 
+    // ===== 更新通道与仓库入口（设置页真实接线） =====
+    //
+    // 用户提的两件事都在「设置 › 启动与更新」里：① 检查更新要能走 gh-proxy 加速代理，
+    // 并且允许自定义；② 左下角要有 GitHub 仓库地址。这条用例只测**接线**：下拉里真的
+    // 列出五个内置代理、选中后写进设置并立刻按新通道重查、自定义输入框回车即应用、
+    // 仓库入口点了会打开正确地址。通道拼接与回退次序在 core_engine / qt_business 里。
+    void settingsUpdateChannelAndRepositoryLink() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("UpdateChannelSettingsTest");
+
+        AppController controller(nullptr, false);
+        // 更新检查要联网：这条用例不点「检查更新」，只改通道与观察真实接线。
+        QQmlApplicationEngine engine;
+        QStringList qmlErrors;
+        connect(&engine, &QQmlEngine::warnings, this, [&](const QList<QQmlError>& warnings) {
+            for (const auto& warning : warnings) {
+                const auto message = warning.toString();
+                if (message.contains("SettingsPage.qml") || message.contains("AboutSection.qml")
+                    || message.contains("TypeError") || message.contains("ReferenceError")
+                    || message.contains("Binding loop"))
+                    qmlErrors.append(message);
+            }
+        });
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showSettings", true);
+        QTest::qWait(100);
+
+        auto* page = window->findChild<QQuickItem*>("settingsPage");
+        QVERIFY(page);
+        // ---- ① 侧栏左下角的仓库入口 ----
+        auto* repoLink = findVisualItem(window, "settingsRepositoryLink");
+        QVERIFY2(repoLink, "设置页侧栏左下角必须有 GitHub 仓库入口");
+        QVERIFY(repoLink->isVisible());
+        QCOMPARE(controller.updater()->repositoryUrl(),
+                 QStringLiteral("https://github.com/Aloys233/KomiraQuake-Desktop"));
+        // 位置：侧栏内部、靠底（版本号之上）。只断言「在侧栏里且低于一半高度」，
+        // 不写死像素 —— 侧栏项目数变化时布局会上下浮动。
+        auto* sidebar = window->findChild<QQuickItem*>("settingsSidebar");
+        QVERIFY(sidebar);
+        const QRectF linkRect(repoLink->mapToItem(sidebar, QPointF(0, 0)), repoLink->size());
+        QVERIFY2(linkRect.top() > sidebar->height() * 0.5,
+                 qPrintable(QStringLiteral("仓库入口不在左下角：top=%1 / sidebar=%2")
+                                .arg(linkRect.top())
+                                .arg(sidebar->height())));
+        // 点了会请求打开仓库地址（AppController 的唯一出口，这里不发真实浏览器）。
+        QSignalSpy openSpy(&controller, &AppController::externalUrlRequested);
+        QVERIFY(openSpy.isValid());
+        QVERIFY(clickByName(window, "settingsRepositoryLink"));
+        QTRY_COMPARE(openSpy.count(), 1);
+        QCOMPARE(openSpy.at(0).at(0).toString(),
+                 QStringLiteral("https://github.com/Aloys233/KomiraQuake-Desktop"));
+        // 非 http(s) 一律拒开（防止把数据驱动的文本交给系统处理器）。
+        controller.openExternalUrl(QStringLiteral("file:///etc/passwd"));
+        QCOMPARE(openSpy.count(), 1);
+
+        // ---- ② 更新通道下拉 ----
+        QVERIFY(clickByName(window, "settingsNav-about"));
+        QTRY_COMPARE(page->property("currentSection").toInt(), 8);
+        auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
+        QVERIFY(scroll);
+        const auto scrollTo = [&](QQuickItem* item) {
+            QVERIFY(item);
+            const QPointF inFlick =
+                item->mapToItem(scroll, QPointF(item->width() / 2, item->height() / 2));
+            scroll->setProperty("contentY", scroll->property("contentY").toReal() + inFlick.y()
+                                                - scroll->height() * 0.45);
+            QTest::qWait(80);
+        };
+        auto* combo = findVisualItem(window, "updateChannelCombo");
+        auto* proxyField = findVisualItem(window, "customProxyField");
+        QVERIFY2(combo && proxyField, "更新通道下拉与自定义代理输入框必须在设置页里");
+        scrollTo(combo);
+        // 3 条行为通道 + 5 个内置加速代理。
+        QCOMPARE(combo->property("count").toInt(), 8);
+        QCOMPARE(combo->property("currentIndex").toInt(), 0); // 默认「自动」
+        QCOMPARE(controller.settings()->updateChannel(), QStringLiteral("auto"));
+        // 下拉文案必须真的把五个代理列出来（只断言数量会被「随便填八条」骗过）。
+        QStringList comboLabels;
+        {
+            const QVariantList model = combo->property("model").value<QVariantList>();
+            for (const QVariant& item : model) comboLabels << item.toString();
+        }
+        for (const QString& host : {QStringLiteral("gh-proxy.org"), QStringLiteral("v4.gh-proxy.org"),
+                                    QStringLiteral("v6.gh-proxy.org"), QStringLiteral("cdn.gh-proxy.org"),
+                                    QStringLiteral("axisnow.gh-proxy.org")}) {
+            bool found = false;
+            for (const QString& label : comboLabels) {
+                if (label.contains(host)) found = true;
+            }
+            QVERIFY2(found, qPrintable(QStringLiteral("通道下拉里缺少 %1：%2")
+                                           .arg(host, comboLabels.join(" | "))));
+        }
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/64-settings-update-channel.png"));
+
+        // 选第 6 项（axisnow）→ 设置跟上，下拉反向也跟上（Binding 没被拖断）。
+        QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, 7));
+        QTRY_COMPARE(controller.settings()->updateChannel(), QStringLiteral("gh-proxy-axisnow"));
+        // 反向：改设置，下拉必须跟着动（选项序：auto / direct / custom / gh-proxy /
+        // v4 / v6 / cdn / axisnow）。
+        controller.settings()->setUpdateChannel(QStringLiteral("gh-proxy-cdn"));
+        QTRY_COMPARE(combo->property("currentIndex").toInt(), 6);
+
+        // 自定义通道：输入框启用，回车即写入设置。
+        QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, 2));
+        QTRY_COMPARE(controller.settings()->updateChannel(), QStringLiteral("custom"));
+        QTRY_VERIFY(proxyField->isEnabled());
+        scrollTo(proxyField);
+        // 「应用并检查」会真的发一次检查请求：钉成一个本机拒绝连接的候选，
+        // 既不碰外网，也让「应用后立刻重查」这条副作用可断言。
+        controller.updater()->setAttemptsForTest({QStringLiteral("http://127.0.0.1:1/none")});
+        proxyField->setProperty("text", QStringLiteral("https://mirror.example.com/gh"));
+        // 回车只发给**有焦点**的输入框；不显式拿焦点的话按键会落到设置页根项上，
+        // 于是这条断言会以「设置没变」的形式失败，看起来像 onAccepted 没接。
+        proxyField->forceActiveFocus(Qt::MouseFocusReason);
+        QTRY_VERIFY(proxyField->hasActiveFocus());
+        QTest::keyClick(window, Qt::Key_Return);
+        QTRY_COMPARE(controller.settings()->updateCustomProxy(),
+                     QStringLiteral("https://mirror.example.com/gh"));
+        // 应用即检查：失败态落到 error（本机拒绝连接），而不是停在 idle。
+        QTRY_COMPARE_WITH_TIMEOUT(controller.updater()->state(), QStringLiteral("error"), 10000);
+        controller.updater()->setAttemptsForTest({});
+        // 「清除」把输入框与设置一起清空。
+        auto* clearProxy = findVisualItem(window, "resetCustomProxyButton");
+        QVERIFY(clearProxy && clearProxy->isVisible());
+        QVERIFY(clickByName(window, "resetCustomProxyButton"));
+        QTRY_COMPARE(controller.settings()->updateCustomProxy(), QString());
+        controller.settings()->setUpdateCustomProxy(QString());
+        QTest::qWait(60);
+        QTRY_COMPARE(proxyField->property("text").toString(), QString());
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/64b-settings-custom-proxy.png"));
+
+        // 切回「仅直连」：面板里的代理输入框应当灰掉（不可编辑但仍可见）。
+        QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, 1));
+        QTRY_COMPARE(controller.settings()->updateChannel(), QStringLiteral("direct"));
+        QTRY_VERIFY(!proxyField->isEnabled());
+
+        // 输入框必须**双向**跟着设置走：用户手打之后，外部改设置（清除 / 恢复默认）
+        // 仍要能推动它。这条用真实键盘输入来打，因为「用户打字会不会断开 QML 绑定」
+        // 只有走真正的文本输入路径才能验出来 —— C++ setProperty 可能绕过那条路径。
+        QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, 2));
+        QTRY_COMPARE(controller.settings()->updateChannel(), QStringLiteral("custom"));
+        QTRY_VERIFY(proxyField->isEnabled());
+        scrollTo(proxyField);
+        proxyField->forceActiveFocus(Qt::MouseFocusReason);
+        QTRY_VERIFY(proxyField->hasActiveFocus());
+        QTest::keyClick(window, Qt::Key_A, Qt::ControlModifier);
+        for (const QChar ch : QStringLiteral("typed.example.com")) {
+            QTest::keyClick(window, ch.toLower().toLatin1());
+        }
+        QTRY_COMPARE(proxyField->property("text").toString(),
+                     QStringLiteral("typed.example.com"));
+        controller.settings()->setUpdateCustomProxy(QStringLiteral("https://external.example"));
+        QTRY_COMPARE(proxyField->property("text").toString(),
+                     QStringLiteral("https://external.example"));
+
+        // 恢复默认：通道回「自动」、下拉与输入框都跟着回落。
+        controller.settings()->resetToDefaults();
+        QTRY_COMPARE(controller.settings()->updateChannel(), QStringLiteral("auto"));
+        QTRY_COMPARE(combo->property("currentIndex").toInt(), 0);
+        QTRY_COMPARE(controller.settings()->updateCustomProxy(), QString());
+        QTRY_COMPARE(proxyField->property("text").toString(), QString());
+        QTRY_VERIFY2(qmlErrors.isEmpty(), qPrintable(qmlErrors.join('\n')));
+    }
+
     // 侧栏只展示稳定的历史目录：实时预警不产生行（它只留在 HUD/地图）。
     // 同时验收卡片信息层级（距离列）与无定位时「500 km 内」不可选。
     void catalogListShowsStableHistoryOnly() {

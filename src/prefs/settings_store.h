@@ -10,6 +10,7 @@
 
 #include "core/source_estimator.h"
 #include "core/wave_fade.h"
+#include "core/update_channel.h"
 
 namespace komira {
 
@@ -89,6 +90,12 @@ public:
     /// 关闭主窗口时收进托盘（默认）；关闭时直接退出应用。
     Q_PROPERTY(bool closeToTray READ closeToTray WRITE setCloseToTray NOTIFY closeToTrayChanged)
     Q_PROPERTY(bool autoCheckUpdates READ autoCheckUpdates WRITE setAutoCheckUpdates NOTIFY autoCheckUpdatesChanged)
+    /// 更新检查走的通道：`auto`（默认，直连优先再走内置加速代理）/ `direct`（只直连）/
+    /// `custom`（自定义代理）/ 某个内置代理的 id（`gh-proxy` 等，见 core/update_channel.h）。
+    Q_PROPERTY(QString updateChannel READ updateChannel WRITE setUpdateChannel NOTIFY updateChannelChanged)
+    /// 自定义加速代理前缀（如 `https://gh-proxy.org`）。仅在 `updateChannel == "custom"` 时使用；
+    /// 留空或非法时检查退化为内置代理次序，不做「尽力猜」。读取返回原始输入（供输入框回显）。
+    Q_PROPERTY(QString updateCustomProxy READ updateCustomProxy WRITE setUpdateCustomProxy NOTIFY updateCustomProxyChanged)
     /// 本地震源推算（Beta）：只吃实时测站强度场，不产事件、不参与告警。
     Q_PROPERTY(bool sourceEstimationEnabled READ sourceEstimationEnabled WRITE setSourceEstimationEnabled NOTIFY sourceEstimationEnabledChanged)
     /// 触发阈值（同制式强度）：达到它的测站进入正证据，低于它的邻近站作为删失观测。
@@ -483,6 +490,25 @@ public:
     bool autoCheckUpdates() const { return s_.value("autoCheckUpdates", true).toBool(); }
     void setAutoCheckUpdates(bool v) { set("autoCheckUpdates", v); }
 
+    /// 更新检查通道。未知值一律回落到 `auto`（旧版本残留 / 手改配置不该变成
+    /// 「什么都检查不了」）；`custom` 但自定义前缀非法时由 UpdateService 负责兜底。
+    static constexpr const char* kDefaultUpdateChannel = "auto";
+    QString updateChannel() const {
+        const QString channel = s_.value("updateChannel", kDefaultUpdateChannel).toString();
+        return updateChannelValid(channel) ? channel : QString::fromLatin1(kDefaultUpdateChannel);
+    }
+    void setUpdateChannel(const QString& v) {
+        set("updateChannel", updateChannelValid(v) ? v : QString::fromLatin1(kDefaultUpdateChannel));
+    }
+    /// 通道 id 是否合法（`auto` / `direct` / `custom` / 内置代理 id）。
+    static bool updateChannelValid(const QString& v) {
+        return update_channel::isKnownChannel(v.toStdString());
+    }
+    /// 自定义加速代理前缀。原样保存（用户输入 `gh-proxy.org` 不改写成 `https://…`，
+    /// 免得他下次打开设置看到自己没写的 scheme）；是否可用由 core 的 normalizePrefix 判定。
+    QString updateCustomProxy() const { return s_.value("updateCustomProxy", "").toString(); }
+    void setUpdateCustomProxy(const QString& v) { set("updateCustomProxy", v); }
+
     /// 本地震源推算（Beta）。**默认关闭**：它是 Beta 能力，解尚未在真实地震上校验过，
     /// 默认打开会让一张可能不准的推定震中出现在所有人的地图上；由用户显式开启。
     bool sourceEstimationEnabled() const {
@@ -557,6 +583,8 @@ signals:
     void announceEventChanged();
     void announceUpdateChanged();
     void autoCheckUpdatesChanged();
+    void updateChannelChanged();
+    void updateCustomProxyChanged();
     void backgroundBlurChanged();
     void basemapIdChanged();
     void closeToTrayChanged();

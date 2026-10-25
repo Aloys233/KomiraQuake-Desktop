@@ -25,6 +25,7 @@
 #include "core/time_sync.h"
 #include "core/travel_table.h"
 #include "core/wave_fade.h"
+#include "core/update_channel.h"
 #include "core/vector_map_data.h"
 #include "model/earthquake_event.h"
 
@@ -1187,6 +1188,162 @@ int main(int argc, char** argv) {
             std::vector<double> nan = {0, 0, std::nan(""), 0, 10, 10};
             PolygonTessellator::tessellate({Ring(nan)}, FR::EvenOdd, &m);
             check(m.empty(), "tess: NaN coordinates reject the whole ring");
+        }
+    }
+
+    // ---- 更新通道：GitHub 加速代理的候选表 --------------------------------
+    //
+    // 这一段的判据都落在「**次序**与**拼接结果**」上，而不是「列表里有几个代理」——
+    // 后者在加一条代理时总会通过，测不出真实行为。次序是这里唯一有意义的契约：
+    // 直连优先意味着用户在有网络的环境里永远不打代理；代理优先意味着他选了通道就
+    // 不必等直连那 6 s 超时。
+    {
+        using namespace komira::update_channel;
+        const std::string target = "https://api.github.com/repos/x/y/releases/latest";
+        const auto urls = [&](const std::vector<Candidate>& list) {
+            std::vector<std::string> out;
+            for (const Candidate& c : list) out.push_back(c.url);
+            return out;
+        };
+        const auto labels = [&](const std::vector<Candidate>& list) {
+            std::vector<std::string> out;
+            for (const Candidate& c : list) out.push_back(c.label);
+            return out;
+        };
+        const auto contains = [](const std::vector<std::string>& list, const std::string& v) {
+            return std::find(list.begin(), list.end(), v) != list.end();
+        };
+
+        // 五个内置代理都在表里，且各自的拼接形式就是 `<前缀>/<完整目标>`。
+        check(builtinProxies().size() == 5, "update channels: five builtin proxies");
+        for (const Proxy& proxy : builtinProxies()) {
+            const std::string prefix(proxy.prefix);
+            check(prefix.rfind("https://", 0) == 0 && !prefix.empty() && prefix.back() != '/'
+                      && prefix.find("gh-proxy.org") != std::string::npos,
+                  std::string("update channels: prefix of ") + proxy.id);
+            check(proxiedUrl(proxy.prefix, target) == std::string(proxy.prefix) + "/" + target,
+                  std::string("update channels: proxied url of ") + proxy.id);
+        }
+        check(findProxy("gh-proxy") != nullptr && findProxy("gh-proxy")->prefix
+                  == std::string("https://gh-proxy.org"),
+              "update channels: gh-proxy prefix");
+        check(findProxy("gh-proxy-v4") != nullptr
+                  && std::string(findProxy("gh-proxy-v4")->prefix) == "https://v4.gh-proxy.org",
+              "update channels: v4 prefix");
+        check(findProxy("gh-proxy-v6") != nullptr
+                  && std::string(findProxy("gh-proxy-v6")->prefix) == "https://v6.gh-proxy.org",
+              "update channels: v6 prefix");
+        check(findProxy("gh-proxy-cdn") != nullptr
+                  && std::string(findProxy("gh-proxy-cdn")->prefix) == "https://cdn.gh-proxy.org",
+              "update channels: cdn prefix");
+        check(findProxy("gh-proxy-axisnow") != nullptr
+                  && std::string(findProxy("gh-proxy-axisnow")->prefix)
+                         == "https://axisnow.gh-proxy.org",
+              "update channels: axisnow prefix");
+        check(findProxy("nonsense") == nullptr, "update channels: unknown proxy id");
+
+        // ---- auto（默认）：直连第一，代理在后 ----
+        {
+            const auto list = candidates(kAuto, "", target);
+            check(!list.empty() && list.front().url == target && !list.front().accelerator,
+                  "update channels: auto tries direct first");
+            check(urls(list).size() == builtinProxies().size() + 1,
+                  "update channels: auto covers direct plus every proxy");
+            check(contains(urls(list), proxiedUrl("https://gh-proxy.org", target))
+                      && contains(urls(list), proxiedUrl("https://axisnow.gh-proxy.org", target)),
+                  "update channels: auto covers gh-proxy family");
+        }
+
+        // ---- direct：只有直连 ----
+        {
+            const auto list = candidates(kDirect, "https://example.com", target);
+            check(list.size() == 1 && list.front().url == target,
+                  "update channels: direct ignores proxies");
+        }
+
+        // ---- 指定内置代理：该代理第一，直连兜底在最后 ----
+        {
+            const auto list = candidates("gh-proxy-v6", "", target);
+            check(!list.empty()
+                      && list.front().url == proxiedUrl("https://v6.gh-proxy.org", target),
+                  "update channels: chosen proxy goes first");
+            check(list.back().url == target && !list.back().accelerator,
+                  "update channels: direct is the last resort");
+            // 不重复：选了 v6 之后，v6 不该再作为兜底出现一次。
+            int v6Count = 0;
+            for (const Candidate& c : list) {
+                if (c.url == proxiedUrl("https://v6.gh-proxy.org", target)) ++v6Count;
+            }
+            check(v6Count == 1, "update channels: no duplicate proxy in one round");
+        }
+
+        // ---- 自定义代理 ----
+        {
+            const auto list = candidates(kCustom, "https://mirror.example.com/gh", target);
+            check(!list.empty()
+                      && list.front().url
+                             == "https://mirror.example.com/gh/" + target,
+                  "update channels: custom proxy goes first");
+            check(labels(list).front() == "自定义代理 mirror.example.com",
+                  "update channels: custom label uses host");
+            check(list.back().url == target, "update channels: custom still falls back to direct");
+            // 尾部斜杠会被归一化，不产生双斜杠。
+            const auto slash = candidates(kCustom, "https://mirror.example.com/gh/", target);
+            check(slash.front().url == "https://mirror.example.com/gh/" + target,
+                  "update channels: trailing slash normalized");
+            // 省略 scheme 时补 https://。
+            const auto bare = candidates(kCustom, "mirror.example.com", target);
+            check(bare.front().url == "https://mirror.example.com/" + target,
+                  "update channels: bare host gets https scheme");
+            // 自定义前缀正好等于某个内置代理：只请求一次。
+            const auto same = candidates(kCustom, "https://gh-proxy.org", target);
+            int ghCount = 0;
+            for (const Candidate& c : same) {
+                if (c.url == proxiedUrl("https://gh-proxy.org", target)) ++ghCount;
+            }
+            check(ghCount == 1, "update channels: custom equal to builtin is not duplicated");
+            check(same.front().url == proxiedUrl("https://gh-proxy.org", target),
+                  "update channels: custom equal to builtin keeps priority");
+        }
+
+        // ---- 自定义前缀未填/非法：跳过它，仍先走内置代理（不能悄悄变回直连优先） ----
+        {
+            const auto empty = candidates(kCustom, "   ", target);
+            check(!empty.empty() && empty.front().accelerator,
+                  "update channels: empty custom still prefers proxies");
+            check(empty.back().url == target, "update channels: empty custom keeps direct fallback");
+            const auto bad = candidates(kCustom, "htps://broken", target);
+            check(bad.front().accelerator && bad.back().url == target,
+                  "update channels: invalid custom falls back to builtin proxies");
+            check(normalizePrefix("htps://broken").empty(), "update channels: typo scheme rejected");
+            check(normalizePrefix("ftp://example.com").empty(), "update channels: ftp scheme rejected");
+            check(normalizePrefix("https://exa mple.com").empty(), "update channels: whitespace rejected");
+            check(normalizePrefix("https://").empty(), "update channels: scheme only rejected");
+            check(normalizePrefix("https://example.com/?x=1").empty(),
+                  "update channels: query string rejected");
+            check(normalizePrefix("  https://example.com//  ") == "https://example.com",
+                  "update channels: trims whitespace and slashes");
+            check(normalizePrefix("HTTP://Example.com") == "HTTP://Example.com",
+                  "update channels: case-insensitive scheme accepted");
+        }
+
+        // ---- 未知通道 id：按 auto 处理（旧配置/手改不该变成「检查不了」） ----
+        {
+            check(isKnownChannel(kAuto) && isKnownChannel(kDirect) && isKnownChannel(kCustom)
+                      && isKnownChannel("gh-proxy"),
+                  "update channels: known ids");
+            check(!isKnownChannel("nonsense"), "update channels: unknown channel id");
+            const auto list = candidates("nonsense", "", target);
+            check(!list.empty() && list.front().url == target,
+                  "update channels: unknown channel behaves like auto");
+        }
+
+        // ---- 每个候选都要能独立被识别（日志与「当前走的哪条」都靠它） ----
+        {
+            const auto list = candidates(kAuto, "", target);
+            for (const Candidate& c : list) {
+                check(!c.label.empty() && !c.url.empty(), "update channels: candidate is describable");
+            }
         }
     }
 

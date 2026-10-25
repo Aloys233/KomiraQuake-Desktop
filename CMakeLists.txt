@@ -374,12 +374,14 @@ if(BUILD_TESTING)
         src/source/simulated_source.cpp
         src/source/sub_source_catalog.cpp
         src/service/sentry_service.cpp
+        src/service/update_service.cpp
         src/service/source_estimation_service.cpp
         src/service/travel_time_arrivals.h
         src/core/source_estimator.cpp src/core/region_names.cpp
         src/model/event_list_model.cpp src/model/event_list_model.h
         src/store/history_store.cpp src/prefs/settings_store.cpp)
     target_include_directories(qt_business_test PRIVATE src)
+    target_compile_definitions(qt_business_test PRIVATE KOMIRA_VERSION="${PROJECT_VERSION}")
     target_link_libraries(qt_business_test PRIVATE Qt6::Test Qt6::Network Qt6::WebSockets Qt6::Sql sentry)
     komira_copy_crashpad_handler(qt_business_test)
     add_test(NAME qt_business COMMAND qt_business_test)
