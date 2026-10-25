@@ -2217,6 +2217,120 @@ private slots:
         }
     }
 
+    /// 情报报次槽从「发布时刻」改成「测定状态」后的旧库搬家 + 来源标签列。
+    ///
+    /// 两条都是 2026-10-25 那次现场缺陷留下的数据问题：
+    /// · 旧槽 `i:<毫秒>` 让同一份情报被 Wolfx（有 ReportTime）与 Jian（没有）拆成两行，
+    ///   详情把一报显示成「2 报」；
+    /// · events 表只存了最后写入那一路的来源，重启后列表里另一路聚合源彻底消失。
+    void reportArchiveMigratesInfoSlotsAndKeepsSourceTags() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath("info_slots.sqlite");
+        const long long origin = 1'800'000'000'000LL;
+        const QString key = quakePrimaryGroupKey("CENC", origin, 30.0, 103.0);
+        QVERIFY(!key.isEmpty());
+        {
+            HistoryStore store;
+            QVERIFY(store.init(path));
+            // 旧版写入的两行：同一份「自动测定」情报，槽是各自的发布时刻。
+            StoredReport jian;
+            jian.quakeKey = key;
+            jian.reportKey = QStringLiteral("i:%1").arg(origin);
+            jian.reportNum = 1;
+            jian.sourceId = QStringLiteral("jian");
+            jian.sourceTag = QStringLiteral("Jian·CENC");
+            jian.receivedAt = origin + 30'000;
+            jian.timestamp = origin;
+            jian.magnitude = 4.8;
+            jian.latitude = 32.47;
+            jian.longitude = 94.05;
+            jian.location = QStringLiteral("西藏那曲市巴青县");
+            jian.isInfo = true;
+            jian.determination = QStringLiteral("automatic");
+            StoredReport wolfx = jian;
+            wolfx.reportKey = QStringLiteral("i:%1").arg(origin + 171'000);
+            wolfx.reportTime = origin + 171'000;
+            wolfx.sourceId = QStringLiteral("wolfx");
+            wolfx.sourceTag = QStringLiteral("Wolfx·CENC");
+            wolfx.receivedAt = origin + 33'000;
+            store.upsertReports({jian, wolfx});
+            QCOMPARE(store.loadReports(key).size(), qsizetype(2));
+        }
+        {
+            // 重开：旧槽被搬到 `i:automatic`，两路聚合源落进同一行（主键含 source_id）。
+            HistoryStore store;
+            QVERIFY(store.init(path));
+            const auto rows = store.loadReports(key);
+            QCOMPARE(rows.size(), qsizetype(2));
+            for (const StoredReport& r : rows) {
+                QCOMPARE(r.reportKey, QStringLiteral("i:automatic"));
+                QCOMPARE(r.determination, QStringLiteral("automatic"));
+                QVERIFY(r.sourceId == QStringLiteral("jian") || r.sourceId == QStringLiteral("wolfx"));
+            }
+            // 幂等：再开一次不会重复、也不会把新槽当成旧槽再搬。
+            HistoryStore again;
+            QVERIFY(again.init(path));
+            QCOMPARE(again.loadReports(key).size(), qsizetype(2));
+        }
+
+        {
+            // 没有测定状态的情报退回发布时刻分槽（JMA / USGS 这类上游）：两次定稿仍独立。
+            HistoryStore store;
+            QVERIFY(store.init(path));
+            StoredReport unstated = store.loadReports(key).first();
+            unstated.quakeKey = quakePrimaryGroupKey("JMA", origin, 35.0, 140.0);
+            unstated.reportKey = QStringLiteral("i:%1").arg(origin + 5'000);
+            unstated.timestamp = origin;
+            unstated.reportTime = origin + 5'000;
+            unstated.determination.clear();
+            unstated.sourceId = QStringLiteral("wolfx");
+            unstated.sourceTag = QStringLiteral("Wolfx·JMA");
+            store.upsertReports({unstated});
+        }
+        {
+            // 迁移在 init 阶段跑：重开一次才轮到它处理上面那一行。
+            HistoryStore store;
+            QVERIFY(store.init(path));
+            const QString unstatedKey = quakePrimaryGroupKey("JMA", origin, 35.0, 140.0);
+            const auto rows = store.loadReports(unstatedKey);
+            QCOMPARE(rows.size(), qsizetype(1));
+            QCOMPARE(rows.front().reportKey, QStringLiteral("i:t%1").arg(origin + 5'000));
+        }
+
+        // ── events 表的来源标签列：并集要能跨重启活下来 ──
+        {
+            HistoryStore store;
+            QVERIFY(store.init(path));
+            EarthquakeEvent event;
+            event.id = "cenc_AU.20261025192419.9";
+            event.eventId = "AU.20261025192419.9";
+            event.source = QStringLiteral("中国地震台网 地震信息").toStdString();
+            event.sourceProvider = "Wolfx";
+            event.sourceAgency = "CENC";
+            event.sourceId = "wolfx";
+            event.magnitude = 4.8;
+            event.latitude = 32.47;
+            event.longitude = 94.05;
+            event.depth = 70.0;
+            event.location = QStringLiteral("西藏那曲市巴青县").toStdString();
+            event.timestamp = origin;
+            event.isInfo = true;
+            event.determination = "automatic";
+            event.sourceTags = {"Jian·CENC", "Wolfx·CENC"};
+            store.upsertAll({event});
+            const auto loaded = store.loadRecent(10);
+            QCOMPARE(loaded.size(), qsizetype(1));
+            QCOMPARE(loaded.front().sourceTags.size(), std::size_t(2));
+            QVERIFY(std::find(loaded.front().sourceTags.begin(), loaded.front().sourceTags.end(),
+                              "Jian·CENC")
+                    != loaded.front().sourceTags.end());
+            QVERIFY(std::find(loaded.front().sourceTags.begin(), loaded.front().sourceTags.end(),
+                              "Wolfx·CENC")
+                    != loaded.front().sourceTags.end());
+        }
+    }
+
     // ---- Whews (api.2v8.cn) ----
 
     // 站点顺序：国内备用站在前，主站在后（需求：优先备用站，不可用才用主站）。

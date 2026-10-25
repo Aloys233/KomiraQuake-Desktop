@@ -262,6 +262,12 @@ private:
     /// 同 id 就地更新或追加；避免重启后「DB 载入 + 首次目录轮询」在列表留下重复条目。
     /// 写入内存历史；返回持久化字段是否真的变化（未变则无需写库）。
     bool upsertHistory(const EarthquakeEvent& event);
+    /// 门控**之前**把本帧的 `<provider>·<agency>` 标签并进同 id 的历史行。
+    /// 另一路聚合源转送的同一份报文会被 `EventGate` 判 Duplicate 后直接 return，
+    /// 不到 upsertHistory；只在这里补标签，正文一律不动。
+    void noteHistorySourceTag(const EarthquakeEvent& event);
+    /// 按 id 取历史行（归并后的那一份）；没有则返回 nullptr。
+    const EarthquakeEvent* historyById(const std::string& id) const;
     /// 把事件排进下一批写库；同 id 去重。
     void queueHistoryWrite(const EarthquakeEvent& event);
     /// 一次事务写完全部待写事件，并 prune 一次；随后合并落盘墓碑。

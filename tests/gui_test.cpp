@@ -12,9 +12,14 @@
 #include <QDir>
 #include <QFontDatabase>
 #include <QFontInfo>
+#include <QRegularExpression>
 #include <functional>
 #include <cmath>
 #include "core/intensity_calculator.h"
+#include "source/eew_parser.h"
+#include "source/jian_parser.h"
+#include "source/jian_protocol.h"
+#include "source/wolfx_protocol.h"
 #include "core/quake_calculator.h"
 #include "core/source_estimator.h"
 #include "core/warning_session.h"
@@ -5499,6 +5504,196 @@ private slots:
     /// 同一场地震的**实时预警**与**地震情报**是两条链路，必须落进同一份报次归档：
     /// 预警按报数逐条排，情报单独标「情报」并区分自动/正式测定。发震时刻口径不同
     /// （预警到秒、情报截断到分钟）不能把它们拆成两组。
+    /// 2026-10-25 19:24 西藏那曲市巴青县 M4.8（用户报的现场）：同一份中国地震台网
+    /// 情报经 **Jian** 与 **Wolfx** 两条链路送达。用户看到的是「列表只有 Jian·CENC，
+    /// 点进详情却有 Wolfx 的数据」+「报数是自动测定，但没标注」。
+    ///
+    /// 两条链路给的是同一份上游报文，但字段口径不同：
+    ///   · Jian 只有 `originTime` / `infoTypeName:"[自动测定]"`，没有发布时刻；
+    ///   · Wolfx 有 `ReportTime:"2026-10-25 19:27:10"` / `type:"automatic"`。
+    /// 所以「同一报」的判定不能靠发布时刻（一路压根没有），列表来源标签也不能只取
+    /// 最后到的那一路（history_ 以 id 归并，后到的会把先到的来源标签挤掉）。
+    void catalogKeepsEveryAggregatorTagForOneUpstreamInfoReport() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("CatalogMultiAggregatorTagsTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+
+        // 线上抓包原样（19:24:19 那一条）。
+        const QJsonObject wolfxCenc{
+            {"EventID", "AU.20261025192419.9"}, {"ReportTime", "2026-10-25 19:27:10"},
+            {"depth", "70"}, {"intensity", "4"}, {"latitude", "32.47"},
+            {"location", "西藏那曲市巴青县"}, {"longitude", "94.05"}, {"magnitude", "4.8"},
+            {"placeName", "西藏那曲市巴青县"}, {"time", "2026-10-25 19:24:19"},
+            {"type", "automatic"}};
+        const QJsonObject jianCenc{
+            {"depth", 70}, {"id", "AU.20261025192419.9_A"}, {"infoTypeName", "[自动测定]"},
+            {"latitude", 32.47}, {"longitude", 94.05}, {"magnitude", 4.8},
+            {"originTime", static_cast<double>(1792927459000LL)},
+            {"placeName", "西藏那曲市巴青县"}};
+
+        auto jianEvent = JianParser::parseRecord(*jianChannelFor(QStringLiteral("cenc")), jianCenc,
+                                                 std::nullopt,
+                                                 IntensityStandard::Csis);
+        QVERIFY2(jianEvent.has_value(), "Jian 的 cenc 频道应能解析线上报文");
+        auto wolfxEvent = EewParser::parseCencDirectory(wolfxCenc, std::nullopt,
+                                                        IntensityStandard::Csis, now);
+        QVERIFY2(wolfxEvent.has_value(), "Wolfx 的 cenc_eqlist 应能解析线上报文");
+        // 解析器只填报文内容，`<provider>·<agency>` 由源在 emit 前打标（见 WolfxSource 的
+        // stampSource / JianSource 的 channel.agency），这里按真实接线方式补上。
+        wolfxEvent->sourceProvider = WolfxProtocol::providerName().toStdString();
+        wolfxEvent->sourceAgency = "CENC";
+        // 两条链路必须落在同一个合并键上（否则列表里就是两行）。
+        QCOMPARE(QString::fromStdString(jianEvent->identity()),
+                 QString::fromStdString(wolfxEvent->identity()));
+        // 两路都认出了「自动测定」。
+        QCOMPARE(QString::fromStdString(jianEvent->determination), QStringLiteral("automatic"));
+        QCOMPARE(QString::fromStdString(wolfxEvent->determination), QStringLiteral("automatic"));
+
+        now = 1'800'000'100'000LL;
+        jianEvent->sourceId = "jian";
+        jianEvent->receivedAt = now;
+        controller.handleEvent(*jianEvent, false, true);
+        now = 1'800'000'130'000LL;
+        wolfxEvent->sourceId = "wolfx";
+        wolfxEvent->receivedAt = now;
+        controller.handleEvent(*wolfxEvent, false, true);
+
+        // ① 列表只有一行（同一份上游报文）。
+        const QVariantList list = controller.eventList();
+        QCOMPARE(list.size(), 1);
+        const QVariantMap row = list.first().toMap();
+        // ② 该行的来源标签必须包含**两路聚合源** —— 用户报的正是这里只显示 Jian·CENC。
+        const QStringList tags = row.value("sourceTags").toStringList();
+        QVERIFY2(tags.contains(QStringLiteral("Jian·CENC")),
+                 qPrintable(QStringLiteral("缺少 Jian 标签：%1").arg(tags.join(QLatin1Char(',')))));
+        QVERIFY2(tags.contains(QStringLiteral("Wolfx·CENC")),
+                 qPrintable(QStringLiteral("列表里丢了 Wolfx 标签（用户报的缺陷）：%1")
+                                .arg(tags.join(QLatin1Char(',')))));
+        // ③ 情报不带报次，标「情报」并带测定状态。
+        QCOMPARE(row.value("reportNumText").toString(), QStringLiteral("情报"));
+        QCOMPARE(row.value("determinationText").toString(), QStringLiteral("自动测定"));
+
+        // ④ 详情：同一份情报被两路送达应合成**一报**（不是两报），且来源合并到这一报。
+        controller.showEventDetail(row.value("id").toString());
+        const QVariantMap detail = controller.eventDetail();
+        const QVariantList reports = detail.value("reports").toList();
+        QCOMPARE(reports.size(), 1);
+        const QVariantMap report = reports.first().toMap();
+        QCOMPARE(report.value("numText").toString(), QStringLiteral("情报"));
+        QCOMPARE(report.value("determinationText").toString(), QStringLiteral("自动测定"));
+        const QStringList reportTags = report.value("sourceTags").toStringList();
+        QVERIFY2(reportTags.contains(QStringLiteral("Jian·CENC")),
+                 qPrintable(QStringLiteral("报数行缺少 Jian：%1").arg(reportTags.join(QLatin1Char(',')))));
+        QVERIFY2(reportTags.contains(QStringLiteral("Wolfx·CENC")),
+                 qPrintable(QStringLiteral("报数行缺少 Wolfx：%1").arg(reportTags.join(QLatin1Char(',')))));
+        // 详情顶部的来源标签同样要含两路。
+        QVERIFY(detail.value("sourceTags").toStringList().contains(QStringLiteral("Wolfx·CENC")));
+
+        // ⑤ 两路轮询的发布时刻不同（Wolfx 的 ReportTime 会随每次轮询刷新）不能把同一报
+        //    再拆一行 —— 报次槽按测定状态分，不按发布时刻。
+        now = 1'800'000'400'000LL;
+        QJsonObject wolfxLater = wolfxCenc;
+        wolfxLater.insert(QStringLiteral("ReportTime"), QStringLiteral("2026-10-25 19:28:56"));
+        auto wolfxRepoll = EewParser::parseCencDirectory(wolfxLater, std::nullopt,
+                                                        IntensityStandard::Csis, now);
+        QVERIFY(wolfxRepoll.has_value());
+        wolfxRepoll->sourceProvider = WolfxProtocol::providerName().toStdString();
+        wolfxRepoll->sourceAgency = "CENC";
+        wolfxRepoll->sourceId = "wolfx";
+        wolfxRepoll->receivedAt = now;
+        controller.handleEvent(*wolfxRepoll, false, true);
+        QCOMPARE(controller.eventDetail().value("reports").toList().size(), 1);
+
+        // ⑥ 后到的「正式测定」是同一场地震的另一次定稿：必须**新增一报**，不能因为
+        //    测定状态不同被丢掉、也不能沿用「自动测定」那一行的时标。
+        now = 1'800'001'200'000LL;
+        QJsonObject reviewedPayload = jianCenc;
+        reviewedPayload.insert(QStringLiteral("id"), QStringLiteral("AU.20261025192419.9_M"));
+        reviewedPayload.insert(QStringLiteral("infoTypeName"), QStringLiteral("[正式测定]"));
+        reviewedPayload.insert(QStringLiteral("magnitude"), 4.9);
+        auto reviewed = JianParser::parseRecord(*jianChannelFor(QStringLiteral("cenc")),
+                                                reviewedPayload, std::nullopt,
+                                                IntensityStandard::Csis);
+        QVERIFY(reviewed.has_value());
+        QCOMPARE(QString::fromStdString(reviewed->determination), QStringLiteral("reviewed"));
+        // 正式测定与自动测定的 identity 相同（id 去掉 _M/_A 后缀后对齐 Wolfx），
+        // 所以列表仍是一行，详情多一报。
+        QCOMPARE(QString::fromStdString(reviewed->identity()),
+                 QString::fromStdString(jianEvent->identity()));
+        reviewed->sourceId = "jian";
+        reviewed->receivedAt = now;
+        controller.handleEvent(*reviewed, false, true);
+        const QVariantList afterReviewed = controller.eventDetail().value("reports").toList();
+        QCOMPARE(afterReviewed.size(), 2);
+        QSet<QString> determinations;
+        for (const QVariant& entry : afterReviewed) {
+            determinations.insert(entry.toMap().value("determinationText").toString());
+        }
+        QVERIFY(determinations.contains(QStringLiteral("自动测定")));
+        QVERIFY(determinations.contains(QStringLiteral("正式测定")));
+
+        // ⑦ 列表卡片：用户报的缺陷现场就在这里 —— 每张卡片的来源胶囊必须是两条。
+        {
+            const QVariantList rows = controller.eventList();
+            QCOMPARE(rows.size(), 1);
+            QCOMPARE(rows.first().toMap().value("sourceTags").toStringList().size(), 2);
+        }
+
+        // ⑧ QML：报数区**折叠着**就要能读到测定状态（用户反馈「自动，你在报数那没有标注」）。
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        window->setProperty("showList", true);
+        QTRY_VERIFY(controller.eventModel()->rowCount() >= 1);
+        auto* sidebar = window->findChild<QQuickItem*>("eventSidebar");
+        QVERIFY(sidebar);
+        // 先拍列表：用户报的缺陷现场（卡片底部的来源胶囊只有一枚）。
+        QTRY_VERIFY_WITH_TIMEOUT(sidebar->width() > 200, 5000);
+        QTest::qWait(300);
+        // 只数**可见**的胶囊：详情面板此时还没打开，但它的 delegate 已经按早先那几次
+        // showEventDetail 建好了（隐藏），不筛可见性会把它那几枚也算进来。
+        QStringList listPills;
+        for (auto* item : visualItems(sidebar)) {
+            if (!item->isVisible()) continue;
+            const QString text = item->property("text").toString();
+            if (text == QStringLiteral("Jian·CENC") || text == QStringLiteral("Wolfx·CENC")) {
+                if (!listPills.contains(text)) listPills << text;   // 列表里每枚标签只该出现一次
+            }
+        }
+        listPills.sort();
+        QCOMPARE(listPills, QStringList({QStringLiteral("Jian·CENC"), QStringLiteral("Wolfx·CENC")}));
+        QVERIFY2(window->grabWindow().save(evidenceDirectory(window) + "/71b-list-both-aggregators.png"),
+                 "取证图保存失败");
+        sidebar->setProperty("detailEventId", row.value("id").toString());
+        auto* panel = window->findChild<QQuickItem*>("eventDetailPanel");
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        QCOMPARE(panel->property("reportsExpanded").toBool(), false);
+        auto* summary = window->findChild<QQuickItem*>("eventDetailReportSummary");
+        QVERIFY2(summary, "报数标题右侧缺少测定状态摘要");
+        const QString summaryText = summary->property("text").toString();
+        QVERIFY2(summaryText.contains(QStringLiteral("自动测定")),
+                 qPrintable(QStringLiteral("折叠态摘要里没有测定状态：%1").arg(summaryText)));
+        QVERIFY2(summary->isVisible(), "折叠态摘要必须可见");
+        // 侧栏展开有一段动画：不等它落定，取证图里整块面板还在视口外。
+        QTRY_VERIFY_WITH_TIMEOUT(sidebar->width() > 200, 5000);
+        QTest::qWait(300);
+        QVERIFY2(window->grabWindow().save(evidenceDirectory(window) + "/71-detail-report-summary.png"),
+                 "取证图保存失败");
+    }
+
     void eventDetailMergesEewAndInfoReports() {
         QTemporaryDir isolated;
         QVERIFY(isolated.isValid());

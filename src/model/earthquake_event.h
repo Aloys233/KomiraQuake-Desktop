@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+// `sourceTags` 是 std::vector<std::string>；这里显式包含，不依赖别的头间接带进来
+// （事件头被大量 TU 引用，缺了它就会在「谁先包含谁」变化时随机编译失败）。
+#include <vector>
 
 #include "model/warning_level.h"
 
@@ -29,6 +32,14 @@ struct EarthquakeEvent {
     /// 抓取该记录的数据源 ID（`wolfx` / `pancakes` / `jian` / `whews`…），
     /// 供设置页的逐源「信息事件震级过滤」在**展示层**复核。旧库记录为空。
     std::string sourceId;
+    /// 这份上游报文被哪些聚合源送达过，元素形如 `Wolfx·CENC`（`sourceTagFor` 的产物）。
+    ///
+    /// **必须是累积量，不能只放「本条记录自己的来源」**：两个聚合源转送同一份报文时
+    /// `id` 完全相同（都按 `<频道>_<上游 id>` 拼），`history_` 按 id 归并后只剩后到的那
+    /// 一条记录 —— 若标签只挂在单条记录上，先到的那个源就从列表里彻底消失了（实测
+    /// 2026-10-25 19:24 西藏那曲 M4.8：列表只显示 `Jian·CENC`，详情却有两路报次）。
+    /// 落库后重启仍完整（events 表的 `source_tags` 列）。
+    std::vector<std::string> sourceTags;
     double distanceKm = 0.0;
     /// 本条报文的原始 JSON（紧凑序列化）。只用于详情页「原始数据」展示，
     /// 不进入 events 表；报次归档见 AppController 的 event_reports。

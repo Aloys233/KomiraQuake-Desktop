@@ -120,7 +120,10 @@ bool sameStoredEvent(const EarthquakeEvent& a, const EarthquakeEvent& b) {
            a.maxIntensityText == b.maxIntensityText && a.pWaveArrival == b.pWaveArrival &&
            a.sWaveArrival == b.sWaveArrival && a.warningLevel == b.warningLevel &&
            a.reportNum == b.reportNum && a.isFinal == b.isFinal && a.isCanceled == b.isCanceled &&
-           a.isInfo == b.isInfo && a.determination == b.determination;
+           a.isInfo == b.isInfo && a.determination == b.determination &&
+           // 标签是累积量：另一路聚合源加入时字段内容没变，但这一行必须重写，
+           // 否则重启后列表又只剩最后写入的那一路。
+           a.sourceTags == b.sourceTags;
 }
 
 QString sourceTagFor(const EarthquakeEvent& event) {
@@ -133,6 +136,17 @@ QString sourceTagFor(const EarthquakeEvent& event) {
 void appendSourceTag(QStringList& tags, const EarthquakeEvent& event) {
     const QString tag = sourceTagFor(event);
     if (!tag.isEmpty() && !tags.contains(tag)) tags.push_back(tag);
+    // 累积标签优先于「本条记录自己的来源」补齐：同一份上游报文的另一路聚合源已经在
+    // 记录上打过标（见 EarthquakeEvent::sourceTags），只取当前这条会把它们丢掉。
+    for (const std::string& stored : event.sourceTags) {
+        const QString other = QString::fromStdString(stored).trimmed();
+        if (!other.isEmpty() && !tags.contains(other)) tags.push_back(other);
+    }
+}
+
+void appendUniqueTag(std::vector<std::string>& tags, const std::string& tag) {
+    if (tag.empty()) return;
+    if (std::find(tags.begin(), tags.end(), tag) == tags.end()) tags.push_back(tag);
 }
 
 QVariantMap toMap(const EarthquakeEvent& e, IntensityStandard standard = IntensityStandard::Csis) {
@@ -1887,6 +1901,9 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         // 会永久丢失，表现为「改完设置要重启才像生效」。
         const bool visibleByFilter =
             !source || settings_->passesInfoMagnitudeFilter(source->id(), event.magnitude);
+        // 标签并集在门控**之前**：另一路聚合源的同一份报文会被判 Duplicate 并 return，
+        // 那一路的来源标签只能在这里补上（见 noteHistorySourceTag）。
+        noteHistorySourceTag(event);
         const auto decision = gate_.admit(event, nowMs());
         if (decision == EventGateDecision::Duplicate || decision == EventGateDecision::Stale) {
             admit(event, AdmissionStatus::Duplicate);
@@ -1905,7 +1922,10 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
         if (isAlertLevel(event.warningLevel)) event.warningLevel = WarningLevel::Watch;
         const bool changed = upsertHistory(event);
         if (changed) {
-            queueHistoryWrite(event);
+            // 落盘写的是**归并后的那一行**，不是这一帧：标签并集在 upsertHistory 里做，
+            // 写回原始事件会把刚并进去的另一路标签抹掉（重启后又只剩最后写入的那一路）。
+            const EarthquakeEvent* stored = historyById(event.id);
+            queueHistoryWrite(stored ? *stored : event);
             // 仅对「刚发生」的新信息提醒；启动时回填几百条历史不应刷屏。
             const long long stamp = event.reportTime > 0 ? event.reportTime : event.timestamp;
             const long long now = nowMs();
@@ -2028,17 +2048,59 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
 }
 
 bool AppController::upsertHistory(const EarthquakeEvent& event) {
+    // 同一份上游报文被两路聚合源送达时 `id` 相同（`<频道>_<上游 id>`），这里是把它们
+    // 归并成一行的唯一位置，所以**标签必须在这里并集**：只保留「本条记录的来源」会让
+    // 先到的那一路从列表里消失（用户实测：西藏 19:24 那场只剩 `Jian·CENC`，详情里却有
+    // Wolfx 的报次）。并集是单调的 —— 标签只增不减，目录整表重发也不会把另一路挤掉。
+    EarthquakeEvent merged = event;
+    appendUniqueTag(merged.sourceTags, sourceTagFor(event).toStdString());
     for (int i = 0; i < history_.size(); ++i) {
-        if (history_[i].id == event.id) {
-            if (sameStoredEvent(history_[i], event)) return false;
-            history_[i] = event;
-            historyDirty_ = true;
-            return true;
-        }
+        if (history_[i].id != merged.id) continue;
+        for (const std::string& tag : history_[i].sourceTags) appendUniqueTag(merged.sourceTags, tag);
+        if (sameStoredEvent(history_[i], merged)) return false;
+        history_[i] = std::move(merged);
+        historyDirty_ = true;
+        return true;
     }
-    history_.push_back(event);
+    history_.push_back(std::move(merged));
     historyDirty_ = true;
     return true;
+}
+
+void AppController::noteHistorySourceTag(const EarthquakeEvent& event) {
+    // `EventGate` 把「另一路聚合源转送的同一份报文」判成 Duplicate 后 handleEvent 会直接
+    // 返回，`upsertHistory` 因此根本跑不到 —— 而这里正是用户看到缺陷的路径：同一份 CENC
+    // 情报先由 Jian 落进 history_，再由 Wolfx 送来时被门控丢掉，列表里就只剩 `Jian·CENC`，
+    // 详情页（读的是 event_reports 归档，归档在门控**之前**记录）却两路都在。
+    //
+    // 所以标签并集必须在门控**之前**做，且只动标签、不动正文：Duplicate 的语义是
+    // 「这条报文内容没有新信息」，不是「这个源不存在」。
+    const QString tag = sourceTagFor(event);
+    if (tag.isEmpty()) return;
+    for (int i = 0; i < history_.size(); ++i) {
+        EarthquakeEvent& stored = history_[i];
+        if (stored.id != event.id) continue;
+        const std::string value = tag.toStdString();
+        if (std::find(stored.sourceTags.begin(), stored.sourceTags.end(), value)
+            != stored.sourceTags.end())
+            return;
+        stored.sourceTags.push_back(value);
+        historyDirty_ = true;
+        queueHistoryWrite(stored);
+        // Duplicate 分支在 handleEvent 里直接 `return`，走不到后面的
+        // `scheduleDirectoryUiRefresh()`：标签刚变了就自己排一次刷新，否则列表要等下一帧
+        // 目录/预警才更新，用户仍会觉得「另一路没出现」。
+        scheduleDirectoryUiRefresh();
+        return;
+    }
+    // history_ 里还没有这条（首次入库会被 upsertHistory 自己补上标签）。
+}
+
+const EarthquakeEvent* AppController::historyById(const std::string& id) const {
+    for (const EarthquakeEvent& event : history_) {
+        if (event.id == id) return &event;
+    }
+    return nullptr;
 }
 
 void AppController::queueHistoryWrite(const EarthquakeEvent& event) {
@@ -2292,12 +2354,23 @@ QStringList AppController::reportCandidateKeys(const EarthquakeEvent& event) {
 
 QString AppController::reportSlotKey(const EarthquakeEvent& event) {
     // 预警：同报被多路聚合源收到要合成一行，所以槽就是报数。
-    // 情报：没有报数（解析器一律给 1），同一场地震还会先出「自动测定」、后出「正式
-    // 测定」两条，必须各自留行；用发布时刻做槽，同一份报文重复轮询才会命中同一行。
     if (event.isCanceled && !event.isInfo) return QStringLiteral("c");
     if (!event.isInfo) return QStringLiteral("n:") + QString::number(event.reportNum > 0 ? event.reportNum : 1);
+    // 情报：没有报数（解析器一律给 1），但**同一场地震确实会有多条内容不同的情报** ——
+    // 中国地震台网先发「自动测定」、几十分钟后再发「正式测定」，两者是同一场地震的
+    // 两次定稿，必须各占一行；同一份情报被两路聚合源重复轮询则必须落在同一行。
+    //
+    // 有测定状态时**只能**按它分槽，不能用发布时刻：发布时刻是各聚合源的字段口径，
+    // 同一份上游报文经 Wolfx 有 `ReportTime`（19:27:10）、经 Jian 压根没有（留 0 →
+    // 退回发震时刻 19:24:19），用时刻做槽会把同一报拆成两行（实测：一报显示成「2 报」）。
+    //
+    // 没有测定状态的源（JMA 情报、USGS 目录、部分省级台网）退回发布时刻做槽 —— 它们的
+    // 各链路都带发布时刻，此时「同一时刻 = 同一报」仍然成立，而不同波的两次定稿也不会
+    // 被压成一条。
+    if (!event.determination.empty())
+        return QStringLiteral("i:") + QString::fromStdString(event.determination);
     const long long stamp = event.reportTime > 0 ? event.reportTime : event.timestamp;
-    return QStringLiteral("i:") + QString::number(stamp);
+    return QStringLiteral("i:t") + QString::number(stamp);
 }
 
 QString AppController::resolveReportSlot(const ReportGroup& group, const EarthquakeEvent& event) {
@@ -2313,7 +2386,10 @@ QString AppController::resolveReportSlot(const ReportGroup& group, const Earthqu
     // 同一槽已被占用：要么是同一份报文（另一路聚合源转送），要么是同一分钟同一网格里
     // 另一场地震的第 1 报。两者只能靠一起点时刻与上游 ID 区分 —— 同一场地震的各链路
     // 起点时刻一致（差 ≤2 s），相邻两场小震不会。
-    if (event.isInfo) return base;   // 情报的槽含发布时刻，撞车即同一份报文
+    // 情报的槽只按测定状态分（`i:automatic` / `i:reviewed`），撞车即同一份报文：
+    // 归档组本身已经过「机构 + 分钟桶 + 震中网格 + 90 s/25 km 复核」，同组同槽不会
+    // 是另一场地震。
+    if (event.isInfo) return base;
     const long long delta = existing->timestamp > event.timestamp
                                 ? existing->timestamp - event.timestamp
                                 : event.timestamp - existing->timestamp;
@@ -2665,12 +2741,23 @@ void AppController::rebuildEventDetail() {
 
     const ReportGroup group = reportGroups_.value(detailKey_);
     QVector<ReportRecord> ordered = group.reports;
-    // 排序：实时预警各报按报数升序在前，情报行按发布时刻在后。两类是不同性质的报文
-    // （预警是同一场地震的多次修正，情报是事后定稿），混在一起按报数排会让都从 1
-    // 开始的两条交替出现。
+    // 排序：实时预警各报按报数升序在前，情报行在后（先按测定状态、再按发布时刻）。
+    // 两类是不同性质的报文（预警是同一场地震的多次修正，情报是事后定稿），混在一起
+    // 按报数排会让都从 1 开始的两条交替出现。
     std::sort(ordered.begin(), ordered.end(), [](const ReportRecord& a, const ReportRecord& b) {
         if (a.isInfo != b.isInfo) return !a.isInfo;
         if (a.isInfo) {
+            // 同一场地震的两条情报是「自动测定 → 正式测定」这一条时间线，而各链路的
+            // 发布时刻口径不同（Wolfx 有、Jian 没有），先比时刻会让顺序随哪一路先到而
+            // 翻转。测定状态是固定顺序的语义值，用它排；同状态才退回发布时刻。
+            const auto rank = [](const QString& determination) {
+                if (determination == QLatin1String("automatic")) return 0;
+                if (determination == QLatin1String("reviewed")) return 1;
+                return 2;   // 没有测定状态的上游（JMA / USGS / 部分省级台网）排最后
+            };
+            const int rankA = rank(a.determination);
+            const int rankB = rank(b.determination);
+            if (rankA != rankB) return rankA < rankB;
             const long long stampA = a.reportTime > 0 ? a.reportTime : a.timestamp;
             const long long stampB = b.reportTime > 0 ? b.reportTime : b.timestamp;
             if (stampA != stampB) return stampA < stampB;

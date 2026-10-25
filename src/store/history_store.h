@@ -3,11 +3,42 @@
 #include <QHash>
 #include <QSqlDatabase>
 #include <QString>
+#include <QStringList>
 #include <QVector>
+
+#include <string>
+#include <vector>
 
 #include "model/earthquake_event.h"
 
 namespace komira {
+
+/// `EarthquakeEvent::sourceTags` ↔ events 表的 `source_tags` 列。
+///
+/// 用换行分隔而不是逗号：标签本身是 `<provider>·<agency>`（如 `Wolfx·CENC`），机构段
+/// 可能是中文机构名（`北京地震局`），若将来出现带标点的上游名，逗号/分号都会歧义；
+/// 换行不可能出现在单个标签里，解析退化为一次 split。
+inline QString sourceTagsToText(const std::vector<std::string>& tags) {
+    QStringList parts;
+    parts.reserve(static_cast<qsizetype>(tags.size()));
+    for (const std::string& tag : tags) {
+        const QString text = QString::fromStdString(tag).trimmed();
+        if (!text.isEmpty()) parts.push_back(text);
+    }
+    return parts.join(QLatin1Char('\n'));
+}
+
+inline std::vector<std::string> sourceTagsFromText(const QString& text) {
+    std::vector<std::string> tags;
+    if (text.isEmpty()) return tags;
+    const QStringList parts = text.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    tags.reserve(static_cast<std::size_t>(parts.size()));
+    for (const QString& part : parts) {
+        const QString trimmed = part.trimmed();
+        if (!trimmed.isEmpty()) tags.push_back(trimmed.toStdString());
+    }
+    return tags;
+}
 
 /// 一条报次记录（某个源收到的某一报）。详情页的「数据源 / 报数」两段都靠它。
 /// 与 events 表分开存：同一场地震会收到多报、每报又可能经多个聚合源送达，
@@ -63,6 +94,8 @@ private:
     bool createTable();
     /// 把升级前的 event_reports 行搬到新主键（quake_key 重算、report_key = `n:<num>`）。
     bool migrateLegacyReports();
+    /// 情报的报次槽从 `i:<发布时刻>` 改成 `i:<测定状态>`（跨链路口径对齐，见 reportSlotKey）。
+    bool migrateInfoReportSlots();
     bool writeReportsBlocking(const QVector<StoredReport>& reports);
 
     QSqlDatabase db_;

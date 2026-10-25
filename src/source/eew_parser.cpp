@@ -40,6 +40,21 @@ std::optional<QString> firstString(const QJsonObject& obj, const QStringList& ke
     for (const QString& key : keys) {
         const QJsonValue v = obj.value(key);
         if (v.isUndefined() || v.isNull()) continue;
+        // **数值 ID 必须转成字符串**：Wolfx 的 `cwa_eew` 给 `"ID":1150079`（number，
+        // 且完全没有 `EventID`），`fj_eew` 的 `ID` 也是 number。`QJsonValue::toString()`
+        // 对数字返回空串，于是调用方退回 `nowMs()` 合成 id —— 同一份报文每次重问都得到
+        // 不同的 eventId，被当成一场新地震（列表反复新增、去重与报次合并全部失效）。
+        // 整数值不带小数点，避免 1150079 变成 "1150079.0"。
+        if (v.isDouble()) {
+            const double d = v.toDouble();
+            if (std::isfinite(d)) {
+                return d == std::floor(d) && std::abs(d) < 1e15
+                           ? QString::number(static_cast<qint64>(d))
+                           : QString::number(d);
+            }
+            continue;
+        }
+        if (v.isBool()) continue;
         const QString s = v.toString();
         if (!s.isEmpty() && s != QStringLiteral("null")) return s;
     }
