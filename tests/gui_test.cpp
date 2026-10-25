@@ -3231,8 +3231,11 @@ private slots:
             QVERIFY2(layout.contains("a") && layout.contains("b"), "两个标签都必须有位置");
             const QVariantMap a = layout.value("a").toMap();
             const QVariantMap b = layout.value("b").toMap();
-            // 置信度高的先挑：第一个候选就是「下方」，偏移等于 gap（24）。
-            QCOMPARE(a.value("dy").toDouble(), 24.0);
+            // 置信度高的先挑：第一个候选就是「下方」。偏移量随标记几何走（十字 40 px 后
+            // gap 从 24 提到 30），这里只断言「朝下且留出了十字的空隙」，不钉死具体像素。
+            QVERIFY2(a.value("dy").toDouble() >= 20.0,
+                     qPrintable(QStringLiteral("第一枚标签没有朝下留白: dy=%1")
+                                    .arg(a.value("dy").toDouble())));
             const QRectF ra(400 + a.value("dx").toDouble(), 300 + a.value("dy").toDouble(),
                             176, 30);
             const QRectF rb(420 + b.value("dx").toDouble(), 320 + b.value("dy").toDouble(),
@@ -3240,8 +3243,8 @@ private slots:
             QVERIFY2(!ra.intersects(rb),
                      qPrintable(QStringLiteral("两个推定震中标签重叠: a=%1,%2 b=%3,%4")
                                     .arg(ra.x()).arg(ra.y()).arg(rb.x()).arg(rb.y())));
-            // 第二个必须离开「下方」（会被 a 压住）。
-            QVERIFY2(b.value("dy").toDouble() != 24.0, "第二枚标签未换边");
+            // 第二个必须离开 a 所在的那一侧（否则就压上去了）。
+            QVERIFY2(b.value("dy").toDouble() != a.value("dy").toDouble(), "第二枚标签未换边");
         }
         // ---- 2. 贴边：夹进视口，不允许伸出边缘（伸出部分会被 clip 裁掉） ----
         {
@@ -3301,21 +3304,63 @@ private slots:
         auto* marker = window->findChild<QQuickItem*>("sourceEstimateMarker");
         auto* label = window->findChild<QQuickItem*>("sourceEstimateLabel-china");
         auto* title = window->findChild<QQuickItem*>("sourceEstimateLabelTitle-china");
+        auto* coord = window->findChild<QQuickItem*>("sourceEstimateLabelCoord-china");
         auto* meta = window->findChild<QQuickItem*>("sourceEstimateLabelMeta-china");
-        QVERIFY2(marker && label && title && meta, "缺少常驻标签");
+        auto* detail = window->findChild<QQuickItem*>("sourceEstimateLabelDetail-china");
+        auto* cross = window->findChild<QQuickItem*>("sourceEstimateCross");
+        QVERIFY2(marker && label && title && coord && meta && detail && cross,
+                 "缺少常驻标签或十字");
         QTRY_VERIFY2(label->isVisible(), "推定震中旁没有常驻标签");
-        // 文本契约：首行「区域 · 精度 X · 第 N 报」，次行「M x.x · 深 xx km · N 站」。
+        // 文本契约四行：
+        //   ① 「区域 · 精度 X · 第 N 报」；② 经纬度；③「M x.x · 深 xx km · N 站」；
+        //   ④ 诊断（±km + 残差/空隙）。用户要求「加上经纬度，等等，现在有点简洁了」。
         QVERIFY2(title->property("text").toString().contains(QStringLiteral("精度 ")),
                  qPrintable(QStringLiteral("标签首行缺少精度: ")
                                 + title->property("text").toString()));
         QVERIFY2(title->property("text").toString().contains(QStringLiteral("报")),
                  qPrintable(QStringLiteral("标签首行缺少报数: ")
                                 + title->property("text").toString()));
+        // 经纬度行：必须是 N/E 半球 + 3 位小数，并且数值真的来自标记载荷
+        // （中国四川合成场解在 30/104 附近，解本身有几百米抖动），不能是占位符。
+        const QString coordText = coord->property("text").toString();
+        QVERIFY2(coordText.contains(QStringLiteral("°N")) && coordText.contains(QStringLiteral("°E")),
+                 qPrintable(QStringLiteral("标签缺少经纬度: ") + coordText));
+        {
+            static const QRegularExpression pattern(
+                QStringLiteral("^(\\d+\\.\\d{3})°([NS])\\s+(\\d+\\.\\d{3})°([EW])$"));
+            const QRegularExpressionMatch match = pattern.match(coordText);
+            QVERIFY2(match.hasMatch(),
+                     qPrintable(QStringLiteral("经纬度格式不是「30.000°N  104.000°E」: ")
+                                + coordText));
+            const double lat = match.captured(1).toDouble();
+            const double lon = match.captured(3).toDouble();
+            QVERIFY2(std::abs(lat - 30.0) < 2.0 && std::abs(lon - 104.0) < 2.0,
+                     qPrintable(QStringLiteral("经纬度不是推定坐标: ") + coordText));
+        }
         const QString metaText = meta->property("text").toString();
         QVERIFY2(metaText.contains(QStringLiteral("M ")) && metaText.contains(QStringLiteral("深 ")),
                  qPrintable(QStringLiteral("标签次行缺少震级/深度: ") + metaText));
         QVERIFY2(metaText.contains(QStringLiteral("站")),
                  qPrintable(QStringLiteral("标签次行缺少站数: ") + metaText));
+        // 诊断行必须有不确定度（±km）—— 卡片刻意不显示，地图标签才是它唯一的出口。
+        const QString detailText = detail->property("text").toString();
+        QVERIFY2(detailText.contains(QChar(0x00B1)),
+                 qPrintable(QStringLiteral("标签缺少不确定度: ") + detailText));
+        QVERIFY2(detailText.contains(QStringLiteral("残差")),
+                 qPrintable(QStringLiteral("标签缺少残差诊断: ") + detailText));
+
+        // 形状契约：推定震中与官方震中是**同一个组件**（用户要求「换成和其他震中一样的 X」）。
+        // 只断言组件名不够 —— 两边各写一份 Canvas 也会「都是 Canvas」，因此比对
+        // HypocenterCross 的元类：官方十字与推算十字必须是同一个 QML 类型。
+        auto* officialCross = window->findChild<QQuickItem*>("hypocenterMarker");
+        QVERIFY2(officialCross, "缺少官方震中十字");
+        QVERIFY2(QString::fromLatin1(officialCross->metaObject()->className())
+                     == QString::fromLatin1(cross->metaObject()->className()),
+                 qPrintable(QStringLiteral("官方/推定震中不是同一种标记: %1 vs %2")
+                                .arg(QString::fromLatin1(officialCross->metaObject()->className()),
+                                     QString::fromLatin1(cross->metaObject()->className()))));
+        QCOMPARE(cross->width(), officialCross->width());
+        QCOMPARE(cross->height(), officialCross->height());
 
         // 几何契约：标签完整落在视口内，且不压住震中标记本身。
         const QPointF labelPos = label->mapToItem(map, QPointF(0, 0));
@@ -3328,7 +3373,8 @@ private slots:
                                 .arg(labelRect.top()).arg(labelRect.bottom()).arg(map->height())));
         const QPointF markerCenter = marker->mapToItem(
             map, QPointF(marker->width() / 2, marker->height() / 2));
-        const QRectF markerBox(markerCenter - QPointF(9, 9), QSizeF(18, 18));
+        // 十字改成与官方同款后整体是 40×40（原来菱形只有 18×18）。
+        const QRectF markerBox(markerCenter - QPointF(20, 20), QSizeF(40, 40));
         QVERIFY2(!labelRect.intersects(markerBox), "标签压住了震中标记");
 
         // 开关：关掉标签后标记必须还在（两个开关互不连带）。
@@ -5547,6 +5593,12 @@ private slots:
         const QString timeLine = infoTime->property("text").toString();
         QVERIFY2(timeLine.contains("UTC+8") && timeLine.size() >= 21,
                  qPrintable(QStringLiteral("震中卡片缺少发震时刻: \"%1\"").arg(timeLine)));
+        // 震中经纬度：详情面板能读到的坐标，贴着十字的浮层也要能读到
+        // （用户：「浮动的文字加上经纬度，等等，现在有点简洁了」）。
+        auto* infoCoord = window->findChild<QQuickItem*>("epicenterInfoCoord");
+        QVERIFY2(infoCoord, "震中浮层缺少经纬度行");
+        QTRY_VERIFY(infoCoord->isVisible());
+        QCOMPARE(infoCoord->property("text").toString(), QStringLiteral("30.000°N  104.000°E"));
 
         // 实线像素判据：沿 P 波圆右半侧采样，实线几乎每格都有蓝色；若误改成虚线，
         // 命中率会掉到 0.6 左右。只断言属性抓不到「strokeStyle 写错」。
@@ -6807,8 +6859,249 @@ private slots:
         }
         QVERIFY2(sawLegacyHint, "旧数据详情缺少「原文未保存」说明");
         QVERIFY2(sawSourceFallback, "旧数据详情缺少来源名回退");
+
         QVERIFY(window->grabWindow().save(evidenceDirectory(window)
                                           + "/54-legacy-event-detail.png"));
+    }
+
+    /// 回归：推算焦点不得抢用户的鼠标。
+    ///
+    /// 用户报「聚焦到震源推算的时候不要抢我鼠标」。根因：`frameEstimateImpl` 既不读也不写
+    /// `following`，于是用户拖动/滚轮把 `following` 置 false 对推算完全无效 —— 松手后
+    /// 16 ms 的波前 tick 立刻把镜头拉回推定震中。事件路径没有这个问题（它走 following）。
+    /// 本用例同时锁住「显式重新跟随仍然有效」，否则修成「永远不跟」也能骗过前两条。
+    void estimateFocusReleasesCameraToUser() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EstimateCameraOwnershipTest");
+        qputenv("QML_DISABLE_DISK_CACHE", "1");
+
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setVectorOverlay(false);
+        controller.settings()->setShowStationLayer(false);
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+        controller.settings()->setSourceEstimationEnabled(true);
+        controller.settings()->setDeveloperMode(true);
+        controller.settings()->setSourceEstimationRegionEnabled("china", true);
+        controller.settings()->setShowEstimatedEpicenter(true);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(map);
+        QTest::qWait(300);
+
+        // 合成一帧测站强度，让中国区出一个可见解。
+        std::vector<StationSnapshot::Entry> frame;
+        std::vector<StationSnapshot::StationMeta> metas;
+        int index = 0;
+        for (double lat = 28.4; lat <= 31.6 + 1e-9; lat += 0.2) {
+            for (double lon = 102.4; lon <= 105.6 + 1e-9; lon += 0.2) {
+                StationSnapshot::Entry entry;
+                entry.lat = lat; entry.lon = lon; entry.csis = true;
+                entry.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Csis, 5.8,
+                    QuakeCalculator::haversineDistance(30.0, 104.0, lat, lon), 10.0);
+                entry.meta = index++;
+                frame.push_back(entry);
+                StationSnapshot::StationMeta meta;
+                meta.source = QStringLiteral("PancakesSeis");
+                metas.push_back(meta);
+            }
+        }
+        controller.stationSnapshot_->setEntries(frame, metas);
+        controller.sourceEstimation_->ingestObservations(frame);
+        controller.sourceEstimation_->runEstimation();
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.focusEstimate_.isEmpty(), 8000);
+        QTest::qWait(1600);   // 等入场取景补间走完
+        QVERIFY2(map->property("estimateFocused").toBool(), "前置条件：推算焦点未生效");
+
+        // ---- 拖动：松手后镜头必须留在用户放下的位置 ----
+        const QPointF origin = map->mapToScene(QPointF(map->width() / 2, map->height() / 2));
+        QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, origin.toPoint());
+        for (int step = 1; step <= 4; ++step) {
+            QTest::mouseMove(window, (origin + QPointF(40 * step, 25 * step)).toPoint());
+            QTest::qWait(5);
+        }
+        QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier,
+                            (origin + QPointF(160, 100)).toPoint());
+        const double latAfterDrag = map->property("centerLat").toDouble();
+        const double lonAfterDrag = map->property("centerLon").toDouble();
+        // 推进若干帧：波前 tick 会照常推送半径，镜头必须纹丝不动。
+        for (int i = 0; i < 50; ++i) { now += 16; QTest::qWait(8); }
+        QVERIFY2(std::abs(map->property("centerLat").toDouble() - latAfterDrag) < 0.02,
+                 qPrintable(QStringLiteral("拖动后镜头被抢回：centerLat %1 -> %2")
+                                .arg(latAfterDrag).arg(map->property("centerLat").toDouble())));
+        QVERIFY2(std::abs(map->property("centerLon").toDouble() - lonAfterDrag) < 0.02,
+                 qPrintable(QStringLiteral("拖动后镜头被抢回：centerLon %1 -> %2")
+                                .arg(lonAfterDrag).arg(map->property("centerLon").toDouble())));
+
+        // ---- 滚轮缩放：同样不能被波前 tick 拽回去 ----
+        QMetaObject::invokeMethod(map, "zoomAt", Q_ARG(QVariant, 600), Q_ARG(QVariant, 400),
+                                  Q_ARG(QVariant, 1.0));
+        QTest::qWait(400);
+        const double zoomAfterWheel = map->property("zoom").toDouble();
+        for (int i = 0; i < 50; ++i) { now += 16; QTest::qWait(8); }
+        QVERIFY2(std::abs(map->property("zoom").toDouble() - zoomAfterWheel) < 0.02,
+                 qPrintable(QStringLiteral("滚轮缩放后被抢回：zoom %1 -> %2")
+                                .arg(zoomAfterWheel).arg(map->property("zoom").toDouble())));
+
+        QVERIFY2(!map->property("following").toBool(),
+                 "用户接管镜头后应退出跟随态（波前 tick 据此停手）");
+
+        // ---- 显式「跟随震中」必须能重新接管（防止修成「永远不跟」）----
+        QVERIFY(QMetaObject::invokeMethod(map, "toggleFollowEvent"));
+        QTest::qWait(900);
+        QVERIFY2(map->property("following").toBool(), "显式聚焦后应恢复跟随");
+        const double estimateLat = controller.focusEstimate_.value("latitude").toDouble();
+        const double estimateLon = controller.focusEstimate_.value("longitude").toDouble();
+        QVERIFY2(std::abs(map->property("centerLat").toDouble() - estimateLat) < 1.0,
+                 qPrintable(QStringLiteral("显式聚焦未回到推定震中：%1 vs %2")
+                                .arg(map->property("centerLat").toDouble()).arg(estimateLat)));
+        QVERIFY2(std::abs(map->property("centerLon").toDouble() - estimateLon) < 1.0,
+                 qPrintable(QStringLiteral("显式聚焦未回到推定震中：%1 vs %2")
+                                .arg(map->property("centerLon").toDouble()).arg(estimateLon)));
+    }
+
+    /// 回归：推算焦点的「自动缩放」不得让瓦片看起来抖动。
+    ///
+    /// 用户报「震源推算视角自动缩放的时候，感觉瓦片有抖动」。根因与上一条同源：
+    /// 推算焦点从不置 `following`，而 zoom/center 的 `Behavior` 平滑（`followSmoothing`）
+    /// 正是绑在它上面的 —— 于是推算的相机**逐帧裸写** zoom。波前半径每次 tick 只前进
+    /// 一点点且被走时表量化，裸写出来的就是「不动、突然跳一格、再不动」，瓦片逐帧缩放
+    /// 比例忽大忽小 = 抖。事件焦点没有这毛病，因为它走 following。
+    ///
+    /// 判据落在**跟随期**（入场补间结束后）：入场是 600 ms 的显式补间，它本来就该单调
+    /// 加速收口；真正被用户看到「抖」的是随后这一段又慢又长的自动推拉。
+    void estimateFollowKeepsTilesSteady() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("EstimateTileSteadyTest");
+        qputenv("QML_DISABLE_DISK_CACHE", "1");
+
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setVectorOverlay(false);
+        controller.settings()->setShowStationLayer(false);
+        controller.settings()->setShowWavefront(true);
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+        controller.settings()->setSourceEstimationEnabled(true);
+        controller.settings()->setDeveloperMode(true);
+        controller.settings()->setSourceEstimationRegionEnabled("china", true);
+        controller.settings()->setShowEstimatedEpicenter(true);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(map);
+        QTest::qWait(300);
+
+        std::vector<StationSnapshot::Entry> frame;
+        std::vector<StationSnapshot::StationMeta> metas;
+        int index = 0;
+        for (double lat = 28.4; lat <= 31.6 + 1e-9; lat += 0.2) {
+            for (double lon = 102.4; lon <= 105.6 + 1e-9; lon += 0.2) {
+                StationSnapshot::Entry entry;
+                entry.lat = lat; entry.lon = lon; entry.csis = true;
+                entry.raw = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Csis, 5.8,
+                    QuakeCalculator::haversineDistance(30.0, 104.0, lat, lon), 10.0);
+                entry.meta = index++;
+                frame.push_back(entry);
+                StationSnapshot::StationMeta meta;
+                meta.source = QStringLiteral("PancakesSeis");
+                metas.push_back(meta);
+            }
+        }
+        controller.stationSnapshot_->setEntries(frame, metas);
+        controller.sourceEstimation_->ingestObservations(frame);
+        controller.sourceEstimation_->runEstimation();
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.focusEstimate_.isEmpty(), 8000);
+
+        // 从头采到底：先跨过入场补间，再采跟随期。跟随期由 `cameraMoving` 分流，
+        // 不靠固定帧数猜边界（机器快慢会让补间落点差好几帧）。
+        // `followSmoothing` 本身就精确表达「补间已停、且处于跟随」：它是
+        // following && !gestureActive && !cameraMove.running && !reduceMotion && visible。
+        // 入场补间跑着时它为 false，补间一结束就转为 true —— 用它分流最稳，不用猜帧数。
+        QVector<double> followZooms;
+        int unsmoothedDuringFollow = 0;
+        bool followStarted = false;
+        for (int i = 0; i < 220; ++i) {
+            now += 16;
+            QTest::qWait(9);
+            const bool smoothing = map->property("followSmoothing").toBool();
+            if (!smoothing && !followStarted) continue;   // 仍在入场补间里
+            if (smoothing) followStarted = true;
+            if (!followStarted) continue;
+            followZooms.append(map->property("zoom").toDouble());
+            if (i > 0 && !smoothing) ++unsmoothedDuringFollow;
+        }
+        const int followFrames = followZooms.size();
+        QVERIFY2(followFrames >= 60,
+                 qPrintable(QStringLiteral("没采到足够的跟随期帧（%1）").arg(followFrames)));
+
+        // ① 跟随期必须开平滑。它是「逐帧裸写」的开关，也是下面两条成立的原因。
+        QVERIFY2(unsmoothedDuringFollow == 0,
+                 qPrintable(QStringLiteral("推算跟随期有 %1/%2 帧没有启用镜头平滑，"
+                                           "zoom 会被逐帧裸写（瓦片抖动）")
+                                .arg(unsmoothedDuringFollow).arg(followFrames)));
+
+        // ② 单调：波前只扩张，镜头只该缓慢推远，不该来回。
+        int reversals = 0;
+        int lastDirection = 0;
+        for (int i = 1; i < followZooms.size(); ++i) {
+            const double delta = followZooms.at(i) - followZooms.at(i - 1);
+            if (std::abs(delta) < 1e-9) continue;
+            const int direction = delta > 0 ? 1 : -1;
+            if (lastDirection != 0 && direction != lastDirection) ++reversals;
+            lastDirection = direction;
+        }
+        QVERIFY2(reversals == 0,
+                 qPrintable(QStringLiteral("推算跟随期间 zoom 出现 %1 次反向漂移（镜头在来回抖）")
+                                .arg(reversals)));
+
+        // ③ 步长有界：裸写会让某一帧突然吃掉一大截（实测出现过 0.03+/帧），
+        //    平滑后每帧只走一小步。
+        double maxStep = 0;
+        for (int i = 1; i < followZooms.size(); ++i)
+            maxStep = std::max(maxStep, std::abs(followZooms.at(i) - followZooms.at(i - 1)));
+        QVERIFY2(maxStep < 0.02,
+                 qPrintable(QStringLiteral("跟随期单帧 zoom 步长 %1 过大，瓦片会看出格子跳")
+                                .arg(maxStep)));
+
+        // ④ 镜头确实在动（防止「冻结镜头」骗过上面三条）。
+        const double span = *std::max_element(followZooms.begin(), followZooms.end())
+                            - *std::min_element(followZooms.begin(), followZooms.end());
+        QVERIFY2(span > 0.01,
+                 qPrintable(QStringLiteral("跟随期 zoom 几乎未变（%1），判据没有真正生效")
+                                .arg(span)));
     }
 };
 QTEST_MAIN(GuiTest)

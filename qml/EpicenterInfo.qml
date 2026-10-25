@@ -1,7 +1,7 @@
 import QtQuick
 
-// 震中下方的浮动信息块（对齐 kanameishi 的震中浮层）：只放「看一眼就够」的三行
-// —— 震中地名 / M·深度·烈度 / 数据源，详细内容仍在左侧 HUD 与事件列表里。
+// 震中下方的浮动信息块（对齐 kanameishi 的震中浮层）：只放「看一眼就够」的几行
+// —— 震中地名 / 发震时刻 / M·深度·烈度 / 经纬度 / 数据源，详细内容仍在左侧 HUD 与事件列表里。
 //
 // 默认不显示：指针悬停到震中十字上才出现（由 MapView 传入 shown）。地图上同时有
 // 波前、测站、纠偏标记，常驻的文字标签会一直压在这些内容上面。
@@ -54,6 +54,11 @@ Item {
     /// 发震时刻（UTC+8）：与 HUD / 事件列表同源，独占一行保证完整可见。
     readonly property string timeText: hasData && event.timeText !== undefined
         ? String(event.timeText) : ""
+    /// 震中经纬度：此前这块浮层只有地名/时刻/震级/来源，看不出震中到底在哪一个点；
+    /// 详情面板能读到的坐标，地图上贴着十字的地方也应该读得到。3 位小数 ≈ 100 m，
+    /// 与测站悬停浮层同一套格式（`Theme::coordText`）。
+    readonly property string coordText: hasData
+        ? theme.coordText(Number(event.latitude), Number(event.longitude), 3) : ""
     /// 数据源 + 报数/情报态：次要信息，压缩到一行。
     readonly property string sourceText: {
         if (!hasData) return "";
@@ -111,6 +116,16 @@ Item {
             width: parent.width
             visible: text.length > 0
             text: root.metaText
+            color: root.theme.outline
+            font.family: root.theme.numberFamily
+            font.pixelSize: 11
+            elide: Text.ElideRight
+        }
+        Text {
+            objectName: "epicenterInfoCoord"
+            width: parent.width
+            visible: text.length > 0
+            text: root.coordText
             color: root.theme.outline
             font.family: root.theme.numberFamily
             font.pixelSize: 11

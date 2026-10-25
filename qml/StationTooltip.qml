@@ -46,8 +46,9 @@ Item {
         if (info.type && info.type.length && info.type !== info.code) parts.push(info.type);
         return parts.join(" · ");
     }
+    // 与地图标签 / 事件信息块同一套坐标格式（`Theme::coordText`，3 位小数 + 半球）。
     readonly property string coordinateText: hasInfo
-        ? Number(info.lat).toFixed(3) + "°N  " + Number(info.lon).toFixed(3) + "°E" : ""
+        ? theme.coordText(Number(info.lat), Number(info.lon), 3) : ""
     readonly property color valueColor: {
         if (!hasInfo) return theme.textPrimary;
         return theme.stationTextColorFor(info.raw, info.standard);

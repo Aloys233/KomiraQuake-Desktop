@@ -197,6 +197,7 @@ set(KOMIRA_QML_FILES
     qml/StationStack.qml
     qml/SourceEstimateCard.qml
     qml/EstimateMarker.qml
+    qml/HypocenterCross.qml
     qml/EpicenterInfo.qml
     qml/StationTooltip.qml
     qml/SettingsPage.qml

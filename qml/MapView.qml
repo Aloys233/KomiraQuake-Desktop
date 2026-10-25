@@ -50,7 +50,13 @@ Item {
     property real userLat: 0.0
     property real userLon: 0.0
     property bool hasUser: false
-    /// 镜头是否锁定在焦点事件上（工具条的"跟随震中"按下态）。默认不跟随：无定位时地图是全国概览。
+    /// 镜头是否锁定在**焦点**上（事件或本地推算）。默认不跟随：无定位时地图是全国概览。
+    ///
+    /// 推算焦点也必须走这一个开关：早先只有事件路径用它，`frameEstimateImpl` 直接把它
+    /// 置 false，于是 (a) 用户拖拽/缩放把 following 关掉对推算毫无作用 —— 松手后下一个
+    /// 16 ms 波前 tick 立刻把镜头拉回推定震中，就是用户说的「抢我鼠标」；(b) `followSmoothing`
+    /// 跟着 false 一起关掉，推算的相机逐帧裸写 zoom/center，帧间步长忽大忽小，
+    /// 瓦片看起来就是「抖」。两条症状同一个根因，所以共用这一个开关。
     property bool following: false
     /// 用户是否手动控制过镜头（拖动/缩放/回到我的位置/复位）。用于避免定位到达时抢镜头。
     property bool userMovedCamera: false
@@ -72,7 +78,8 @@ Item {
             pendingFocus = false;
             // 手势期间到达的焦点可能是推算（估算接管了低优先级事件）：必须走同一个
             // 分支判断，否则 frameEventImpl 会因为没有事件而直接返回、镜头停在原地。
-            if (estimateFocused) frameEstimateImpl(undefined);
+            // 待执行聚焦是「新焦点」语义，故 explicit：用户松手后该被带过去。
+            if (estimateFocused) frameEstimateImpl(undefined, true);
             else frameEventImpl(undefined);
         }
         // 手势中窗口尺寸可能变过（minZoom 抬升），补做一次下界检查。
@@ -373,8 +380,9 @@ Item {
         }
         // 推算焦点优先于事件焦点：Camera 跟到推定震中，事件十字与波前已由控制器隐藏
         // （mapEvent 为空）。手势期间与事件聚焦共用 pendingFocus，松手后再飞。
+        // 这是**用户主动**要求跟着走，故 explicit=true：用户之前拖开过也要重新接管。
         if (estimateFocused) {
-            frameEstimateImpl(undefined);
+            frameEstimateImpl(undefined, true);
             return;
         }
         frameEventImpl(undefined);
@@ -416,9 +424,20 @@ Item {
 
     /// 推定震中取景（见 focusEvent）。半径取「不确定度 × 2.5」，下限 120 km：
     /// 推算解通常有 ±几十 km 的误差，贴太近会把不确定度圈裁出屏幕。
-    function frameEstimateImpl(animate) {
+    ///
+    /// `explicit` 区分「用户点了跟随/选中」与「波前逐帧自动跟随」两种调用：
+    ///   · 自动跟随（默认）只在**没被用户接管**时写镜头 —— 这正是 `following` 的语义，
+    ///     用户一拖动 / 一滚轮就把它置 false，此后镜头归用户，松手也不会被抢回去；
+    ///   · 显式聚焦则无条件重新接管（用户刚才是主动要它跟）。
+    /// 早先这里既不读也不写 `following`，于是拖动/缩放对推算完全无效：松手后波前 tick
+    /// 立刻把镜头拉回推定震中，手感就是「抢鼠标」。
+    function frameEstimateImpl(animate, explicit) {
         if (gestureActive) return;
-        following = false;
+        // 逐帧自动跟随（animate === false，来自波前 tick / 布局重取景）必须在用户接管
+        // 镜头后停手：`following` 是唯一的「用户还想让它跟吗」的裁决位，拖动与滚轮都会
+        // 把它置 false。显式聚焦（工具条「跟随震中」、事件列表选中）才允许强行重新接管。
+        if (explicit !== true && animate === false && !following) return;
+        following = true;
         idleResetTimer.stop();
         if (!estimateFocused || width <= 0 || height <= 0) return;
         const lat = Number(focusEstimate.latitude);
@@ -450,7 +469,9 @@ Item {
         if (!estimateFocused) return;
         defaultOverviewDone = true;
         Qt.callLater(function() {
-            if (estimateFocused && !gestureActive) frameEstimateImpl(undefined);
+            // 新焦点出现属于「换了一场要看的地震」：即便用户此前拖开过，也该把镜头
+            // 带到新的推定震中（否则解出来了却停在空地），故走 explicit。
+            if (estimateFocused && !gestureActive) frameEstimateImpl(undefined, true);
         });
     }
 
@@ -1264,31 +1285,15 @@ Item {
         z: 3
 
         // 震中 X 十字。参考 kanameishi eqlistCross.svg：10px 米黄描边打底 + 6px 红描边。
-        Canvas {
+        // 画法与推定震中共用 `HypocenterCross.qml`：两者形状必须**完全一致**
+        // （用户要求「震源推算的震中换成和其他震中一样的 X」），各写一份必然漂移。
+        HypocenterCross {
             id: hypocenter
             objectName: "hypocenterMarker"
             visible: root.hasEvent
+            theme: root.theme
             x: root.hypocenterX - width / 2
             y: root.hypocenterY - height / 2
-            width: 40
-            height: 40
-            onPaint: {
-                const ctx = getContext("2d");
-                ctx.reset();
-                ctx.lineCap = "round";
-                const cross = (color, lineWidth) => {
-                    ctx.strokeStyle = color;
-                    ctx.lineWidth = lineWidth;
-                    ctx.beginPath();
-                    ctx.moveTo(5, 5);
-                    ctx.lineTo(35, 35);
-                    ctx.moveTo(35, 5);
-                    ctx.lineTo(5, 35);
-                    ctx.stroke();
-                };
-                cross(root.theme.hypocenterHalo, 10);
-                cross(root.theme.hypocenterCross, 6);
-            }
         }
 
         // 用户位置（带纠偏）。与十字同一个毛病：压在密网测站下面就等于没有。
@@ -1313,8 +1318,10 @@ Item {
     }
 
     // ---- 本地震源推算（Beta）：推定震中 ------------------------------------
-    // 与官方震中的红叉刻意区分：官方用「X 十字」，这里用「菱形 + 中心点 + 不确定度圈」，
-    // 形状不同就不会被误读成已发布震中。
+    // **形状与官方震中完全相同**：同一个 `HypocenterCross.qml`（10px 米黄打底 + 6px 红描边）。
+    // 早先用菱形是为了「一眼不被误读成已发布震中」，用户明确要求统一成 X，故形状不再承担
+    // 区分职责 —— 现在靠文字：推定震中常驻标签（首行「区域 · 精度 · 第 N 报」），官方震中
+    // 只有悬停信息块。不确定度圈仍保留，它表达的是「解的粗糙程度」，不是震中符号。
     // 放在测站层**之后**：测站方标是 C++ 一次性批量绘制的兄弟项，z 跨子树不生效，
     // 画在 mapRenderLayer 里会被上千个测站盖住（官方震中的红叉就有这个毛病）。
     //
@@ -1422,7 +1429,9 @@ Item {
                                || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
         const pad = 8;      // 距视口边缘
-        const gap = 24;     // 标签到标记中心的距离（菱形边长 18，留出呼吸）
+        // 标签到标记中心的距离：十字画布 40 px、外圈打底描边再外扩 2 px，故半臂约 22 px；
+        // 再留 8 px 空隙，标签底衬才不会压住十字的下半截。
+        const gap = 30;
         const collide = 4;  // 标签之间的最小间隙
         const placed = [];
         for (let i = 0; i < sorted.length; ++i) {
@@ -1770,7 +1779,11 @@ Item {
             Rectangle { width: 28; height: 1; x: 6; color: root.theme.glassBorder }
             GlassButton { theme: root.theme; visible: root.hasUser; iconName: "navigation"; accessibleName: "回到我的位置"; flat: true; onClicked: root.focusUser() }
             GlassButton {
-                theme: root.theme; visible: root.hasEvent; iconName: "locate-fixed"
+                // 推算焦点下事件为空（mapEvent 让位），但镜头同样可以被用户接管/恢复，
+                // 所以按钮必须在两种焦点下都在。否则用户拖开之后没有任何入口把镜头
+                // 请回推定震中 —— 只能等解过期。
+                theme: root.theme; visible: root.hasEvent || root.estimateFocused
+                iconName: "locate-fixed"
                 accessibleName: root.following ? "正在跟随震中；点击退出跟随" : "恢复跟随震中"
                 flat: !root.following; primary: root.following
                 onClicked: root.toggleFollowEvent()

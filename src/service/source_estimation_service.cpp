@@ -682,6 +682,17 @@ void SourceEstimationService::publish() {
             // 卡片早就有它们，标记载荷此前只给了几何量与震级深度。
             mark["stationCount"] = estimate.stationCount;
             mark["reportNum"] = std::max(1, region.reportNum);
+            // 地图常驻标签从两行扩到四行后要的诊断字段（用户：「浮动的文字加上经纬度，
+            // 等等，现在有点简洁了」）：残差 / 方位角空隙 / P·S 相数 / 反推发震时刻。
+            // 口径与卡片逐字一致 —— 到时路径的 `rms` 装的是**到时残差（秒）**，
+            // 强度路径装的是强度残差 RMS（见 `SourceEstimate::rmsIntensity` 的注释），
+            // QML 侧按 `usesArrivalTimes` 决定单位，不在这里折算。
+            mark["rms"] = estimate.rmsIntensity;
+            mark["azimuthGap"] = estimate.azimuthGapDeg;
+            mark["pPhases"] = estimate.pPhaseCount;
+            mark["sPhases"] = estimate.sPhaseCount;
+            mark["usesArrivalTimes"] = estimate.method.rfind("arrival_time", 0) == 0;
+            mark["originUtc8"] = originText(region.originEpochMs);
             // 波前（S/P 圆）要用发震时刻反解走时；推算卡本身只印时刻文本，标记载荷
             // 之前没有这个字段，地图侧只能拿到 0 而画不出推算波前。
             mark["originEpochMs"] = static_cast<qint64>(region.originEpochMs);

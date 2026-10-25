@@ -144,6 +144,19 @@ QtObject {
         else base = niedStationColor(raw);
         return Qt.rgba(base.r, base.g, base.b, dark ? 0.30 : 0.18);
     }
+    /// 经纬度文本：`30.000°N  104.000°E`。
+    ///
+    /// 统一在这里成型，是因为地图标记载荷、测站悬停浮层、事件详情都要印坐标 ——
+    /// 各写一份 `toFixed(3) + "°N"` 迟早会在小数位或半球符号上分叉。非有限值返回空串
+    /// （调用方据此整行隐藏，而不是印出 `NaN°N`）。
+    function coordText(lat: real, lon: real, digits: int): string {
+        if (!isFinite(lat) || !isFinite(lon)) return "";
+        const places = digits > 0 ? digits : 0;
+        const ns = lat >= 0 ? "N" : "S";
+        const ew = lon >= 0 ? "E" : "W";
+        return Math.abs(lat).toFixed(places) + "°" + ns + "  "
+             + Math.abs(lon).toFixed(places) + "°" + ew;
+    }
     function magnitudeColor(m: real): color {
         if (m < 3.0) return "#00796B";
         if (m < 4.5) return "#F57F17";

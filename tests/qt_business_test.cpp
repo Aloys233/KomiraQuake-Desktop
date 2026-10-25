@@ -1138,6 +1138,27 @@ private slots:
         QCOMPARE(info.value("visible").toBool(), true);
         QCOMPARE(info.value("markers").toList().size(), 4);
 
+        // 地图常驻标签的字段契约：位置改用 X 十字后，标签是唯一的口头信息，
+        // 至少要有经纬度、精度/报次、震级/深度/站数，以及一条诊断（±km + 残差/空隙或 P/S 相数）。
+        {
+            const QVariantMap chinaMark = markers[0].toMap();
+            QCOMPARE(chinaMark.value("id").toString(), QStringLiteral("china"));
+            QVERIFY(std::abs(chinaMark.value("latitude").toDouble() - china.latitude) < 1e-9);
+            QVERIFY(std::abs(chinaMark.value("longitude").toDouble() - china.longitude) < 1e-9);
+            QVERIFY(chinaMark.value("uncertaintyKm").toDouble() > 0.0);
+            QVERIFY(chinaMark.contains("rms"));
+            QVERIFY(chinaMark.contains("azimuthGap"));
+            QVERIFY(chinaMark.contains("pPhases") && chinaMark.contains("sPhases"));
+            QVERIFY(chinaMark.contains("usesArrivalTimes"));
+            QVERIFY(!chinaMark.value("originUtc8").toString().isEmpty());
+            const QVariantMap japanMark = markers[1].toMap();
+            QCOMPARE(japanMark.value("usesArrivalTimes").toBool(), true);
+            QVERIFY(japanMark.value("pPhases").toInt() > 0);
+            // 到时路径的 rms 是**秒**；强度路径是强度残差，两者的量级差一个数量级，
+            // 标签按 usesArrivalTimes 换单位，这里钉住口径不串。
+            QVERIFY(std::abs(japanMark.value("rms").toDouble()) < 10.0);
+        }
+
         // 只改日本区的门槛：中国区已有的解必须原样保留（区域互不作废）。
         const SourceEstimate chinaBefore = china;
         settings.setSourceEstimationMinStations("japan", 40);
