@@ -4688,6 +4688,74 @@ private slots:
         QVERIFY(click("sourceNav-wolfx"));
         QTRY_VERIFY(findVisualItem(window, "wolfxSwitch"));
 
+        // ── Jian 的 46 路频道要真的出现在设置页 ──────────────────────────────
+        // 频道表补齐之后，设置页必须把每一路都渲染成可点的开关；同时用**真实主窗口**
+        // 验证「新增的 39 路」不只是躺在协议表里 —— 抓一路新增的（usgs）与一路老频道
+        // （jma-eew）各点一次，确认它们各自独立地写进 disabledSubSources。
+        //
+        // 子源开关住在右栏的 sourceDetailScroll 里（46 路远超卡片高度），点之前必须先把
+        // 那一层内滚动也滚到位 —— 页面级 click 只滚 settingsScroll，滚动条以下的行会被
+        // 窗口丢弃（第一版就是这么 FAIL 在 click("jianSub-usgs") 返回 false）。
+        auto clickInDetail = [&](const QString& name) {
+            auto* item = findVisualItem(window, name);
+            auto* inner = findVisualItem(window, "sourceDetailScroll");
+            if (!item || !inner || !item->isVisible() || !item->isEnabled()) return false;
+            // 先让它落进内层滚动视口，再等一帧让 Flickable 的几何稳定；**不要**回头再调
+            // page 级的 click —— 那会重设外层 contentY，触发的重排会把内层 contentY 打回，
+            // 结果点在一个已经滑走的坐标上（第一版就是这么拿到 FALSE 的）。
+            const qreal maxY =
+                qMax<qreal>(0, inner->property("contentHeight").toReal() - inner->height());
+            const QPointF center =
+                item->mapToItem(inner, QPointF(item->width() / 2, item->height() / 2));
+            inner->setProperty("contentY",
+                               qBound<qreal>(0, center.y() - inner->height() / 2, maxY));
+            QTest::qWait(120);
+            const QPoint position =
+                item->mapToScene(QPointF(item->width() / 2, item->height() / 2)).toPoint();
+            const QRect windowRect(QPoint(0, 0), window->size());
+            if (!windowRect.contains(position)) {
+                qWarning("[test] clickInDetail(%s) 落在窗口外: (%d,%d) / 窗口 %dx%d",
+                         qPrintable(name), position.x(), position.y(),
+                         window->width(), window->height());
+                return false;
+            }
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, position);
+            return true;
+        };
+        QVERIFY(click("sourceNav-jian"));
+        QTRY_VERIFY(findVisualItem(window, "jianSwitch"));
+        QVERIFY(click("jianSubHeader"));
+        QTRY_VERIFY(findVisualItem(window, "jianSub-usgs"));
+        for (const QString& subId : {"cea", "kma-eew", "sa", "early-est", "ningxia",
+                                     "kma", "usgs", "emsc", "koeri", "gsras"}) {
+            QVERIFY2(findVisualItem(window, QStringLiteral("jianSub-") + subId),
+                     qPrintable(QStringLiteral("设置页缺少 Jian 子源：") + subId));
+        }
+        QVERIFY(findVisualItem(window, "jianSub-cea-pr"));
+        // 分组头读的是同一份快照：7 路实时预警 + 39 路地震情报。
+        auto* subHeader = findVisualItem(window, "jianSubHeader");
+        QVERIFY(subHeader);
+        bool sawCounts = false;
+        for (auto* item : visualItems(subHeader)) {
+            const QString text = item->property("text").toString();
+            if (text.contains("7/7") || text.contains("/46")) sawCounts = true;
+        }
+        QVERIFY2(sawCounts, "子源计数未反映 46 路");
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/57c-settings-sources-jian.png"));
+        QVERIFY(clickInDetail("jianSub-usgs"));
+        QTRY_VERIFY(!controller.settings()->isSubSourceEnabled("jian", "usgs"));
+        // 只影响这一路：JMA 预警仍是启用状态（旧的 7 路之一），KMA 情报也没被牵连，
+        // Whews 的同名频道（usgs）更不该被连坐。
+        QVERIFY(controller.settings()->isSubSourceEnabled("jian", "jma-eew"));
+        QVERIFY(controller.settings()->isSubSourceEnabled("jian", "kma"));
+        QVERIFY(controller.settings()->isSubSourceEnabled("whews", "usgs"));
+        // 分组开关（全开 / 全不选）必须按 kind 各出一个，否则 46 路只能逐条点。
+        QVERIFY(findVisualItem(window, "jianSubAll-directory"));
+        QVERIFY(findVisualItem(window, "jianSubNone-directory"));
+        QVERIFY(click("sourceNav-wolfx"));
+        QTRY_VERIFY(findVisualItem(window, "wolfxSwitch"));
+
         // ── 延迟显示 ────────────────────────────────────────────────────────
         // 设置页此前对四个源永远看不到延迟（只有 Wolfx 曾经 ping 过，其余三个源连
         // pong 都没接）。链路层由 qt_business 的 everyEventSourceMeasuresLinkLatency

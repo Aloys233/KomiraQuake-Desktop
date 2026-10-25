@@ -57,7 +57,9 @@ QHash<QString, QVector<SubSourceInfo>> buildCatalog() {
 
     QVector<SubSourceInfo> jian;
     for (const JianChannel& channel : jianChannels()) {
-        jian.push_back({channel.type, channelName(channel.agency, channel.kind), channel.kind});
+        // 与 HUD 标题同源：设置页的开关名与事件卡上的来源名必须是同一句话，
+        // 否则用户勾了「中国地震预警网 地震预警」却在列表里看到「CEA 地震预警」。
+        jian.push_back({channel.type, jianTitleFor(channel), channel.kind});
     }
     catalog.insert(SourceIds::kJian, disambiguate(jian));
 

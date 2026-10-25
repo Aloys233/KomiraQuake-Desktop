@@ -21,7 +21,7 @@ namespace komira {
 
 namespace {
 const QString kBaseDescription =
-    QStringLiteral("Jian（api.sismotide.top）聚合（CENC/CEA/JMA/CWA/HKO）");
+    QStringLiteral("Jian（api.sismotide.top）聚合（CEA/JMA/CWA/KMA/SA 等 46 路地震频道）");
 }
 
 JianSource::JianSource(QObject* parent) : EarthquakeSource(parent) {
@@ -262,12 +262,26 @@ void JianSource::handleMessage(const QString& text) {
         return;
     }
 
-    // /all 首帧快照：{type:"all", "source:xxx": {Data, md5}, …}
+    // /all 首帧快照：{type:"all", "source：xxx": {Data, md5}, …}
+    //
+    // **冒号是全角 U+FF1A，不是 ASCII ':'**。上游文档与真实快照都用全角（`source：cea`），
+    // 参考实现也是用 `^source[:：]` 同时兜住两种写法。此前这里只匹配半角 `"source:"`，
+    // 结果整帧快照被静默丢弃 —— 表现为「连上了、也有历史列表，但最新一报永远不出现」，
+    // 而且不报任何错。两端都必须同时接受两种冒号。
     if (type == QLatin1String("all")) {
-        static const QString kSourcePrefix = QStringLiteral("source:");
+        static const QString kHalfPrefix = QStringLiteral("source:");
+        // 用 QChar(0xFF1A) 显式构造：写成 QStringLiteral("source\xEF\xBC\x9A") 会把 UTF-8
+        // 的三个字节当成三个 UTF-16 码元（U+00EF U+00BC U+009A），看起来像全角冒号、
+        // 实际永远匹配不上 —— 这个坑本身也会让「修好的代码」继续静默丢帧。
+        static const QString kFullPrefix =
+            QStringLiteral("source") + QChar(0xFF1A);   // '：'
         for (auto it = obj.begin(); it != obj.end(); ++it) {
-            if (!it.key().startsWith(kSourcePrefix)) continue;
-            handleRecord(it.key().mid(kSourcePrefix.size()),
+            const QString& key = it.key();
+            const QString prefix = key.startsWith(kHalfPrefix) ? kHalfPrefix
+                                  : key.startsWith(kFullPrefix) ? kFullPrefix
+                                                                : QString();
+            if (prefix.isEmpty()) continue;
+            handleRecord(key.mid(prefix.size()),
                          it.value().toObject().value(QStringLiteral("Data")).toObject());
         }
         return;

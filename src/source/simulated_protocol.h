@@ -6,7 +6,7 @@
 
 namespace komira {
 
-/// 模拟数据源常量。协议 sim-eew/1，契约见《NATIVE_PORT_SPEC》 §2.7。
+/// 模拟数据源常量。协议 sim-eew/1，契约见《NATIVE_PORT_SPEC》 §2.8。
 ///
 /// 服务端在仓库 `Simulated/`（Go + WebSocket + 浏览器控制台），仅供开发自测。
 struct SimulatedProtocol {

@@ -51,6 +51,7 @@
 #include "source/snet_station_parser.h"
 #include "source/whews_parser.h"
 #include "source/whews_protocol.h"
+#include "source/wolfx_protocol.h"
 #include "source/wolfx_seis_parser.h"
 #include "core/quake_calculator.h"
 #include "core/region_names.h"
@@ -710,12 +711,529 @@ private slots:
                                         std::nullopt, IntensityStandard::Csis).has_value());
     }
 
+    /// 46 路地震类频道必须全部在表内，且每项的 agency / eventNs 与 Whews 的同源频道
+    /// **逐字一致**——合并键是 `<agency>|<eventNs>:<上游 id>`，两处写法不一致时同一场
+    /// 地震会落进两个键，列表里出现两条重复条目。这条断言是「补频道」最容易踩的坑。
+    void jianChannelsCoverAllEarthquakeFeeds() {
+        // 文档里全部地震类频道（7 路 EEW + 39 路速报/情报）。刻意不含海啸 / 气象 /
+        // 火山 / 烈度速报 / 测站：它们要么没有数据模型，要么不进 /all。
+        const QStringList expected = {
+            // EEW
+            "cea", "cea-pr", "cwa-eew", "jma-eew", "sa", "kma-eew", "early-est",
+            // 中国
+            "cenc", "ningxia", "yunnan", "shanxi", "beijing",
+            // 东亚 / 东南亚
+            "cwa", "jma", "hko", "kma", "tmd", "mmd", "bmkg", "phivolcs",
+            // 大洋洲
+            "geonet", "ga",
+            // 美洲
+            "usgs", "nrcan", "usp", "scsn", "ncedc", "csn", "ssn", "peru", "igepn",
+            // 欧洲
+            "emsc", "gfz", "bcsf", "ingv", "ipgp", "infp", "sed", "knmi", "noa",
+            "ipma", "lmu", "afad", "koeri",
+            // 其他 / 全球
+            "isc", "gsras",
+        };
+        QCOMPARE(static_cast<int>(jianChannels().size()), expected.size());
+        QSet<QString> actual;
+        for (const JianChannel& channel : jianChannels()) {
+            actual.insert(channel.type);
+            QVERIFY(!channel.agency.isEmpty());
+            QVERIFY2(!channel.type.isEmpty(), qPrintable(channel.agency));
+        }
+        for (const QString& type : expected) {
+            QVERIFY2(actual.contains(type), qPrintable(QStringLiteral("缺少频道：") + type));
+        }
+
+        // 每条 {agency, eventNs} 与 Whews 的同源频道必须一致（跨聚合商合并键）。
+        // early-est 在 Whews 里叫 early_est、peru 在 Whews 里是 igp —— 这两处最易写错。
+        const QHash<QString, QPair<QString, QString>> whewsPairs = {
+            {"cea", {"CEA", "cenc_eew"}},        {"cwa-eew", {"CWA", "cwa_eew"}},
+            {"jma-eew", {"JMA", "jma_eew"}},     {"sa", {"SA", "sa_eew"}},
+            {"kma-eew", {"KMA", "kma_eew"}},     {"early-est", {"Early-est", "early_est"}},
+            {"cenc", {"CENC", ""}},              {"cwa", {"CWA", "cwa_eqlist"}},
+            {"jma", {"JMA", "jma_eqlist"}},      {"kma", {"KMA", "kma_eqlist"}},
+            {"hko", {"HKO", "hko_eqlist"}},      {"usgs", {"USGS", "usgs"}},
+            {"emsc", {"EMSC", "emsc"}},          {"gfz", {"GFZ", "gfz"}},
+            {"peru", {"IGP", "igp"}},
+        };
+        for (auto it = whewsPairs.constBegin(); it != whewsPairs.constEnd(); ++it) {
+            const JianChannel* channel = jianChannelFor(it.key());
+            QVERIFY2(channel != nullptr, qPrintable(it.key()));
+            QCOMPARE(channel->agency, it.value().first);
+            QCOMPARE(channel->eventNs, it.value().second);
+        }
+        // 未接入的路径必须查不到，否则 /all 里会解析出海啸/气象的假地震。
+        for (const QString& unsupported : {"weather", "jma-tsunami", "cwa-tsunami", "usgs-tsunami",
+                                           "nmefc-tsunami", "jma-volcano", "usgs-volcano", "cenc-ir"}) {
+            QVERIFY2(jianChannelFor(unsupported) == nullptr, qPrintable(unsupported));
+        }
+    }
+
+    /// 各源字段族都要能正确落库：KMA 的罗马数字 + maxMMI、英文地名按坐标补中文、
+    /// 深度 0 视为未知、reportTime 解析、以及每路频道的 kind 分类。
+    void jianHandlesMultiAgencyFieldShapes() {
+        // KMA 预警：intensity 是罗马数字、maxMMI 是数值；地名有 placename_zh。
+        const JianChannel* kmaEew = jianChannelFor(QStringLiteral("kma-eew"));
+        QVERIFY(kmaEew != nullptr);
+        QCOMPARE(kmaEew->kind, SourceEventKind::Live);
+        auto kma = JianParser::parseRecord(
+            *kmaEew,
+            QJsonObject{{"id", "2021007178"}, {"originTime", static_cast<double>(1639469956000)},
+                        {"latitude", 33.15}, {"longitude", 126.24}, {"depth", 0},
+                        {"magnitude", 5.3}, {"placeName", "제주 서귀포시 서남서쪽 32km 해역"},
+                        {"placename_zh", "济州特别自治道西归浦市"}, {"infoTypeName", "지진조기경보"},
+                        {"isWarn", true}, {"maxMMI", 6}, {"intensity", "Ⅵ"}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(kma.has_value());
+        QCOMPARE(QString::fromStdString(kma->eventId), QStringLiteral("kma_eew:2021007178"));
+        QCOMPARE(QString::fromStdString(kma->sourceAgency), QStringLiteral("KMA"));
+        QCOMPARE(kma->maxIntensityRaw, 6.0);
+        QCOMPARE(QString::fromStdString(kma->maxIntensityText), QStringLiteral("Ⅵ"));
+        // placename_zh 优先于韩文原文。
+        QCOMPARE(QString::fromStdString(kma->location), QStringLiteral("济州特别自治道西归浦市"));
+        // 深度 0 是「未定深度」，落 10 km 兜底而不是「正好在地表」。
+        QCOMPARE(kma->depth, 10.0);
+
+        // KMA 速报目录：只给罗马数字、没有 maxMMI 时按码位换算。
+        const JianChannel* kmaCatalog = jianChannelFor(QStringLiteral("kma"));
+        QVERIFY(kmaCatalog != nullptr && kmaCatalog->kind == SourceEventKind::Directory);
+        auto kmaInfo = JianParser::parseRecord(
+            *kmaCatalog,
+            QJsonObject{{"id", "kma_20260825094122_34.66_126.40"},
+                        {"originTime", static_cast<double>(1787623282000)},
+                        {"latitude", 34.66}, {"longitude", 126.40}, {"depth", 21},
+                        {"magnitude", 2.5}, {"placeName", "전남광주 해남군 서북서쪽 21km 지역"},
+                        {"placename_zh", "全罗南道海南郡"}, {"intensity", "Ⅲ"}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(kmaInfo.has_value());
+        QVERIFY(kmaInfo->isInfo);
+        QVERIFY(kmaInfo->isFinal);
+        QCOMPARE(kmaInfo->maxIntensityRaw, 3.0);
+
+        // USGS 目录：英文地名按坐标补「震源区」中文名（与 GQ / Pancakes 同一张表）。
+        const JianChannel* usgs = jianChannelFor(QStringLiteral("usgs"));
+        QVERIFY(usgs != nullptr);
+        auto usgsEvent = JianParser::parseRecord(
+            *usgs,
+            QJsonObject{{"id", "ci41530808"}, {"originTime", static_cast<double>(1787191666940)},
+                        {"latitude", 33.417}, {"longitude", -116.639}, {"depth", 6.45},
+                        {"magnitude", 0.31}, {"placeName", "15 km N of Warner Springs, CA"},
+                        {"infoTypeName", "Automatic"}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(usgsEvent.has_value());
+        QCOMPARE(QString::fromStdString(usgsEvent->eventId), QStringLiteral("usgs:ci41530808"));
+        QCOMPARE(QString::fromStdString(usgsEvent->determination), QStringLiteral("automatic"));
+        // 中文地名表命中时不再保留英文原文（表缺失时退回原文，故只断言「已替换」）。
+        QVERIFY(QString::fromStdString(usgsEvent->location) != "15 km N of Warner Springs, CA");
+
+        // SA 预警：只有 number，没有 serial；报次取 number。
+        const JianChannel* sa = jianChannelFor(QStringLiteral("sa"));
+        QVERIFY(sa != nullptr && sa->kind == SourceEventKind::Live);
+        auto saEvent = JianParser::parseRecord(
+            *sa,
+            QJsonObject{{"id", "ew1730000000"}, {"number", 1},
+                        {"originTime", static_cast<double>(1730000000000)}, {"latitude", 34.05},
+                        {"longitude", -118.25}, {"depth", 10}, {"magnitude", 5.2},
+                        {"placeName", "Los Angeles, California"}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(saEvent.has_value());
+        QCOMPARE(QString::fromStdString(saEvent->eventId), QStringLiteral("sa_eew:ew1730000000"));
+        QCOMPARE(QString::fromStdString(saEvent->sourceAgency), QStringLiteral("SA"));
+        QVERIFY(!saEvent->isFinal);   // 实时预警，上游没给 isFinal
+
+        // 省级地震局（宁夏）：中文地名保留原文，不拿 1° 粗格表覆盖。
+        const JianChannel* ningxia = jianChannelFor(QStringLiteral("ningxia"));
+        QVERIFY(ningxia != nullptr && ningxia->kind == SourceEventKind::Directory);
+        auto nx = JianParser::parseRecord(
+            *ningxia,
+            QJsonObject{{"id", "2050691459024261121"},
+                        {"originTime", static_cast<double>(1777760872000)}, {"latitude", 39.2659},
+                        {"longitude", 106.563}, {"depth", 19.0}, {"magnitude", 2.5},
+                        {"placeName", "宁夏石嘴山市惠农区"}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(nx.has_value());
+        QCOMPARE(QString::fromStdString(nx->location), QStringLiteral("宁夏石嘴山市惠农区"));
+        QCOMPARE(QString::fromStdString(nx->eventId), QStringLiteral("ningxia:2050691459024261121"));
+
+        // JMA 情报：地名是日文官方写法，保留原文；reportTime 也解析出来。
+        const JianChannel* jma = jianChannelFor(QStringLiteral("jma"));
+        QVERIFY(jma != nullptr);
+        auto jmaInfo = JianParser::parseRecord(
+            *jma,
+            QJsonObject{{"id", "20260820094551"}, {"originTime", "2026-08-20T09:45:00+09:00"},
+                        {"latitude", 32.6}, {"longitude", 130.7}, {"depth", 10.0},
+                        {"magnitude", 2.3}, {"placeName", "熊本県熊本地方"}, {"intensity", "1"},
+                        {"telegram", "VXSE53"}, {"infoType", "発表"}, {"serial", 1},
+                        {"reportTime", "2026-08-20T09:49:00+09:00"}},
+            std::nullopt, IntensityStandard::Csis);
+        QVERIFY(jmaInfo.has_value());
+        QCOMPARE(QString::fromStdString(jmaInfo->location), QStringLiteral("熊本県熊本地方"));
+        QVERIFY(jmaInfo->reportTime > jmaInfo->timestamp);
+        QCOMPARE(QString::fromStdString(jmaInfo->maxIntensityText), QStringLiteral("1"));
+    }
+
+    /// `/all` 首帧快照的键名用的是**全角冒号** `source：xxx`（U+FF1A），不是 ASCII ':'。
+    /// 此前只匹配半角前缀，整帧快照被静默丢弃 —— 表现为「连上了、也有历史列表，但最新
+    /// 一报永远不出现」，且不报任何错。回归用**未经修改的线上抓包**（从参考实现
+    /// `test/fixtures/jian/all.json`，2026-09-16 抓的帧里摘出三路，键名保持全角原样）。
+    /// 两种冒号都必须能解析 —— 文档示例用半角、线上快照用全角，只认一种就会漏。
+    void jianAllSnapshotKeyUsesFullWidthColon() {
+        const QString path = QFINDTESTDATA("fixtures/jian_all_snapshot.json");
+        QVERIFY2(!path.isEmpty(), "缺少 fixtures/jian_all_snapshot.json");
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QByteArray raw = file.readAll();
+        file.close();
+        // 抓包里必须是全角冒号；若哪天有人「顺手」把它改成半角，这条断言会先失败，
+        // 免得回归从此测不到真实形状。
+        QVERIFY(raw.contains(QByteArrayLiteral("source\xEF\xBC\x9A")));
+
+        JianSource source;
+        // 新鲜度窗口：三路里只有 cea 是实时预警（30 min 窗口），另两路是情报（不设窗口）。
+        // 故把「现在」设在 **cea 的发震时刻之后 2 s**：real-time 那一路进得来，两路情报
+        // 无论多旧都该进得来 —— 这条同时验证了「新鲜度只约束 Live」。
+        source.setNowProvider([] { return 1789376847000LL + 2000; });
+        source.setMonoProvider([] { return 0LL; });
+        source.running_ = true;
+        source.generation_ = 1;
+        auto* socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+        source.socket_ = socket;
+        source.attempt_ = 1;
+        QSignalSpy received(&source, &JianSource::eventReceived);
+        QVERIFY(received.isValid());
+
+        source.handleMessage(QString::fromUtf8(raw));
+        QCOMPARE(received.count(), 3);
+        QStringList agencies;
+        for (const auto& args : received)
+            agencies << QString::fromStdString(qvariant_cast<EarthquakeEvent>(args.at(0)).sourceAgency);
+        // 顺序由 QJsonObject 键序（字母序）决定，不该依赖它 —— 按 agency 判断。
+        for (const QString& expected : {"CEA", "USGS", "KMA"}) {
+            QVERIFY2(agencies.contains(expected),
+                     qPrintable(QStringLiteral("缺少 %1：%2").arg(expected, agencies.join(','))));
+        }
+
+        // 半角写法同样要能解析（文档示例用半角，不能只认全角）。
+        received.clear();
+        QByteArray halfWidth = raw;
+        halfWidth.replace(QByteArrayLiteral("source\xEF\xBC\x9A"), QByteArrayLiteral("source:"));
+        source.handleMessage(QString::fromUtf8(halfWidth));
+        QCOMPARE(received.count(), 3);
+        source.stop();
+    }
+
     void jianAuthTokenParsing() {
         QCOMPARE(JianParser::parseAuthToken(QByteArrayLiteral("{\"ok\":true,\"token\":\"rt_x\"}"))
                      .value_or(QString()),
                  QStringLiteral("rt_x"));
         QVERIFY(!JianParser::parseAuthToken(QByteArrayLiteral("{\"ok\":false,\"code\":4101}")).has_value());
         QVERIFY(!JianParser::parseAuthToken(QByteArrayLiteral("not json")).has_value());
+    }
+
+    /// Wolfx 目录**走 WS 推送**：`query_cenceqlist` / `query_jmaeqlist` 各回一帧
+    /// 整份 50 条列表（不是单条 EEW）。旧实现只订阅 6 条 EEW 查询、且把目录帧当 EEW
+    /// 直接丢弃，目录只能靠 90 s HTTP 轮询 —— 新地震进列表最坏等 90 s。
+    /// 回归读**线路抓包**（2026-10-25 从 `wss://ws-api.wolfx.jp/all_eew` 实收）。
+    void wolfxDirectoryPushesOverWebSocket() {
+        const QString cencPath = QFINDTESTDATA("fixtures/wolfx_cenc_eqlist.json");
+        const QString jmaPath = QFINDTESTDATA("fixtures/wolfx_jma_eqlist.json");
+        QVERIFY2(!cencPath.isEmpty(), "缺少 fixtures/wolfx_cenc_eqlist.json");
+        QVERIFY2(!jmaPath.isEmpty(), "缺少 fixtures/wolfx_jma_eqlist.json");
+        auto readJson = [](const QString& path) {
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly)) return QJsonObject();
+            const QJsonObject obj = QJsonDocument::fromJson(file.readAll()).object();
+            file.close();
+            return obj;
+        };
+        const QJsonObject cencRoot = readJson(cencPath);
+        const QJsonObject jmaRoot = readJson(jmaPath);
+        QVERIFY(!cencRoot.isEmpty());
+        QVERIFY(!jmaRoot.isEmpty());
+        // 抓包里必须有 md5：它是「内容没变就跳过整帧」的依据，缺了这条回归就测不到短路。
+        QVERIFY(!cencRoot.value("md5").toString().isEmpty());
+        QVERIFY(!jmaRoot.value("md5").toString().isEmpty());
+
+        WolfxSource source;
+        // 目录帧不设新鲜度窗口（只有 Live 有），故「现在」取抓包里的发震时刻之后即可。
+        // 用 2026-10-25 10:24:02 UTC+8（CENC 首条）作为参照点。
+        const long long now = 1792895042000LL + 60'000;
+        source.setNowProvider([now] { return now; });
+        source.setMonoProvider([] { return 0LL; });
+        source.running_ = true;
+        source.generation_ = 1;
+        source.socket_ = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, &source);
+        source.attempt_ = 1;
+        QSignalSpy received(&source, &WolfxSource::eventReceived);
+        QVERIFY(received.isValid());
+
+        // 帧外形与线上一致：整份对象 + `type` 字段。
+        QJsonObject cencFrame = cencRoot;
+        cencFrame.insert(QStringLiteral("type"), QStringLiteral("cenc_eqlist"));
+        source.handleMessage(QString::fromUtf8(QJsonDocument(cencFrame).toJson(QJsonDocument::Compact)));
+        const int cencCount = received.count();
+        QVERIFY2(cencCount > 0, "WS 目录帧必须被解析（旧实现把它当 EEW 丢弃）");
+        // 逐条核对来源标注：目录帧的 agency 由频道决定，不是 EEW 的 CEA。
+        for (const auto& args : received) {
+            const auto event = qvariant_cast<EarthquakeEvent>(args.at(0));
+            QCOMPARE(event.sourceProvider, std::string("Wolfx"));
+            QCOMPARE(event.sourceAgency, std::string("CENC"));
+            QVERIFY(event.isInfo);
+            QVERIFY(event.isFinal);
+            QCOMPARE(args.at(1).value<SourceEventKind>(), SourceEventKind::Directory);
+        }
+        // 第一条的字段抽样对照抓包（No1：瓦努阿图群岛 M6.2）。
+        const QString firstPath = QFINDTESTDATA("fixtures/wolfx_cenc_eqlist.json");
+        Q_UNUSED(firstPath);
+        QVariantList first = received.at(0);
+        const auto firstEvent = qvariant_cast<EarthquakeEvent>(first.at(0));
+        QCOMPARE(QString::fromStdString(firstEvent.location), QStringLiteral("瓦努阿图群岛"));
+        QCOMPARE(firstEvent.magnitude, 6.2);
+        // 发震时刻按 UTC+8 墙钟解析：10:24:02 UTC+8 = 02:24:02Z。
+        QCOMPARE(firstEvent.timestamp, 1792895042000LL);
+        QVERIFY(source.info().directoryLastSuccess > 0);
+
+        // md5 短路：同一帧重放不该再发事件（否则每次查询都会往列表灌 50 条重复）。
+        received.clear();
+        source.handleMessage(QString::fromUtf8(QJsonDocument(cencFrame).toJson(QJsonDocument::Compact)));
+        QCOMPARE(received.count(), 0);
+        // 内容变了（改 md5）就必须重新解析。
+        cencFrame.insert(QStringLiteral("md5"), QStringLiteral("changed"));
+        source.handleMessage(QString::fromUtf8(QJsonDocument(cencFrame).toJson(QJsonDocument::Compact)));
+        QCOMPARE(received.count(), cencCount);
+
+        // JMA 目录帧：shindo 走 JMA 震度文本、时刻按 JST 解析，agency 是 JMA。
+        received.clear();
+        QJsonObject jmaFrame = jmaRoot;
+        jmaFrame.insert(QStringLiteral("type"), QStringLiteral("jma_eqlist"));
+        source.handleMessage(QString::fromUtf8(QJsonDocument(jmaFrame).toJson(QJsonDocument::Compact)));
+        QVERIFY(received.count() > 0);
+        for (const auto& args : received) {
+            const auto event = qvariant_cast<EarthquakeEvent>(args.at(0));
+            QCOMPARE(event.sourceAgency, std::string("JMA"));
+            QVERIFY(event.isInfo);
+            // JMA 目录永不产生 warning/critical。
+            QVERIFY(event.warningLevel != WarningLevel::Critical);
+        }
+        source.stop();
+    }
+
+    /// 目录查询指令必须**都在**订阅表里，且能反查回子源 id。
+    /// 这条钉住的是「只发 6 条 EEW 查询」的旧缺陷：`query_cenceqlist` /
+    /// `query_jmaeqlist` 从未被发送，目录推送整条链路等于不存在。
+    void wolfxSubscriptionsCoverDirectoryChannels() {
+        const QStringList& queries = WolfxProtocol::queries();
+        QVERIFY(queries.contains(QStringLiteral("query_cenceqlist")));
+        QVERIFY(queries.contains(QStringLiteral("query_jmaeqlist")));
+        // 每条指令都要能反查回频道 id，否则子源开关对它是无效的（关了照样订阅）。
+        for (const QString& query : queries) {
+            const QString type = WolfxProtocol::typeForQuery(query);
+            QVERIFY2(!type.isEmpty(), qPrintable(QStringLiteral("未映射：%1").arg(query)));
+            QVERIFY2(WolfxProtocol::eewTypes().contains(type)
+                         || WolfxProtocol::directoryTypes().contains(type),
+                     qPrintable(QStringLiteral("映射到未知频道：%1").arg(type)));
+        }
+        // 6 路 EEW + 2 路目录，顺序上 EEW 在前（告警链路优先拿到数据）。
+        QCOMPARE(queries.size(), 8);
+        for (int i = 0; i < 6; ++i)
+            QVERIFY(WolfxProtocol::isEewType(WolfxProtocol::typeForQuery(queries.at(i))));
+        for (int i = 6; i < queries.size(); ++i)
+            QVERIFY(WolfxProtocol::isDirectoryType(WolfxProtocol::typeForQuery(queries.at(i))));
+        // 目录端点的 query 必须与订阅表一致（HTTP 兜底与 WS 主链路订同一频道）。
+        for (const auto& endpoint : WolfxProtocol::directoryEndpoints()) {
+            QVERIFY(queries.contains(endpoint.query));
+            QCOMPARE(WolfxProtocol::typeForQuery(endpoint.query), endpoint.subId);
+        }
+    }
+
+    /// 查询**不能并发**：线上实测同时发 8 条只有第一条回包，其余被上游丢弃。
+    /// 断言订阅走队列串行发出（一次 flush 只发一条），且关闭子源后不再发它的查询。
+    void wolfxQueriesAreSerializedAndFiltered() {
+        WolfxSource source;
+        source.setNowProvider([] { return origin; });
+        source.setMonoProvider([] { return 0LL; });
+        source.running_ = true;
+        source.generation_ = 1;
+        source.attempt_ = 1;
+        // 队列机制本身不依赖真连接，直接验 enqueue/flush 的语义。
+        source.enqueueQuery(QStringLiteral("query_cenceew"));
+        source.enqueueQuery(QStringLiteral("query_sceew"));
+        source.enqueueQuery(QStringLiteral("query_cenceew"));   // 重复入队被忽略
+        QCOMPARE(source.pendingQueries_, QStringList({QStringLiteral("query_cenceew"),
+                                                      QStringLiteral("query_sceew")}));
+        // 未连接时 flush 清空队列（不把指令攒着，避免重连后一次灌出旧订阅）。
+        source.flushQueryQueue();
+        QVERIFY(source.pendingQueries_.isEmpty());
+        QVERIFY(!source.queryStaggerTimer_.isActive());
+
+        // 关闭 cenc_eew 后，它的查询不得入队（发送端 flushQueryQueue 还会再过一道过滤）。
+        source.setSubSourceFilter([](const QString& id) { return id != QStringLiteral("cenc_eew"); });
+        source.enqueueQuery(QStringLiteral("query_cenceew"));
+        source.enqueueQuery(QStringLiteral("query_sceew"));
+        QCOMPARE(source.pendingQueries_.size(), 2);
+        source.stop();
+    }
+
+    /// JMA 的 `isWarn` 区分「緊急地震速報（警報）」与「（予報）」：两者的震级/震中
+    /// 可以完全相同，只有它说明「已对强震动地区发布警报」。旧实现完全没读这个字段，
+    /// 于是警报在 UI 上与普通速报长得一样。
+    void jmaAlertUpgradesLevelAndTitle() {
+        auto payload = [this](bool isWarn) {
+            return QJsonObject{{"type", "jma_eew"}, {"EventID", "20261025150429"},
+                               {"Serial", 4}, {"OriginTime", "2026/10/25 15:04:21"},
+                               {"AnnouncedTime", "2026/10/25 15:05:17"},
+                               {"Hypocenter", "福島県沖"}, {"Latitude", 37.8},
+                               {"Longitude", 141.8}, {"Magnitude", 4.1}, {"Depth", 40.0},
+                               {"MaxIntensity", "2"}, {"isFinal", true}, {"isWarn", isWarn}};
+        };
+        const long long now = 1792908000000LL;
+        // 予報：本地无定位时按震级定级 → M4.1 只是 watch。
+        const auto forecast = EewParser::parse(payload(false), std::nullopt, IntensityStandard::Csis,
+                                              QStringLiteral("JMA 紧急地震速报"),
+                                              QStringLiteral("wolfx_"), now, true,
+                                              QStringLiteral("jma_eew"));
+        QVERIFY(forecast.has_value());
+        QVERIFY(!forecast->alertIssued);
+        QCOMPARE(forecast->warningLevel, WarningLevel::Watch);
+        // 发布时刻取 `AnnouncedTime`（原来只认 ReportTime，JMA 的「发布」永远是 0）。
+        QVERIFY(forecast->reportTime > 0);
+        // 发震时刻按 JST 解析：15:04:21 JST = 06:04:21Z。
+        QCOMPARE(forecast->timestamp, 1792908261000LL);
+
+        // 警報：即使本地烈度低也必须至少是 warning —— 警报是官方判定，比衰减估算权威。
+        const auto alert = EewParser::parse(payload(true), std::nullopt, IntensityStandard::Csis,
+                                            QStringLiteral("JMA 紧急地震速报"),
+                                            QStringLiteral("wolfx_"), now, true,
+                                            QStringLiteral("jma_eew"));
+        QVERIFY(alert.has_value());
+        QVERIFY(alert->alertIssued);
+        QVERIFY(alert->warningLevel == WarningLevel::Warning
+                || alert->warningLevel == WarningLevel::Critical);
+        // 取消报不升级：撤回报不该因为残留的 isWarn 又变成警报。
+        auto canceled = payload(true);
+        canceled.insert(QStringLiteral("isCancel"), true);
+        const auto cancelEvent = EewParser::parse(canceled, std::nullopt, IntensityStandard::Csis,
+                                                  QStringLiteral("JMA 紧急地震速报"),
+                                                  QStringLiteral("wolfx_"), now, true,
+                                                  QStringLiteral("jma_eew"));
+        QVERIFY(cancelEvent.has_value());
+        QVERIFY(cancelEvent->isCanceled);
+        QVERIFY(!cancelEvent->alertIssued);
+
+        // 同一报次的「予報 → 警報」升级必须穿过 EventGate（否则被当重复丢掉）。
+        EventGate gate;
+        QCOMPARE(gate.admit(*forecast, now), EventGateDecision::Pass);
+        QCOMPARE(gate.admit(*alert, now), EventGateDecision::Correction);
+    }
+
+    /// `cwa_eew` / `fj_eew` 的 `ID` 是**数值型**，而 `cwa_eew` 更极端：**没有 `EventID`**。
+    /// `firstString()` 用 `QJsonValue::toString()` 取值，对数字返回空串，于是 `rawId`
+    /// 退化成 `nowMs()` —— 同一份报文每次重问（30/15 s 一轮）都会得到**不同的 eventId**，
+    /// 被当成一场新地震：列表里反复新增、EventGate 去重与「第 N 报」合并全部失效。
+    /// 线上抓包（2026-10-25）：`{"ID":1150079,…}` 是 number，`EventID` 为 undefined。
+    void numericIdFieldsBecomeStableEventIds() {
+        auto parseAt = [](const QByteArray& raw, long long now) {
+            return EewParser::parse(QJsonDocument::fromJson(raw).object(), std::nullopt,
+                                    IntensityStandard::Csis, QStringLiteral("CWA 地震预警"),
+                                    QStringLiteral("wolfx_"), now, false,
+                                    QStringLiteral("cwa_eew"));
+        };
+        // 真实 cwa_eew 报文：ID 是数字、无 EventID。
+        const QByteArray cwa = R"({"type":"cwa_eew","ID":1150079,"ReportTime":"2026-10-24 04:58:29",)"
+                               R"("ReportNum":4,"OriginTime":"2026-10-24 04:58:04","HypoCenter":"花蓮縣中部外海",)"
+                               R"("Latitude":23.89,"Longitude":121.86,"Magunitude":4.7,"Magnitude":4.7,)"
+                               R"("Depth":20,"MaxIntensity":"2","isCancel":false})";
+        // 两个不同的「现在」= 两次重问回包。identity 必须一致，否则同一场地震被当成两场。
+        const auto first = parseAt(cwa, 1792900000000LL);
+        const auto second = parseAt(cwa, 1792900015000LL);
+        QVERIFY(first.has_value());
+        QVERIFY(second.has_value());
+        QVERIFY2(first->identity() == second->identity(),
+                 qPrintable(QStringLiteral("eventId 不稳定：%1 vs %2")
+                                .arg(QString::fromStdString(first->eventId),
+                                     QString::fromStdString(second->eventId))));
+        // 数值 ID 必须真的被读出来（不是退化成时间戳）。
+        QCOMPARE(QString::fromStdString(first->eventId), QStringLiteral("cwa_eew:1150079"));
+
+        // fj_eew：有 EventID（字符串）优先用它，ID 为数字只是发报 ID。
+        const QByteArray fj = R"({"type":"fj_eew","ID":10061,"EventID":"202609150258_1",)"
+                              R"("ReportTime":"2026-09-15 02:58:33","ReportNum":1,)"
+                              R"("OriginTime":"2026-09-15 02:58:20","HypoCenter":"福建莆田市秀屿区",)"
+                              R"("Latitude":25.18,"Longitude":119.39,"Magunitude":3.1,"Magnitude":3.1})";
+        const auto fjParsed = EewParser::parse(QJsonDocument::fromJson(fj).object(), std::nullopt,
+                                               IntensityStandard::Csis,
+                                               QStringLiteral("福建省地震局 地震预警"),
+                                               QStringLiteral("wolfx_"), 1792900000000LL, false,
+                                               QStringLiteral("fj_eew"));
+        QVERIFY(fjParsed.has_value());
+        QCOMPARE(QString::fromStdString(fjParsed->eventId), QStringLiteral("fj_eew:202609150258_1"));
+
+        // 只有数字 ID、没有 EventID 的 fj 型报文：同样要稳定。
+        const QByteArray fjNumeric = R"({"type":"fj_eew","ID":10061,)"
+                                     R"("ReportTime":"2026-09-15 02:58:33","ReportNum":1,)"
+                                     R"("OriginTime":"2026-09-15 02:58:20","HypoCenter":"福建莆田市秀屿区",)"
+                                     R"("Latitude":25.18,"Longitude":119.39,"Magnitude":3.1})";
+        auto parseFjAt = [&fjNumeric](long long now) {
+            return EewParser::parse(QJsonDocument::fromJson(fjNumeric).object(), std::nullopt,
+                                    IntensityStandard::Csis, QStringLiteral("福建省地震局 地震预警"),
+                                    QStringLiteral("wolfx_"), now, false,
+                                    QStringLiteral("fj_eew"));
+        };
+        const auto fjN1 = parseFjAt(1792900000000LL);
+        const auto fjN2 = parseFjAt(1792900015000LL);
+        QVERIFY(fjN1.has_value());
+        QVERIFY(fjN2.has_value());
+        QCOMPARE(fjN1->eventId, fjN2->eventId);
+        QCOMPARE(QString::fromStdString(fjN1->eventId), QStringLiteral("fj_eew:10061"));
+    }
+
+    /// 线上端到端：用真实 `WolfxSource` 连 `ws-api.wolfx.jp`，验证两件事 ——
+    /// ① **串行节流**：8 条订阅逐条发出后目录帧才会回来（并发发送时只有第一条回包，
+    ///    目录帧永远不来）；② **周期重发**：服务端不主动推目录变化，必须 30 s 重问
+    ///    才会收到新一帧（实测被动等 5 分钟一帧未推）。
+    ///
+    /// 默认跳过：需要外网、且依赖上游当时有数据（`query_cenceqlist` 恒回一帧，故目录必然有）。
+    /// 手动运行：`KOMIRA_LIVE_WOLFX=1 ./qt_business_test wolfxLiveSubscriptionsDeliverDirectory`
+    void wolfxLiveSubscriptionsDeliverDirectory() {
+        if (qEnvironmentVariableIsEmpty("KOMIRA_LIVE_WOLFX")) {
+            QSKIP("设置 KOMIRA_LIVE_WOLFX=1 才跑线上用例（需要外网）");
+        }
+        WolfxSource source;
+        // **关掉 HTTP 兜底**：否则 start() 会立刻发一次 HTTP 请求，几百毫秒内就把目录
+        // 填进来，用例看起来「通过」，实际根本没走到 WS 订阅那条路（第一版就踩了这个坑：
+        // 353 ms 就 PASS，日志里目录帧却来自 HTTP）。关掉后唯一的数据来源只剩 WS。
+        source.setDirectoryPollingEnabled(false);
+        int directoryEvents = 0;
+        connect(&source, &WolfxSource::eventReceived, this,
+                [&directoryEvents](const EarthquakeEvent&, SourceEventKind kind) {
+                    if (kind == SourceEventKind::Directory) ++directoryEvents;
+                });
+        const auto startedAt = QDateTime::currentMSecsSinceEpoch();
+        source.start();
+        // 8 条查询按 1.2 s 串行发出，两条目录查询排在第 7/8 条 ≈ 7–10 s 才发出；
+        // 并发发送时它们会被上游丢弃、永远不会回包。上限 40 s 容忍慢网。
+        QTRY_VERIFY_WITH_TIMEOUT(source.directoryPushAt_.size() >= 2, 40000);
+        const auto elapsed = QDateTime::currentMSecsSinceEpoch() - startedAt;
+        // 串行节拍的证据：目录帧不可能在 6 条 EEW 查询发完之前回来（≥ 6 × 1.2 s）。
+        QVERIFY2(elapsed >= 6000,
+                 qPrintable(QStringLiteral("目录帧 %1 ms 就回来了，说明查询没有串行节拍").arg(elapsed)));
+        QVERIFY(directoryEvents > 0);
+        // 两路目录都必须真的回来 —— 只回来一路说明某条订阅被上游丢弃了。
+        QVERIFY(source.directoryPushAt_.contains(QStringLiteral("cenc_eqlist")));
+        QVERIFY(source.directoryPushAt_.contains(QStringLiteral("jma_eqlist")));
+
+        // 目录查询必须**周期重发**：服务端不主动推目录变化，只发一次就等于目录冻结。
+        // 等过 30 s 的重发周期，确认**又收到了一帧**。
+        //
+        // 注意这里**不能断言「事件数增长」**：内容没变时 md5 短路正确地不发事件
+        // （第一版就是这么写的，FAIL 在 `directoryEvents > before` —— 而那一刻日志里
+        // 明明在反复重发查询，是断言挑错了观测量）。观测量应是「帧到达时刻」。
+        const long long firstFrameAt = source.directoryPushAt_.value(QStringLiteral("cenc_eqlist"));
+        QVERIFY(firstFrameAt > 0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            source.directoryPushAt_.value(QStringLiteral("cenc_eqlist")) > firstFrameAt, 45000);
+        source.stop();
     }
 
     void hiddenMutedStopAndReplay() {
@@ -1473,7 +1991,7 @@ private slots:
         QVERIFY(wolfx.last().kind == SourceEventKind::Directory);
 
         QCOMPARE(subSourcesFor("pancakes").size(), 4);
-        QCOMPARE(subSourcesFor("jian").size(), 7);
+        QCOMPARE(subSourcesFor("jian").size(), 46);
         QCOMPARE(subSourcesFor("whews").size(), 41);
         QVERIFY(subSourcesFor("simulated").isEmpty());
 

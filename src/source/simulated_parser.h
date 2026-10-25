@@ -12,7 +12,7 @@
 
 namespace komira {
 
-/// 模拟源报文解析（协议 sim-eew/1，见《NATIVE_PORT_SPEC》 §2.7）。
+/// 模拟源报文解析（协议 sim-eew/1，见《NATIVE_PORT_SPEC》 §2.8）。
 ///
 /// 服务端只发场景可表达的字段；距离、烈度、到时、预警等级一律由
 /// [EewParser::recompute] 依用户定位与烈度制式本地派生。
