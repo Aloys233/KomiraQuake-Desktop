@@ -315,10 +315,25 @@ std::optional<EarthquakeEvent> EewParser::parse(const QJsonObject& obj,
     const QString eventId = eventNamespace.isEmpty()
                                 ? rawId
                                 : eventNamespace + QLatin1Char(':') + rawId;
+    // 警报级（JMA `isWarn`）：决定展示名是「紧急地震警报」还是「紧急地震速报」，
+    // 也参与定级 —— 警报是气象厅已发布的状态，不该因为本地算出的烈度偏低就降成「关注」。
+    // 上游没给这个字段（中国各局、Pancakes 的 JMA 转发偶尔缺）时保持 false，不影响既有行为。
+    const bool isWarn = obj.value("isWarn").toBool(false);
+
     EarthquakeEvent event = buildEvent(idPrefix + rawId, eventId, *magnitude, *latitude, *longitude, depth, location,
                       originTime != 0 ? originTime : nowMs, sourceTitle, user, standard,
                       maxIntensity.text, maxIntensity.raw, reportNum, isFinal, isCanceled);
-    event.reportTime = parseReportTime(firstString(obj, {"ReportTime", "reportTime", "updateTime"}).value_or(QString()));
+    // 发布时刻：JMA 用 `AnnouncedTime`（报文发出），中国各局用 `ReportTime`。
+    // 原来只认 `ReportTime`，于是 jma_eew 的「发布」行永远是接收时刻。
+    event.reportTime = parseReportTime(
+        firstString(obj, {"ReportTime", "reportTime", "AnnouncedTime", "updateTime"}).value_or(QString()));
+    if (isWarn && !event.isCanceled) {
+        event.alertIssued = true;
+        // 警报一旦发布，最低也按「地震预警」处理：`isWarn` 是官方判定，
+        // 比本地衰减关系算出来的烈度更权威（本地可能只是离震中远）。
+        if (event.warningLevel == WarningLevel::Normal || event.warningLevel == WarningLevel::Watch)
+            event.warningLevel = WarningLevel::Warning;
+    }
     return event;
 }
 

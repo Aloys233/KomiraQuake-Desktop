@@ -16,7 +16,10 @@ bool EventGate::sameBody(const EarthquakeEvent& a, const EarthquakeEvent& b) {
            a.isCanceled == b.isCanceled && a.timestamp == b.timestamp &&
            a.reportTime == b.reportTime && a.maxIntensityRaw == b.maxIntensityRaw &&
            a.maxIntensityText == b.maxIntensityText && a.isInfo == b.isInfo &&
-           a.determination == b.determination;
+           a.determination == b.determination &&
+           // JMA 的「予報 → 警報」升级常常不涨报次（同一 Serial 就地升级），
+           // 不算进报文内容就会当成重复丢掉，告警级别永远停在速报。
+           a.alertIssued == b.alertIssued;
 }
 
 void EventGate::prune(long long nowMs) {

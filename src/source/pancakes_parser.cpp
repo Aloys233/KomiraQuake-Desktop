@@ -192,11 +192,20 @@ std::optional<PancakesParsed> parseJmaEew(const QJsonObject& payload, long long 
     const bool canceled = payload.value("isCancel").toBool(
         payload.value("isCanceled").toBool(false));
     const auto max = EewParser::parseMaxIntensity(payload, standard);
-    return build(PancakesProtocol::sourceJmaEew(), *rawId, *magnitude, *latitude, *longitude, depth,
+    auto parsed = build(PancakesProtocol::sourceJmaEew(), *rawId, *magnitude, *latitude, *longitude, depth,
                  location, origin, max.text, max.raw, serial,
                  payload.value("isFinal").toBool(false), canceled,
                  EewParser::parseTime(firstString(payload, QStringLiteral("AnnouncedTime")).value_or(QString())),
                  user, standard, SourceEventKind::Live);
+    // 警报/予報：与 Wolfx 的 jma_eew 同一语义（同一份上游报文可能只在一侧带该字段）。
+    // 在 build() 之后补，是因为 build 内部已经跑过 recompute，这里要覆盖它的定级结果。
+    if (!parsed.event.isCanceled && payload.value("isWarn").toBool(false)) {
+        parsed.event.alertIssued = true;
+        if (parsed.event.warningLevel == WarningLevel::Normal
+            || parsed.event.warningLevel == WarningLevel::Watch)
+            parsed.event.warningLevel = WarningLevel::Warning;
+    }
+    return parsed;
 }
 
 std::optional<PancakesParsed> parseJmaEqlist(const QString& action, const QJsonObject& payload,

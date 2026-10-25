@@ -123,7 +123,10 @@ bool sameStoredEvent(const EarthquakeEvent& a, const EarthquakeEvent& b) {
            a.isInfo == b.isInfo && a.determination == b.determination &&
            // 标签是累积量：另一路聚合源加入时字段内容没变，但这一行必须重写，
            // 否则重启后列表又只剩最后写入的那一路。
-           a.sourceTags == b.sourceTags;
+           a.sourceTags == b.sourceTags &&
+           // 警报升级（予報 → 警報）必须算一次真实变化：否则同一报次的升级报文
+           // 会被当成重复丢掉，HUD 永远停在「紧急地震速报」。
+           a.alertIssued == b.alertIssued;
 }
 
 QString sourceTagFor(const EarthquakeEvent& event) {
@@ -159,7 +162,15 @@ QVariantMap toMap(const EarthquakeEvent& e, IntensityStandard standard = Intensi
     m["depth"] = e.depth;
     m["depthText"] = QString::number(e.depth, 'f', 0);
     m["location"] = QString::fromStdString(e.location);
-    m["source"] = QString::fromStdString(e.source);
+    // 展示名：上游发布警报时把「紧急地震速报」改为「紧急地震警报」。
+    // 日本气象厅靠 `isWarn` 区分「警報」与「予報」，两者的震级/震中可能完全相同，
+    // 只有这个字段能说明「已对强震动地区发布警报」。在展示层成型，是因为同一条
+    // 报文经 Wolfx / Pancakes / Jian 转发时源名不同，主题措辞必须一致。
+    QString displaySource = QString::fromStdString(e.source);
+    if (e.alertIssued)
+        displaySource.replace(QStringLiteral("紧急地震速报"), QStringLiteral("紧急地震警报"));
+    m["source"] = displaySource;
+    m["alertIssued"] = e.alertIssued;
     m["timestamp"] = static_cast<qlonglong>(e.timestamp);
     // 发震时刻：与校时时钟一致，固定渲染为 UTC+8 的完整时刻。
     m["timeText"] = utc8Text(e.timestamp);

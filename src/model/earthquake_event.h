@@ -63,6 +63,10 @@ struct EarthquakeEvent {
     /// 出现在列表与历史里，报次（第 N 报）只由实时预警产生。UI 据此决定标「情报」
     /// 还是「第 N 报」，不再把恒为 1 的 reportNum 当成报次显示。
     bool isInfo = false;
+    /// 上游已发布**警报**（目前只有 JMA 的 `isWarn` 提供）。用于区分气象厅的
+    /// 「緊急地震速報（警報）」与「（予報）」：前者是官方对强震动地区发布的警报，
+    /// 后者只是速报。仅影响展示名与最低告警级别，不参与去重与合并。
+    bool alertIssued = false;
 
     int remainingSeconds(long long nowMs) const {
         if (!sWaveArrival) return -1;
