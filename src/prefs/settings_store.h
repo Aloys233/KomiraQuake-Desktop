@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include <QObject>
 #include <QSettings>
 #include <QString>
@@ -7,6 +9,7 @@
 #include <QVariantMap>
 
 #include "core/source_estimator.h"
+#include "core/wave_fade.h"
 
 namespace komira {
 
@@ -24,7 +27,18 @@ public:
     Q_PROPERTY(bool showProvinceBorders READ showProvinceBorders WRITE setShowProvinceBorders NOTIFY showProvinceBordersChanged)
     /// 地图叠加层：测站强度点与右上角测站卡片、P/S 波前圆。
     Q_PROPERTY(bool showStationLayer READ showStationLayer WRITE setShowStationLayer NOTIFY showStationLayerChanged)
+    /// 右上角测站卡的形态：true = 收起成一摞（悬停展开），false = 常驻平铺成一排。
+    /// 两者都只是显示形态，不影响任何数据；默认堆叠（与改版以来的观感一致）。
+    Q_PROPERTY(bool stackStationCards READ stackStationCards WRITE setStackStationCards NOTIFY stackStationCardsChanged)
     Q_PROPERTY(bool showWavefront READ showWavefront WRITE setShowWavefront NOTIFY showWavefrontChanged)
+    /// P/S 波前消失口径：`intensity`（默认，按烈度）/ `distance`（按半径）/ `time`（按时间）。
+    Q_PROPERTY(QString waveFadeMode READ waveFadeMode WRITE setWaveFadeMode NOTIFY waveFadeModeChanged)
+    /// 烈度口径的阈值（CSIS 刻度，0.5–6.0）。默认 1.0 = 可感下限 I。
+    Q_PROPERTY(double waveFadeIntensity READ waveFadeIntensity WRITE setWaveFadeIntensity NOTIFY waveFadeIntensityChanged)
+    /// 距离口径的消失半径（km，50–5000）。默认 1000。
+    Q_PROPERTY(int waveFadeDistanceKm READ waveFadeDistanceKm WRITE setWaveFadeDistanceKm NOTIFY waveFadeDistanceKmChanged)
+    /// 时间口径的消失时长（秒，30–3600）。默认 300。
+    Q_PROPERTY(int waveFadeSeconds READ waveFadeSeconds WRITE setWaveFadeSeconds NOTIFY waveFadeSecondsChanged)
     Q_PROPERTY(int intensityStandard READ intensityStandard WRITE setIntensityStandard NOTIFY intensityStandardChanged)
     Q_PROPERTY(double localIntensityFilter READ localIntensityFilter WRITE setLocalIntensityFilter NOTIFY localIntensityFilterChanged)
     Q_PROPERTY(bool enableWarnings READ enableWarnings WRITE setEnableWarnings NOTIFY enableWarningsChanged)
@@ -209,8 +223,68 @@ public:
     void setShowProvinceBorders(bool v) { set("showProvinceBorders", v); }
     bool showStationLayer() const { return s_.value("showStationLayer", true).toBool(); }
     void setShowStationLayer(bool v) { set("showStationLayer", v); }
+    /// 右上角测站卡是否堆叠（true，默认）/ 平铺展开（false）。见 `StationStack.qml`。
+    bool stackStationCards() const { return s_.value("stackStationCards", true).toBool(); }
+    void setStackStationCards(bool v) { set("stackStationCards", v); }
     bool showWavefront() const { return s_.value("showWavefront", true).toBool(); }
     void setShowWavefront(bool v) { set("showWavefront", v); }
+
+    // ---- P/S 波前「什么时候消失」------------------------------------------------
+    //
+    // 三种口径共用同一条渐隐曲线（前 95% 不透明、最后 5% 线性归零，见 core/wave_fade.h），
+    // 差别只在于「走到哪算消失」：
+    //   intensity（默认）  半径到达「CSIS 烈度衰减到 waveFadeIntensity」的震中距
+    //   distance          半径到达 waveFadeDistanceKm
+    //   time              发震后经过 waveFadeSeconds 秒（P 与 S 同时隐去）
+    //
+    // 三个数值各存一个键、**互不改写**：用户切回上次用过的口径时，那口径的数值还在。
+    static constexpr const char* kDefaultWaveFadeMode = "intensity";
+
+    QString waveFadeMode() const {
+        const QString mode = s_.value("waveFadeMode", kDefaultWaveFadeMode).toString();
+        // 未知值（手改配置 / 旧版本残留）一律回落到默认口径，不让地图莫名不画波前。
+        if (mode == QLatin1String("distance") || mode == QLatin1String("time")
+            || mode == QLatin1String("intensity")) {
+            return mode;
+        }
+        return QString::fromLatin1(kDefaultWaveFadeMode);
+    }
+    void setWaveFadeMode(const QString& v) {
+        const QString mode = (v == QLatin1String("distance") || v == QLatin1String("time")
+                              || v == QLatin1String("intensity"))
+                                 ? v
+                                 : QString::fromLatin1(kDefaultWaveFadeMode);
+        set("waveFadeMode", mode);
+    }
+    /// 烈度口径的阈值（CSIS 刻度）。默认 1.0 = 可感下限 I，即历史行为。
+    double waveFadeIntensity() const {
+        return std::clamp(s_.value("waveFadeIntensity", 1.0).toDouble(), 0.5, 6.0);
+    }
+    void setWaveFadeIntensity(double v) { set("waveFadeIntensity", std::clamp(v, 0.5, 6.0)); }
+    /// 距离口径的消失半径（km）。下限 50 是为了不让波前在震中附近就消失。
+    int waveFadeDistanceKm() const {
+        return std::clamp(s_.value("waveFadeDistanceKm", 1000).toInt(), 50, 5000);
+    }
+    void setWaveFadeDistanceKm(int v) { set("waveFadeDistanceKm", std::clamp(v, 50, 5000)); }
+    /// 时间口径的消失时长（秒）。上限对齐「波前只在发震 60 min 内计算」。
+    int waveFadeSeconds() const {
+        return std::clamp(s_.value("waveFadeSeconds", 300).toInt(), 30, 3600);
+    }
+    void setWaveFadeSeconds(int v) { set("waveFadeSeconds", std::clamp(v, 30, 3600)); }
+
+    /// 折算成 core 层的口径结构。QML / AppController 都走这一份，避免两处各拼一遍。
+    WaveFadeSettings waveFadeSettings() const {
+        WaveFadeSettings out;
+        const QString mode = waveFadeMode();
+        out.mode = mode == QLatin1String("distance")
+                       ? WaveFadeMode::Distance
+                       : mode == QLatin1String("time") ? WaveFadeMode::Time
+                                                       : WaveFadeMode::Intensity;
+        out.intensityLevel = waveFadeIntensity();
+        out.distanceKm = waveFadeDistanceKm();
+        out.seconds = waveFadeSeconds();
+        return out;
+    }
 
     int intensityStandard() const { return s_.value("intensityStandard", 0).toInt(); } // 0 csis, 1 jma
     void setIntensityStandard(int v) { set("intensityStandard", v); }
@@ -522,7 +596,12 @@ signals:
     void showEstimateLabelChanged();
     void showProvinceBordersChanged();
     void showStationLayerChanged();
+    void stackStationCardsChanged();
     void showWavefrontChanged();
+    void waveFadeModeChanged();
+    void waveFadeIntensityChanged();
+    void waveFadeDistanceKmChanged();
+    void waveFadeSecondsChanged();
     void silentStartChanged();
     void simulatedUrlChanged();
     void sourceEstimationEnabledChanged();

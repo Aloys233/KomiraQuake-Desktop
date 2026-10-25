@@ -11,6 +11,12 @@ import QtQuick
 // 收起态**最多露 3 张**（`peekCount`）：一摞纸要「看得出是叠着的」就够了，5 张全错开
 // 只会让右上角又宽又高、盖掉更多地图。第 4 张起在收起态透明度归零，展开时再淡入。
 //
+// **形态可选**（`stacked`，设置页「地图与图层 › 测站卡片 › 测站卡片堆叠」）：`true`（默认）= 上面这套
+// 「收起成摞 + 悬停展开」；`false` = **常驻平铺成一排**（等价于永远展开），不再响应悬停，
+// 每一路都完整可读。两者共用同一套几何（只把 `progress` 钉在 1），所以切换形态本身就是
+// 一次普通的展开/收回动画，没有第二条布局路径要维护。平铺态**不按优先级重排**：
+// 每张卡都看得见时，谁站前排没有意义，而换位只会让整排卡在用户眼前跳来跳去。
+//
 // 收起态只看得见前排，所以排序只决定「谁站前排」，按三级排：
 //   ① **读数变过的优先**：20 s 内数值变化过的源排在前面 —— 地震刚到、某一路刚起跳时，
 //      它最值得看，哪怕读数还不高；
@@ -32,6 +38,11 @@ Item {
     /// 逐源卡片数据（`app.stationSources`）：
     /// `[{ id, name, caption, hasData, raw, text, standard, stationCount, frameTime }]`。
     property var sources: []
+    /// 卡片形态：`true` = 收起成一摞（指针放上去展开，默认）；`false` = 常驻平铺成一排。
+    /// 由设置项 `app.settings.stackStationCards` 驱动，切换时走同一套展开动画。
+    property bool stacked: true
+    /// 当前是否「每张卡都要完整可读」：堆叠态的悬停展开，或直接关掉堆叠。
+    readonly property bool showAll: root.expanded || !root.stacked
     /// 「读数正在变」的判定窗口（ms）。可写以便单测把它压短，不必真等 20 秒。
     property int hotWindowMs: 20000
     /// 数值变化的最小判定幅度（原生单位）。小于它的抖动不算「变过」：
@@ -65,12 +76,25 @@ Item {
     }
     // 展开/收回一被要求就立刻开 live：等 `progress` 动了才开的话，首帧卡片已经挪了
     // 一点、纹理却还是旧的 —— 这一帧就是「跳一下」的来源。
-    onExpandedChanged: {
+    function beginTransition() {
         settleDelay.stop();
         root.animating = true;
         // 没有真正的动画时（`reduceMotion`、或者根本没有卡片）progress 不会变，
         // 这里必须自己安排收尾，否则 animating 会永远停在 true（5 张卡一直逐帧重采样）。
         if (root.progress <= 0.0001 || root.progress >= 0.9999) settleDelay.restart();
+    }
+    onExpandedChanged: root.beginTransition()
+    // 切换「堆叠 / 平铺」同样是一次 0↔1 的过渡，模糊一样要跟着切到 live；
+    // 否则用户点一下设置，卡片的模糊就会在整段动画里落后于卡片本身。
+    // 另外切回堆叠态时 `expanded` 可能还留着上一次的悬停结果（用户就是在设置页关掉再
+    // 打开）：不清掉的话这一摞一出现就是摊开的。堆叠态一律从「收起」重新开始。
+    onStackedChanged: {
+        if (root.stacked) {
+            root.expanded = false;
+            expandDelay.stop();
+            collapseDelay.stop();
+        }
+        root.beginTransition();
     }
     onProgressChanged: {
         // 终点（0 或 1）都要等一拍再关：真实动画的最后一帧可能仍是 0.999…；
@@ -78,12 +102,14 @@ Item {
         if (root.progress <= 0.0001 || root.progress >= 0.9999) settleDelay.restart();
         else { settleDelay.stop(); root.animating = true; }
         // 收回动画彻底结束才按最新数据重排（见文件里「展开期间不重排」的说明）。
-        if (!root.expanded && root.progress <= 0.0001) root.applyOrder();
+        if (!root.showAll && root.progress <= 0.0001) root.applyOrder();
     }
 
     function setPointerInside(inside) {
         if (root.pointerInside === inside) return;
         root.pointerInside = inside;
+        // 平铺态没有「展开」这回事：指针进出不做任何事（否则会白跑一遍计时器）。
+        if (!root.stacked) return;
         if (inside && root.visible && root.count > 0) {
             collapseDelay.stop();
             expandDelay.restart();
@@ -108,7 +134,7 @@ Item {
         id: expandDelay
         // 指针扫过时不展开：停稳 80 ms 才算「放上去」。
         interval: 80
-        onTriggered: if (root.pointerInside && root.count > 0) root.expanded = true
+        onTriggered: if (root.stacked && root.pointerInside && root.count > 0) root.expanded = true
     }
     Timer {
         id: collapseDelay
@@ -142,7 +168,9 @@ Item {
     /// 展开进度 0 → 1。**所有几何都从它算**，这样展开/收回只需要一条动画：
     /// 位置、容器宽高、可悬停区域全部同步过渡，不会出现「容器先跳、卡片后动」
     /// 或前排卡被容器的宽度变化甩出去（容器的右缘是固定的，宽度增长只向左延伸）。
-    property real progress: root.expanded ? 1 : 0
+    /// 关掉堆叠（`stacked: false`）时它恒为 1 —— 平铺态就是「永远展开」，
+    /// 所以两种形态共用同一套几何，切换形态本身就复用这条动画。
+    property real progress: root.showAll ? 1 : 0
     Behavior on progress {
         NumberAnimation { duration: root.expandDuration; easing.type: Easing.OutCubic }
     }
@@ -251,7 +279,8 @@ Item {
     function applyOrder() {
         // 收起态才重排（见 onExpandedChanged 的注释）；但源的数量变了必须立刻重排，
         // 否则 order 与下标对不上、slotOf() 全体回落成下标（启用/停用一路时会出现错位）。
-        if (root.expanded && root.order.length === root.count) return;
+        // 平铺态同样不重排：每张卡都看得见，谁站前排没有意义，换位只会让整排卡跳位。
+        if (root.showAll && root.order.length === root.count) return;
         const desired = root.desiredOrder();
         const current = root.order || [];
         let next = desired;
@@ -303,7 +332,7 @@ Item {
         root.lastTextById = texts;
         root.lastChangeById = changes;
         // 首次装填时 order 还是空的：即使正在展开也必须立刻排一次。
-        if (!root.expanded || root.order.length !== root.count) root.applyOrder();
+        if (!root.showAll || root.order.length !== root.count) root.applyOrder();
     }
     onSourcesChanged: root.sync()
     Component.onCompleted: root.sync()
@@ -358,24 +387,24 @@ Item {
             opacity: slot < root.peekCount ? 1 : root.progress
             // 只在**彻底静下来的收起态**才把被淡出的那两张从场景里摘掉：
             // 它们是透明的，却仍然让 GlassCard 的模糊层每 500 ms 采一次地图
-            // （「隐藏内容不做无意义模糊」的契约）。动画一开始（expanded 或 progress>0）
+            // （「隐藏内容不做无意义模糊」的契约）。动画一开始（showAll 或 progress>0）
             // 就重新挂上 —— 那时它们的 opacity 还接近 0，Loader 重建的纹理在淡入里看不出来，
             // 而**收回过程中**绝不会触发重建（否则卡片滑回去时模糊会闪）。
-            // 注意判据里必须带 `expanded`：展开的第一帧 progress 还是 0，只看 progress
-            // 会把卡 4/5 在这一帧里摘掉、下一帧再挂上（又是一次 Loader 重建）。
-            visible: slot < root.peekCount || root.expanded || root.progress > 0.0001
+            // 注意判据里必须带 `showAll`：展开（或平铺）的第一帧 progress 还是 0，
+            // 只看 progress 会把卡 4/5 在这一帧里摘掉、下一帧再挂上（又是一次 Loader 重建）。
+            visible: slot < root.peekCount || root.showAll || root.progress > 0.0001
             // 收起态里换前排时的滑移（几像素）：只在「静止的收起态」开动画。
             // 展开/收回过程中 x/y 是由 progress 逐帧推出来的，若这里也开 Behavior，
             // 会变成「动画套动画」——卡片会明显落在容器边缘后面。
-            // 判据必须是 `!expanded && progress == 0` 两个条件：只看 progress 的话，
+            // 判据必须是 `!showAll && progress == 0` 两个条件：只看 progress 的话，
             // 展开的第一帧 progress 还是 0、Behavior 会把那一小步也做成动画；
-            // 只看 !expanded 的话，收回动画全程都会走 Behavior。
+            // 只看 !showAll 的话，收回动画全程都会走 Behavior。
             Behavior on x {
-                enabled: !root.expanded && root.progress <= 0.0001
+                enabled: !root.showAll && root.progress <= 0.0001
                 NumberAnimation { duration: root.expandDuration; easing.type: Easing.OutCubic }
             }
             Behavior on y {
-                enabled: !root.expanded && root.progress <= 0.0001
+                enabled: !root.showAll && root.progress <= 0.0001
                 NumberAnimation { duration: root.expandDuration; easing.type: Easing.OutCubic }
             }
             onImplicitWidthChanged: root.noteCardSize(implicitWidth, implicitHeight)

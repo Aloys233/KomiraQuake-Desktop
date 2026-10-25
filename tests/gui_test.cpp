@@ -2056,6 +2056,120 @@ private slots:
         QTRY_COMPARE(stack->height(), 0.0);
     }
 
+    /// 「测站卡片堆叠」开关：关掉后右上角必须**常驻平铺**成一排，不再响应悬停。
+    ///
+    /// 设置项 `app.settings.stackStationCards` → `StationStack.stacked`。两种形态共用
+    /// 同一套 `progress` 几何（平铺 = 永远展开），所以这里要验的是：
+    ///  - 平铺态每一路都完整可读、间距 = 卡宽 + gap、宽度 = 整排宽度（与悬停展开同一几何）；
+    ///  - 平铺态**不重排**：每张卡都看得见，换前排只会让整排卡跳位；
+    ///  - 平铺态下悬停进出**不再改变形态**（不能一放上去就重新排一次）；
+    ///  - 关掉再打开开关能来回切，且切回堆叠时从「收起」开始（不留上一次的悬停展开态）；
+    ///  - 切换本身是一次 0↔1 的过渡：模糊要跟着切到 live，否则卡片移动而模糊留在原地。
+    void stationStackCanBeToldToStayFlat() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        AppController controller(nullptr, false);
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl::fromLocalFile(QStringLiteral(KOMIRA_SOURCE_DIR "/tests/StationStackScene.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        auto* stack = window->findChild<QQuickItem*>("fixtureStack");
+        QVERIFY(stack);
+        auto cardOf = [&](const QString& id) {
+            return findVisualItem(window, "stationCard-" + id);
+        };
+        const QStringList ids{ "kmoni", "snet", "kma_station", "pancakes_seis", "wolfx_seis" };
+        QCOMPARE(stack->property("count").toInt(), ids.size());
+        QTRY_VERIFY(stack->property("cardHeight").toReal() >= 40);
+        const qreal cardWidth = stack->property("cardWidth").toReal();
+        const qreal gap = stack->property("gap").toReal();
+        const qreal peekX = stack->property("peekX").toReal();
+
+        // 1. 默认（堆叠）：收起成一摞，宽度只覆盖 3 张纸边。
+        QVERIFY(stack->property("stacked").toBool());
+        QVERIFY(!stack->property("showAll").toBool());
+        QVERIFY2(std::abs(stack->width() - (cardWidth + peekX * 2)) < 0.5,
+                 qPrintable(QStringLiteral("堆叠态宽度不对：%1").arg(stack->width())));
+
+        // 2. 关掉堆叠 → 常驻平铺：5 张全部完整可读，整排宽度 = n·卡宽 + (n-1)·gap。
+        stack->setProperty("stacked", false);
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(stack->property("progress").toReal() - 1.0) < 0.001,
+                                 2000);
+        QVERIFY(stack->property("showAll").toBool());
+        QVERIFY2(!stack->property("expanded").toBool(),
+                 "平铺不是「展开」：expanded 只属于悬停那套状态");
+        QTRY_VERIFY_WITH_TIMEOUT(
+            std::abs(stack->width() - (cardWidth * ids.size() + gap * (ids.size() - 1))) < 0.5,
+            2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!stack->property("animating").toBool(), 3000);
+        QCOMPARE(stack->property("cardBackdropLive").toBool(),
+                 stack->property("backdropLive").toBool());
+        for (const QString& id : ids) {
+            auto* card = cardOf(id);
+            QVERIFY(card);
+            QVERIFY2(card->isVisible() && card->opacity() > 0.99,
+                     qPrintable(QStringLiteral("平铺态 %1 没有完整显示").arg(id)));
+            QVERIFY(std::abs(card->y()) < 0.5);
+        }
+        window->grabWindow().save(evidenceDirectory(window) + "/59g-station-stack-flat.png");
+
+        // 3. 平铺态不重排：喂一个「读数刚变过」的源，order 必须原地不动
+        //    （每张卡都看得见时换前排只会让整排卡在用户眼前跳位）。
+        const QVariantList orderBefore = stack->property("order").toList();
+        {
+            QVariantList list = stack->property("sources").toList();
+            QVariantMap kma = list.at(2).toMap();
+            kma["hasData"] = true; kma["raw"] = 6.0; kma["text"] = "6";
+            list[2] = kma;
+            stack->setProperty("sources", list);
+            QCoreApplication::processEvents();
+            QTest::qWait(1200);   // 跨过 1 s 的兜底重排计时器
+            QCOMPARE(stack->property("order").toList(), orderBefore);
+        }
+
+        // 4. 平铺态下悬停进出不再改变形态：指针压上去也不许「再展开一次」。
+        stack->setProperty("hotWindowMs", 250);
+        // 每次都要**按当前几何**重算指针落点：平铺态整排比收起的一摞宽得多，
+        // 沿用平铺时算出的坐标，切回堆叠后那个点已经落在卡片外面了（悬停自然不触发）。
+        auto centerOfStack = [&] {
+            return stack->mapToScene(QPointF(stack->width() / 2, stack->height() / 2)).toPoint();
+        };
+        QTest::mouseMove(window, QPoint(0, 0));
+        QTest::qWait(30);
+        QTest::mouseMove(window, centerOfStack());
+        QTest::qWait(400);   // 超过 80 ms 的展开延时
+        QVERIFY2(!stack->property("expanded").toBool(), "平铺态不该再响应悬停展开");
+        QCOMPARE(stack->property("progress").toReal(), 1.0);
+
+        // 5. 打开开关切回堆叠：必须从「收起」重新开始（不能停在上一次的悬停展开态），
+        //    并且切换过程本身是一次过渡 —— 模糊要跟着切到 live。
+        stack->setProperty("durationOverride", 600);
+        stack->setProperty("stacked", true);
+        QTRY_VERIFY_WITH_TIMEOUT(stack->property("animating").toBool(), 1000);
+        QVERIFY2(stack->property("cardBackdropLive").toBool(),
+                 "形态切换期间卡片玻璃底没有切到 live（模糊会落后于卡片）");
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(stack->property("progress").toReal()) < 0.001, 2000);
+        QVERIFY(!stack->property("expanded").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(!stack->property("animating").toBool(), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(stack->width() - (cardWidth + peekX * 2)) < 0.5, 2000);
+        window->grabWindow().save(evidenceDirectory(window) + "/59h-station-stack-back-to-stacked.png");
+        // 切回来之后悬停展开必须照常可用（指针要先移出去再移进来，否则 HoverHandler
+        // 认为它一直在卡上，pointerInside 没有重新置位）。
+        stack->setProperty("durationOverride", -1);
+        QTest::mouseMove(window, QPoint(0, 0));
+        QTest::qWait(30);
+        QTest::mouseMove(window, centerOfStack());
+        QTRY_VERIFY_WITH_TIMEOUT(stack->property("expanded").toBool(), 2000);
+        QTest::mouseMove(window, QPoint(0, 0));
+        QTRY_VERIFY_WITH_TIMEOUT(!stack->property("expanded").toBool(), 2000);
+    }
+
     /// 回归：地图上的 UI 浮层必须盖住测站层（测站层 z=2）。
     /// 曾经右侧工具条没有写 z（默认 0），测站直接画在按钮上面。
     void mapOverlaysStayAboveStationLayer() {
@@ -4625,6 +4739,28 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(controller.districtIntensity_.isEmpty(), 1500);
         controller.settings()->setVectorOverlay(true);
         QTRY_VERIFY_WITH_TIMEOUT(!controller.districtIntensity_.isEmpty(), 1500);
+
+        // 「测站卡片堆叠」开关要真的把地图右上角那组分卡片掰成平铺 —— 只改设置值
+        // 不算数，必须一路透传到 StationStack 的几何上（默认堆叠，点一下变平铺）。
+        auto* stack = window->findChild<QQuickItem*>("stationStack");
+        QVERIFY(stack);
+        QVERIFY2(stack->property("stacked").toBool(), "默认必须堆叠");
+        const qreal collapsedWidth = stack->width();
+        auto* stackSwitch = findVisualItem(window, "stackStationCardsSwitch");
+        QVERIFY2(stackSwitch, "设置页「地图与图层」里缺少测站卡片堆叠开关");
+        QVERIFY(stackSwitch->isVisible());
+        QVERIFY2(stackSwitch->width() > 0 && stackSwitch->width() <= scroll->width(),
+                 "stack switch must remain inside the settings column");
+        click(stackSwitch);
+        QTRY_VERIFY(!controller.settings()->stackStationCards());
+        QTRY_VERIFY_WITH_TIMEOUT(!stack->property("stacked").toBool(), 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(stack->width() > collapsedWidth + 100, 2000);
+        window->grabWindow().save(evidenceDirectory(window) + "/59i-settings-stack-flat.png");
+        // 再点一次回到堆叠：宽度收回一摞的水平，开关状态也回到 true。
+        click(stackSwitch);
+        QTRY_VERIFY(controller.settings()->stackStationCards());
+        QTRY_VERIFY_WITH_TIMEOUT(stack->property("stacked").toBool(), 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(stack->width() - collapsedWidth) < 0.5, 2000);
     }
 
     void iconsAndPersistence() {
@@ -5260,6 +5396,172 @@ private slots:
         // 焦点清掉后不再标注（历史事件另行显示十字也无所谓，信息块只跟当前事件）。
         controller.clearMapFocus();
         QTRY_VERIFY(!info->isVisible());
+    }
+
+    /// P/S 波前的「消失条件」可自定义：按烈度（默认）/ 按距离 / 按时间。
+    ///
+    /// 三种口径共用同一条渐隐曲线（前 95% 不透明、最后 5% 归零），差别只在「走到哪算消失」。
+    /// 本用例分两层：
+    ///   · 行为：改设置后**同一场地震**的波前半径/透明度必须立刻按新边界重算 —— 只在
+    ///     定时器里重算是不够的，用户往往在波前还挂着的时候改设置；
+    ///   · UI：设置页的下拉与三条滑杆必须真的接到设置项上（模式切换时只让当前口径可用），
+    ///     且「恢复默认」能把它们拉回去（Binding 而不是被拖断的字面绑定）。
+    void wavefrontFadeModeFollowsSetting() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("WaveFadeModeTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setVectorOverlay(false);
+        controller.settings()->setShowStationLayer(false);
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        auto* pWave = window->findChild<QQuickItem*>("pWaveRing");
+        auto* sWave = window->findChild<QQuickItem*>("sWaveRing");
+        auto* sFill = window->findChild<QQuickItem*>("sWaveFill");
+        QVERIFY(map && pWave && sWave && sFill);
+
+        // 40 秒前的 M7.5 深 10 km：P ≈ 264 km、S ≈ 141 km（走时表反解），
+        // 按烈度 I 的消失半径 ≈ 1715 km —— 于是「按距离 200 km」能单独把 P 藏掉，
+        // 而「按时间 30 秒」把两条一起藏掉，三种口径的差异可以分别观测。
+        EarthquakeEvent e;
+        e.id = e.eventId = "FADE-MODE";
+        e.sourceProvider = "Wolfx"; e.sourceAgency = "CENC"; e.source = "中国地震台网";
+        e.timestamp = now - 40'000;
+        e.latitude = 30.0; e.longitude = 104.0;
+        e.depth = 10.0; e.magnitude = 7.5; e.location = "四川雅安";
+        controller.handleEvent(e, false, false);
+        QTest::qWait(900);   // 等入场取景补间结束
+        const auto waveP = [&] { return controller.property("wavePKm").toDouble(); };
+        const auto waveS = [&] { return controller.property("waveSKm").toDouble(); };
+
+        // ---- ① 默认：按烈度（可感下限 I） ----
+        QCOMPARE(controller.settings()->waveFadeMode(), QStringLiteral("intensity"));
+        QVERIFY2(waveP() > 200.0 && waveP() < 400.0, qPrintable(
+            QStringLiteral("按烈度口径下 P 波半径应约 264 km，实测 %1").arg(waveP())));
+        QVERIFY2(waveS() > 100.0 && waveS() < 200.0, "按烈度口径下 S 波半径应约 141 km");
+        QVERIFY(controller.property("wavePOpacity").toDouble() > 0.99);
+
+        // ---- ② 改口径必须立刻生效（不等下一次 16 ms tick） ----
+        controller.settings()->setWaveFadeMode(QStringLiteral("distance"));
+        controller.settings()->setWaveFadeDistanceKm(200);
+        QCOMPARE(waveP(), -1.0);                       // 264 km > 200 km：P 已越过边界
+        QVERIFY2(waveS() > 0.0, "S 波 141 km < 200 km，仍应显示");
+        // 边界内缩到 100 km：S 也越过边界，两条一起收起。
+        controller.settings()->setWaveFadeDistanceKm(100);
+        QCOMPARE(waveS(), -1.0);
+        // 边界放大：两条都回来（与震级无关，纯几何）。
+        controller.settings()->setWaveFadeDistanceKm(2000);
+        QVERIFY(waveP() > 0.0 && waveS() > 0.0);
+        QVERIFY(controller.property("wavePOpacity").toDouble() > 0.99);
+
+        // ---- ③ 按时间：P 与 S 同时消失，与各自半径无关 ----
+        controller.settings()->setWaveFadeMode(QStringLiteral("time"));
+        controller.settings()->setWaveFadeSeconds(300);
+        QVERIFY2(waveP() > 0.0 && waveS() > 0.0, "40 s < 300 s：两条都应可见");
+        controller.settings()->setWaveFadeSeconds(30);
+        QCOMPARE(waveP(), -1.0);
+        QCOMPARE(waveS(), -1.0);
+
+        // ---- ④ 改口径不改变「现在到底有没有波前」这条判断 ----
+        // 时间口径 30 s 全部藏起来后，退回烈度口径应当重新出现（缓存必须按口径失效，
+        // 而不是把「半径 -1」缓存下来）。
+        controller.settings()->setWaveFadeMode(QStringLiteral("intensity"));
+        QVERIFY2(waveP() > 0.0, "切回按烈度后波前必须恢复");
+
+        // ---- ⑤ 设置页：下拉 + 三条滑杆 ----
+        window->setProperty("showSettings", true);
+        auto* page = window->findChild<QQuickItem*>("settingsPage");
+        QVERIFY(page);
+        QTRY_VERIFY(clickByName(window, "settingsNav-map"));
+        QTRY_COMPARE(page->property("currentSection").toInt(), 2);
+        auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
+        QVERIFY(scroll);
+        const auto scrollTo = [&](QQuickItem* item) {
+            QVERIFY(item);
+            const QPointF inFlick =
+                item->mapToItem(scroll, QPointF(item->width() / 2, item->height() / 2));
+            scroll->setProperty("contentY",
+                                scroll->property("contentY").toReal() + inFlick.y()
+                                    - scroll->height() * 0.45);
+            QTest::qWait(120);
+        };
+
+        auto* combo = findVisualItem(window, "waveFadeModeCombo");
+        auto* intensitySlider = findVisualItem(window, "waveFadeIntensitySlider-control");
+        auto* distanceSlider = findVisualItem(window, "waveFadeDistanceSlider-control");
+        auto* secondsSlider = findVisualItem(window, "waveFadeSecondsSlider-control");
+        QVERIFY(combo && intensitySlider && distanceSlider && secondsSlider);
+        scrollTo(combo);
+        QCOMPARE(combo->property("count").toInt(), 3);
+        QCOMPARE(combo->property("currentIndex").toInt(), 0);
+        // 只有当前口径那条滑杆可用（另两条灰掉，避免用户调了看不见效果）。
+        QVERIFY(intensitySlider->isEnabled());
+        QVERIFY(!distanceSlider->isEnabled());
+        QVERIFY(!secondsSlider->isEnabled());
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/63-settings-wave-fade.png"));
+
+        // 拖动「消失烈度」：设置跟着变、数值文本跟着刷新。
+        auto* intensityValue = findVisualItem(window, "waveFadeIntensitySlider-value");
+        QVERIFY(intensityValue);
+        scrollTo(intensitySlider);
+        {
+            auto* handle = intensitySlider->property("handle").value<QQuickItem*>();
+            QVERIFY(handle);
+            const QPointF from = handle->mapToScene(QPointF(handle->width() / 2,
+                                                            handle->height() / 2));
+            const QPointF to = from + QPointF(intensitySlider->width() * 0.3, 0);
+            const QRectF bounds(0, 0, window->width(), window->height());
+            QVERIFY2(bounds.contains(from) && bounds.contains(to), "滑块必须完整落在视口内");
+            QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, from.toPoint());
+            QTest::mouseMove(window, to.toPoint());
+            QTest::qWait(30);
+            QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, to.toPoint());
+        }
+        QTRY_VERIFY(controller.settings()->waveFadeIntensity() > 1.0);
+        QCOMPARE(intensityValue->property("text").toString(),
+                 QString::number(controller.settings()->waveFadeIntensity(), 'f', 1)
+                     + QStringLiteral(" 度"));
+
+        // 切到「按距离」：下拉必须先跟着设置动（Binding），可用的滑杆也要换成距离那条。
+        controller.settings()->setWaveFadeMode(QStringLiteral("distance"));
+        QTRY_COMPARE(combo->property("currentIndex").toInt(), 1);
+        QTRY_VERIFY(distanceSlider->isEnabled());
+        QTRY_VERIFY(!intensitySlider->isEnabled());
+        QVERIFY(!secondsSlider->isEnabled());
+        // 反向：在下拉上真的选一次「按时间」，设置必须跟着变。
+        QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, 2));
+        QTRY_COMPARE(controller.settings()->waveFadeMode(), QStringLiteral("time"));
+        QTRY_VERIFY(secondsSlider->isEnabled());
+        QTRY_VERIFY(!distanceSlider->isEnabled());
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/63b-settings-wave-fade-time.png"));
+
+        // 恢复默认：口径与三个数值一起回到默认（Binding 没被拖断）。
+        controller.settings()->resetToDefaults();
+        QTRY_COMPARE(combo->property("currentIndex").toInt(), 0);
+        QTRY_COMPARE(controller.settings()->waveFadeIntensity(), 1.0);
+        QTRY_COMPARE(controller.settings()->waveFadeDistanceKm(), 1000);
+        QTRY_COMPARE(controller.settings()->waveFadeSeconds(), 300);
+        QTRY_VERIFY(intensitySlider->isEnabled());
+        QTRY_COMPARE(intensitySlider->property("value").toDouble(), 1.0);
     }
 
     /// 推算也参与聚焦：USGS/GQ 占着镜头时，本地推算解出现就接管；权威事件到达后让位。

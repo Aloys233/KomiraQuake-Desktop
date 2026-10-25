@@ -1624,9 +1624,10 @@ Item {
         onTriggered: stationHover.query(stationHover.pending.x, stationHover.pending.y, true)
     }
 
-    // 右上角：各测站源的实时最大值（仅显示，不参与预警）。收起时叠成一摞
+    // 右上角：各测站源的实时最大值（仅显示，不参与预警）。默认收起时叠成一摞
     // （前排优先显示「刚变过 / 读数高」的那一路，都没有就回落到 NIED），
-    // 指针放上去向左展开成一排。见 StationStack.qml。
+    // 指针放上去向左展开成一排；用户在设置里关掉「测站卡片堆叠」时改为常驻平铺。
+    // 见 StationStack.qml。
     StationStack {
         id: stationStack
         objectName: "stationStack"
@@ -1641,6 +1642,8 @@ Item {
         theme: root.theme
         backdropSource: mapRenderLayer
         backdropLive: root.cameraMoving
+        // 形态由设置项决定：true = 收起成摞（悬停展开），false = 常驻平铺成一排。
+        stacked: app.settings.stackStationCards
         // 100 ms 全量重建的数组直接交给容器：容器内部按**长度**建 delegate，
         // 不会因数组重建而销毁重造玻璃卡（含模糊层）。
         sources: app.stationSources

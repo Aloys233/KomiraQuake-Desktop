@@ -10,6 +10,8 @@ Window {
     width: 900; height: 480; visible: true
     // 只在本夹具里用：把 Theme 的 reduceMotion 暴露成可写，避免去碰 SettingsStore。
     property bool testReduceMotion: false
+    // 「测站卡片堆叠」开关的形态：false = 常驻平铺（对应 `app.settings.stackStationCards`）。
+    property bool testStacked: true
     property var testSources: [
         { id: "kmoni", name: "NIED", caption: "当前最大震度", standard: "jma",
           hasData: false, raw: -3, text: "--" },
@@ -52,6 +54,7 @@ Window {
         theme: material
         backdropSource: mapLayer
         backdropLive: false
+        stacked: window.testStacked
         sources: window.testSources
     }
 }

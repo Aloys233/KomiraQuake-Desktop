@@ -566,16 +566,19 @@ private:
     double waveSOpacity_ = 0.0;
     /// S 波径向渐变填充的不透明度（仅影响半径内非零）。
     double waveSFillOpacity_ = 0.0;
-    /// 波前「影响半径」缓存：只随焦点的震级/深度变化而失效（见 updateWaveRadii）。
+    /// 波前「影响半径」缓存：只随焦点的震级/深度**与消失口径**变化而失效
+    /// （见 updateWaveRadii）。
     double waveCacheMagnitude_ = -1.0;
     double waveCacheDepth_ = -1.0;
     double waveCacheFadeKm_ = 0.0;
+    /// 上一次算透明度用的口径（烈度阈值 / 距离 / 时长）。改动它必须让缓存失效，
+    /// 否则「切到按距离 300 km」会一直沿用按烈度算出的旧上限。
+    WaveFadeSettings waveCacheFade_;
+    bool waveCacheFadeValid_ = false;
 
     /// 波前圆参数。《NATIVE_PORT_SPEC》 §12：>2000 km 切 `jb` 表，>10000 km 不再画。
     static constexpr double kWaveTableSwitchKm = 2000.0;
     static constexpr double kWaveMaxRadiusKm = 10000.0;
-    /// 波前隐去的烈度阈值（CSIS I：可感下限）。
-    static constexpr double kCsisFadeLevel = 1.0;
     static constexpr long long kWaveWindowMs = 60LL * 60LL * 1000LL;
     /// 自动焦点转为历史事件后仍展示 HUD 的宽限期（以最后一报推送时间为准）。
     static constexpr long long kHudWindowMs = 10LL * 60LL * 1000LL;

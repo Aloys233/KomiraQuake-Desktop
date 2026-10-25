@@ -619,6 +619,21 @@ void AppController::wireSettings() {
     // 不改变台站表，故**不**触发 noteStationTablesChanged()：旧实现每次改任意设置都
     // 强制重建约 2500 条悬停元数据，是设置页拖动时的主要浪费之一。
 
+    // ---- 2b. 波前消失口径：改口径/数值必须让当前波前立即按新边界重画 ----
+    // 波前半径由 16 ms 定时器刷新，但定时器只在焦点"还年轻"时跑；用户在设置页
+    // 把口径从「烈度」切到「按距离 300 km」时往往焦点仍活着 —— 不主动重算一次，
+    // 屏幕上会继续挂着按旧口径算的透明度，看起来像设置没生效。
+    const auto reloadWaveFade = [this]() {
+        waveCacheFadeValid_ = false;
+        // 走 updateWaveTimer 而不是直接 updateWaveRadii：它同时负责「焦点已过期就清掉」
+        // 与「该跑定时器就启动」，改口径不能把这两条判定绕过去。
+        updateWaveTimer();
+    };
+    connect(settings_, &SettingsStore::waveFadeModeChanged, this, reloadWaveFade);
+    connect(settings_, &SettingsStore::waveFadeIntensityChanged, this, reloadWaveFade);
+    connect(settings_, &SettingsStore::waveFadeDistanceKmChanged, this, reloadWaveFade);
+    connect(settings_, &SettingsStore::waveFadeSecondsChanged, this, reloadWaveFade);
+
     // ---- 3. 震源推算：只有它的参数/开关会作废旧解 ----
     const auto reloadEstimation = [this]() { sourceEstimation_->reloadSettings(); };
     connect(settings_, &SettingsStore::sourceEstimationEnabledChanged, this, reloadEstimation);
@@ -1737,31 +1752,51 @@ void AppController::updateWaveRadii() {
     // jb 表上限 10000 km 同样会 clamp，到端点即视为超出量程不再画。
     double pKm = p >= kWaveMaxRadiusKm ? -1.0 : p;
     double sKm = s >= kWaveMaxRadiusKm ? -1.0 : s;
-    // 波前"影响半径"：CSIS 降到可感下限（I）时的震中距。这是有意取代 kanameishi 的
-    // 经验式 clamp(50·M²,200,2000)。震级未知（<=0）时无法反解，退回量程上限，保证波前仍可见。
+
+    // 消失口径（用户可在设置页里选）：烈度 / 距离 / 时间。三条口径共用同一条渐隐
+    // 曲线，差别只在「走到哪算消失」，见 core/wave_fade.h。
     //
-    // 该值只取决于 (magnitude, depth)，而两者在事件生命周期内几乎不变 —— 旧实现每帧
-    // 都跑一次 40 次迭代的二分（40 次 rawCsis，含 pow/log）。按参数缓存，只在换事件时重算。
-    if (waveCacheMagnitude_ != magnitude || waveCacheDepth_ != depth) {
+    // 烈度口径的边界半径只取决于 (magnitude, depth, 阈值)，而它们在事件生命周期内
+    // 几乎不变 —— 旧实现每帧都跑一次 40 次迭代的二分（40 次 rawCsis，含 pow/log）。
+    // 按参数缓存，换事件或改口径时才重算。口径参与缓存键：切到「按距离 300 km」后
+    // 仍沿用按烈度算出的旧上限，会表现成「改了设置却没反应」。
+    const WaveFadeSettings fadeSettings = settings_->waveFadeSettings();
+    if (waveCacheMagnitude_ != magnitude || waveCacheDepth_ != depth
+        || !waveCacheFadeValid_ || waveCacheFade_ != fadeSettings) {
         waveCacheMagnitude_ = magnitude;
         waveCacheDepth_ = depth;
-        waveCacheFadeKm_ = magnitude > 0.0
-                               ? IntensityCalculator::distanceForCsis(magnitude, depth,
-                                                                      kCsisFadeLevel)
-                               : kWaveMaxRadiusKm;
+        waveCacheFade_ = fadeSettings;
+        waveCacheFadeValid_ = true;
+        // 震级未知（<=0）时按烈度无法反解，传**负数**让 WaveFade 退回量程上限，保证波前
+        // 在「按距离 / 按时间」两种口径下仍然可见（与震级无关）。注意不能传 0 ——
+        // 0 的语义是「震中处的烈度就已经低于阈值」，那是「该震级不配画圆」，不是「算不出来」。
+        const double intensityRadiusKm =
+            magnitude > 0.0
+                ? IntensityCalculator::distanceForCsis(magnitude, depth,
+                                                      fadeSettings.intensityLevel)
+                : -1.0;
+        waveCacheFadeKm_ = WaveFade::fadeEndKm(fadeSettings, intensityRadiusKm);
     }
     const double fadeKm = waveCacheFadeKm_;
 
-    // 透明度归零即视为隐藏：半径记 -1，取景与绘制都会跳过。
-    const double pOpacity =
-        pKm > 0.0 ? IntensityCalculator::waveOpacity(pKm, fadeKm, kWaveMaxRadiusKm) : 0.0;
-    const double sOpacity =
-        sKm > 0.0 ? IntensityCalculator::waveOpacity(sKm, fadeKm, kWaveMaxRadiusKm) : 0.0;
+    // 透明度的自变量：距离/烈度口径看半径，时间口径看经过时间。透明度归零即视为
+    // 隐藏：半径记 -1，取景与绘制都会跳过。
+    const auto progressOf = [&](double radiusKm) {
+        if (fadeSettings.mode == WaveFadeMode::Time) {
+            return WaveFade::progressForTime(seconds, WaveFade::fadeSeconds(fadeSettings));
+        }
+        return WaveFade::progressForRadius(radiusKm, fadeKm);
+    };
+    const double pOpacity = pKm > 0.0 ? WaveFade::strokeOpacity(progressOf(pKm)) : 0.0;
+    const double sOpacity = sKm > 0.0 ? WaveFade::strokeOpacity(progressOf(sKm)) : 0.0;
     if (pOpacity <= 0.0) pKm = -1.0;
     if (sOpacity <= 0.0) sKm = -1.0;
+    // S 波径向渐变填充与描边共用同一条曲线（峰值 0.25），所以三种口径下填充的
+    // 消失时机与描边严格一致 —— 旧实现是两条独立公式，切换口径时很容易只改到一条。
+    const double sFill = sKm > 0.0 ? WaveFade::fillOpacity(progressOf(sKm)) : 0.0;
     // 只有真正变化的字段才值得发通知：QML 侧的绑定（含 Behavior 动画）据此重算。
     if (pKm == wavePKm_ && sKm == waveSKm_ && pOpacity == wavePOpacity_
-        && sOpacity == waveSOpacity_) {
+        && sOpacity == waveSOpacity_ && sFill == waveSFillOpacity_) {
         if (wavePKm_ < 0.0 && waveSKm_ < 0.0) waveTimer_.stop();
         return;
     }
@@ -1769,8 +1804,7 @@ void AppController::updateWaveRadii() {
     waveSKm_ = sKm;
     wavePOpacity_ = pKm > 0.0 ? pOpacity : 0.0;
     waveSOpacity_ = sKm > 0.0 ? sOpacity : 0.0;
-    waveSFillOpacity_ =
-        sKm > 0.0 ? IntensityCalculator::waveFillOpacity(sKm, fadeKm) : 0.0;
+    waveSFillOpacity_ = sFill;
     emit waveRadiiChanged();
     if (wavePKm_ < 0.0 && waveSKm_ < 0.0) waveTimer_.stop();
 }

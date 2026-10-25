@@ -1,6 +1,7 @@
 // 纯 C++ 核心引擎验证（不依赖 Qt）。用 g++ 直接编译运行。
 // 亦可直接执行 linux/run_core_tests.sh。
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -23,6 +24,7 @@
 #include "core/sound_queue.h"
 #include "core/time_sync.h"
 #include "core/travel_table.h"
+#include "core/wave_fade.h"
 #include "core/vector_map_data.h"
 #include "model/earthquake_event.h"
 
@@ -100,6 +102,81 @@ int main(int argc, char** argv) {
     check(near(IntensityCalculator::waveFillOpacity(200.0, 1000.0), 0.25), "S fill 0.25 inside 0.8fade");
     check(near(IntensityCalculator::waveFillOpacity(1000.0, 1000.0), 0.0), "S fill 0 at fade");
     check(near(IntensityCalculator::waveFillOpacity(1500.0, 1000.0), 0.0), "S fill hidden beyond fade");
+
+    // ---- WaveFade：三种「消失口径」共用一条渐隐曲线 ----------------------
+    {
+        WaveFadeSettings byIntensity;
+        byIntensity.mode = WaveFadeMode::Intensity;
+        byIntensity.intensityLevel = 3.0;   // 比默认 I 更严：边界半径应当更小
+        check(near(WaveFade::fadeEndKm(byIntensity, 600.0), 600.0),
+              "intensity mode uses the decay radius the caller computed");
+        check(WaveFade::fadeEndKm(byIntensity, 400.0) < WaveFade::fadeEndKm(byIntensity, 600.0),
+              "stricter intensity shrinks the end radius");
+        // 负数 = 算不出来（震级未知）：退回量程上限，保证「按距离 / 按时间」两口径仍可见。
+        check(near(WaveFade::fadeEndKm(byIntensity, -1.0), WaveFade::kMaxRadiusKm),
+              "unknown magnitude falls back to hard max");
+        // 0 = 「震中处的烈度就已经低于阈值」（大阈值 + 小震）：波前直接不画，不是可见到底。
+        check(near(WaveFade::fadeEndKm(byIntensity, 0.0), 0.0),
+              "a magnitude below the threshold hides the wavefront entirely");
+
+        WaveFadeSettings byDistance;
+        byDistance.mode = WaveFadeMode::Distance;
+        byDistance.distanceKm = 300.0;
+        check(near(WaveFade::fadeEndKm(byDistance, 600.0), 300.0),
+              "distance mode ignores the decay radius");
+        // 距离口径与震级无关：同一个设置下摆一个巨大半径也不该改变边界。
+        check(near(WaveFade::fadeEndKm(byDistance, 9000.0), 300.0),
+              "distance mode is magnitude independent");
+        byDistance.distanceKm = -5.0;
+        check(WaveFade::fadeEndKm(byDistance, 600.0) >= 1.0,
+              "distance clamps to a positive end");
+
+        WaveFadeSettings byTime;
+        byTime.mode = WaveFadeMode::Time;
+        byTime.seconds = 120.0;
+        check(near(WaveFade::fadeSeconds(byTime), 120.0), "time mode uses configured seconds");
+        byTime.seconds = 0.0;
+        check(near(WaveFade::fadeSeconds(byTime), WaveFade::kMaxSeconds),
+              "non-positive seconds fall back to the hard cap");
+
+        // 曲线本体：与历史行为逐点一致。
+        check(near(WaveFade::strokeOpacity(0.0), 1.0), "progress 0 fully opaque");
+        check(near(WaveFade::strokeOpacity(0.95), 1.0), "fade starts exactly at 95 percent");
+        check(WaveFade::strokeOpacity(0.975) > 0.4 && WaveFade::strokeOpacity(0.975) < 0.6,
+              "progress 97.5 percent is half faded");
+        check(near(WaveFade::strokeOpacity(1.0), 0.0), "progress 1 fully hidden");
+        check(near(WaveFade::strokeOpacity(1.5), 0.0), "beyond the boundary stays hidden");
+        check(near(WaveFade::fillOpacity(0.5), 0.25), "fill peak is 0.25");
+        check(near(WaveFade::fillOpacity(1.0), 0.0), "fill ends with the stroke");
+
+        // 距离口径：300 km 边界仍在最后 5% 之后归零。
+        check(near(WaveFade::progressForRadius(150.0, 300.0), 0.5),
+              "radius progress halves at half way");
+        check(near(WaveFade::progressForRadius(300.0, 300.0), 1.0),
+              "radius progress hits 1 at the boundary");
+        check(near(WaveFade::progressForRadius(0.0, 300.0), 0.0),
+              "radius progress is 0 before start");
+        check(near(WaveFade::strokeOpacity(WaveFade::progressForRadius(285.0, 300.0)), 1.0),
+              "95 percent of a 300 km boundary stays opaque");
+        check(near(WaveFade::strokeOpacity(WaveFade::progressForRadius(300.0, 300.0)), 0.0),
+              "radius mode ends exactly at the configured distance");
+
+        // 时间口径：自变量是经过时间，与半径无关 —— 同一时刻 P（大半径）与 S（小半径）
+        // 必须同时淡出，否则用户设的「一个时长」会变成两条圆环各走各的。
+        check(near(WaveFade::progressForTime(60.0, 120.0), 0.5), "time progress halves at half way");
+        check(near(WaveFade::progressForTime(0.0, 120.0), 0.0), "time progress is 0 at origin");
+        check(near(WaveFade::strokeOpacity(WaveFade::progressForTime(114.0, 120.0)), 1.0),
+              "95 percent of the time window stays opaque");
+        check(near(WaveFade::strokeOpacity(WaveFade::progressForTime(120.0, 120.0)), 0.0),
+              "time mode ends exactly at the configured seconds");
+
+        // 设置结构的比较运算符：AppController 用它判断波前缓存是否失效。
+        WaveFadeSettings a;
+        WaveFadeSettings b;
+        check(a == b, "default fade settings compare equal");
+        b.seconds = 600.0;
+        check(a != b, "changed seconds invalidate the cache key");
+    }
 
     // ---- CoordinateTransform --------------------------------------------
     const auto identity = CoordinateTransform::wgs84ToGcj02(35.0, 139.0);

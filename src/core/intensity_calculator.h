@@ -20,9 +20,11 @@ public:
     /// 有意取代参考实现 kanameishi 的经验式 clamp(50·M², 200, 2000)：这里用衰减关系按
     /// 震级 + 深度反解"可感边界"，比纯震级的平方经验式更贴合物理。
     static double distanceForCsis(double magnitude, double depthKm, double level = 1.0);
-    /// 波前描边不透明度：前 95% 保持不透明，只在 CSIS I 前最后 5% 快速淡到 0。
+    /// 波前描边的**按半径**不透明度：前 95% 不透明，最后 5% 快速淡到 0。
+    /// 三种消失口径（烈度 / 距离 / 时间）共用 `core/wave_fade.h` 的曲线，这里只是
+    /// 「距离口径」那个特例的转发；按时间求透明度请直接用 `WaveFade`。
     static double waveOpacity(double radiusKm, double fadeKm, double hardMaxKm = 10000.0);
-    /// S 波径向渐变填充的不透明度：前 95% 保持 0.25，只在影响半径最后 5% 快速归零。
+    /// S 波径向渐变填充的不透明度：与描边同一条曲线，峰值 0.25。
     static double waveFillOpacity(double radiusKm, double fadeKm);
     static std::string formatCsis(double raw);
     /// 显示烈度（罗马数字的阿拉伯数字形式）：formatCsis 取整所用的同一个值，下限 0。

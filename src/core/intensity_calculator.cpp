@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "core/quake_calculator.h"
+#include "core/wave_fade.h"
 
 namespace komira {
 
@@ -12,7 +13,6 @@ const char* const kRoman[] = {
     "0", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII",
 };
 constexpr int kRomanCount = 13;
-constexpr double kWaveFadeStartRatio = 0.95;
 
 /// 中国大陆 CEA 烈度衰减关系（对齐参考实现 kanameishi 的 calcCeaCsis）。
 double ceaCsis(double magnitude, double distanceKm) {
@@ -66,19 +66,18 @@ double IntensityCalculator::distanceForCsis(double magnitude, double depthKm, do
 }
 
 double IntensityCalculator::waveOpacity(double radiusKm, double fadeKm, double hardMaxKm) {
-    const double fadeEndKm = std::min(fadeKm, hardMaxKm);
-    if (radiusKm <= 0.0 || fadeEndKm <= 0.0 || radiusKm >= fadeEndKm) return 0.0;
-    const double fadeStartKm = fadeEndKm * kWaveFadeStartRatio;
-    if (radiusKm <= fadeStartKm) return 1.0;
-    return std::clamp((fadeEndKm - radiusKm) / (fadeEndKm - fadeStartKm), 0.0, 1.0);
+    // 保留这个入口只为「按半径直接给透明度」的老调用方与单测；曲线本体已搬到
+    // core/wave_fade.h（三种消失口径共用一条），这里只做转发，避免两份公式慢慢分叉。
+    // 半径非正 = 根本没有波前，而不是「刚好在起点」。
+    if (!(radiusKm > 0.0)) return 0.0;
+    return WaveFade::strokeOpacity(
+        WaveFade::progressForRadius(radiusKm, std::min(fadeKm, hardMaxKm)));
 }
 
 double IntensityCalculator::waveFillOpacity(double radiusKm, double fadeKm) {
-    // 与描边不同：填充只画在影响半径内（与 kanameishi 的 sWaveFill 一致），且由 0.25 递减到 0。
-    if (radiusKm <= 0.0 || fadeKm <= 0.0 || radiusKm > fadeKm) return 0.0;
-    const double fadeStartKm = fadeKm * kWaveFadeStartRatio;
-    if (radiusKm <= fadeStartKm) return 0.25;
-    return std::clamp(0.25 * (fadeKm - radiusKm) / (fadeKm - fadeStartKm), 0.0, 0.25);
+    // 与描边同一条曲线（峰值 0.25），见 wave_fade.h。
+    if (!(radiusKm > 0.0)) return 0.0;
+    return WaveFade::fillOpacity(WaveFade::progressForRadius(radiusKm, fadeKm));
 }
 
 int IntensityCalculator::displayLevel(double raw) {

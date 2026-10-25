@@ -26,6 +26,7 @@
 #include "core/ip_geo_lookup.h"
 #include "core/quake_calculator.h"
 #include "core/quake_key.h"
+#include "core/wave_fade.h"
 #include "core/travel_time_service.h"
 #include "core/version_compare.h"
 #include "core/warning_session.h"
@@ -1476,9 +1477,10 @@ private slots:
         QSignalSpy blur(&settings, &SettingsStore::backgroundBlurChanged);
         QSignalSpy basemap(&settings, &SettingsStore::basemapIdChanged);
         QSignalSpy stationLayer(&settings, &SettingsStore::showStationLayerChanged);
+        QSignalSpy stackCards(&settings, &SettingsStore::stackStationCardsChanged);
         QSignalSpy regionParams(&settings, &SettingsStore::sourceEstimationRegionParamsChanged);
         QVERIFY(theme.isValid() && blur.isValid() && basemap.isValid());
-        QVERIFY(stationLayer.isValid() && regionParams.isValid());
+        QVERIFY(stationLayer.isValid() && stackCards.isValid() && regionParams.isValid());
 
         settings.setThemeMode(QStringLiteral("dark"));
         QCOMPARE(theme.count(), 1);
@@ -1495,6 +1497,60 @@ private slots:
         settings.setBackgroundBlur(false);
         QCOMPARE(blur.count(), 1);
         QCOMPARE(theme.count(), 1);
+
+        // 测站卡形态与「测站图层」是两个独立开关：改一个不许惊动另一个。
+        // （两者都挂在测站相关的绑定上，很容易顺手复用同一个信号 —— 那样关图层或
+        //   切形态时，另一处的绑定会白重算，展开动画也会被打断。）
+        settings.setStackStationCards(false);
+        QCOMPARE(stackCards.count(), 1);
+        QCOMPARE(stationLayer.count(), 0);
+        QCOMPARE(aggregate.count(), 3);
+        settings.setStackStationCards(false);   // 幂等：写同样的值必须完全静默
+        QCOMPARE(stackCards.count(), 1);
+        QCOMPARE(aggregate.count(), 3);
+        settings.setShowStationLayer(false);
+        QCOMPARE(stationLayer.count(), 1);
+        QCOMPARE(stackCards.count(), 1);
+
+        // 波前消失口径的四个设置项：各自一个信号，互不惊动；写同样的值必须静默。
+        {
+            QSignalSpy fadeMode(&settings, &SettingsStore::waveFadeModeChanged);
+            QSignalSpy fadeIntensity(&settings, &SettingsStore::waveFadeIntensityChanged);
+            QSignalSpy fadeDistance(&settings, &SettingsStore::waveFadeDistanceKmChanged);
+            QSignalSpy fadeSeconds(&settings, &SettingsStore::waveFadeSecondsChanged);
+            QSignalSpy waveVisible(&settings, &SettingsStore::showWavefrontChanged);
+            QVERIFY(fadeMode.isValid() && fadeIntensity.isValid() && fadeDistance.isValid());
+            QVERIFY(fadeSeconds.isValid() && waveVisible.isValid());
+            settings.setWaveFadeMode(QStringLiteral("distance"));
+            QCOMPARE(fadeMode.count(), 1);
+            QCOMPARE(fadeIntensity.count(), 0);
+            QCOMPARE(fadeDistance.count(), 0);
+            QCOMPARE(waveVisible.count(), 0);
+            // 越界值被夹住后写回同一个值 → 幂等，不再发信号。
+            settings.setWaveFadeDistanceKm(99999);
+            QCOMPARE(settings.waveFadeDistanceKm(), 5000);
+            QCOMPARE(fadeDistance.count(), 1);
+            settings.setWaveFadeDistanceKm(99999);
+            QCOMPARE(fadeDistance.count(), 1);
+            settings.setWaveFadeIntensity(0.1);
+            QCOMPARE(settings.waveFadeIntensity(), 0.5);
+            QCOMPARE(fadeIntensity.count(), 1);
+            settings.setWaveFadeSeconds(1);
+            QCOMPARE(settings.waveFadeSeconds(), 30);
+            QCOMPARE(fadeSeconds.count(), 1);
+            // 未知口径回落到默认，而不是把地图切成「不画波前」。
+            settings.setWaveFadeMode(QStringLiteral("nonsense"));
+            QCOMPARE(settings.waveFadeMode(), QStringLiteral("intensity"));
+            QCOMPARE(fadeMode.count(), 2);
+            // 关掉波前圆是另一条独立的开关。
+            settings.setShowWavefront(false);
+            QCOMPARE(waveVisible.count(), 1);
+            QCOMPARE(fadeMode.count(), 2);
+            settings.setShowWavefront(true);
+            QCOMPARE(waveVisible.count(), 2);
+            QCOMPARE(theme.count(), 1);
+            QCOMPARE(blur.count(), 1);
+        }
 
         // 区域参数是复合键，四个字段共用一个信号。
         settings.setSourceEstimationTrigger(QStringLiteral("japan"), 3.5);
@@ -1523,11 +1579,15 @@ private slots:
         const int beforeTheme = theme.count();
         const int beforeBlur = blur.count();
         const int beforeStations = stationLayer.count();
+        const int beforeStackCards = stackCards.count();
         settings.resetToDefaults();
         QVERIFY2(theme.count() > beforeTheme, "恢复默认必须发出 themeModeChanged");
         QVERIFY2(blur.count() > beforeBlur, "恢复默认必须发出 backgroundBlurChanged");
         QVERIFY2(stationLayer.count() > beforeStations,
                  "恢复默认必须发出 showStationLayerChanged");
+        QVERIFY2(stackCards.count() > beforeStackCards,
+                 "恢复默认必须发出 stackStationCardsChanged（否则开关停在旧值上）");
+        QVERIFY2(settings.stackStationCards(), "恢复默认后测站卡片形态必须回到堆叠");
     }
 
     /// 新增的提醒矩阵 / 声音分轨 / 图层 / 逐源过滤默认值，以及旧通知键的迁移。
@@ -1546,7 +1606,15 @@ private slots:
             QVERIFY(settings.announceCountdown());
             QVERIFY(settings.enableAlarmTone());
             QVERIFY(settings.showStationLayer());
+            // 右上角测站卡默认堆叠（与改版以来的观感一致）：关掉才改成平铺。
+            QVERIFY(settings.stackStationCards());
             QVERIFY(settings.showWavefront());
+            // 波前消失口径：默认按烈度（CSIS I = 可感下限），与改动前的行为一致。
+            QCOMPARE(settings.waveFadeMode(), QStringLiteral("intensity"));
+            QCOMPARE(settings.waveFadeIntensity(), 1.0);
+            QCOMPARE(settings.waveFadeDistanceKm(), 1000);
+            QCOMPARE(settings.waveFadeSeconds(), 300);
+            QCOMPARE(settings.waveFadeSettings().mode, WaveFadeMode::Intensity);
             QVERIFY(settings.showProvinceBorders());
             QVERIFY(settings.closeToTray());
             QVERIFY(settings.isStationSourceEnabled(QStringLiteral("kmoni")));
@@ -1600,8 +1668,14 @@ private slots:
 
             settings.setStationSourceEnabled(QStringLiteral("kmoni"), false);
             QVERIFY(!settings.isStationSourceEnabled(QStringLiteral("kmoni")));
+            settings.setStackStationCards(false);
             settings.setNotifyEew(true);
             settings.setAnnounceCountdown(false);
+            // 波前口径四项都要落盘；三个数值互不改写（切回上次的口径时数值还在）。
+            settings.setWaveFadeMode(QStringLiteral("distance"));
+            settings.setWaveFadeIntensity(2.5);
+            settings.setWaveFadeDistanceKm(350);
+            settings.setWaveFadeSeconds(900);
         }
         SettingsStore reloaded;
         QVERIFY(reloaded.notifyEew());
@@ -1622,6 +1696,18 @@ private slots:
         QVERIFY(!reloaded.showEstimatedEpicenter());
         QVERIFY(!reloaded.isStationSourceEnabled(QStringLiteral("kmoni")));
         QCOMPARE(reloaded.infoMagnitudeFilter(QStringLiteral("wolfx")), 4.0);
+        QCOMPARE(reloaded.waveFadeMode(), QStringLiteral("distance"));
+        QCOMPARE(reloaded.waveFadeIntensity(), 2.5);
+        QCOMPARE(reloaded.waveFadeDistanceKm(), 350);
+        QCOMPARE(reloaded.waveFadeSeconds(), 900);
+        // 折算成 core 层口径后，三个数值都要带过去（地图侧只读这一份）。
+        const WaveFadeSettings reloadedFade = reloaded.waveFadeSettings();
+        QCOMPARE(reloadedFade.mode, WaveFadeMode::Distance);
+        QCOMPARE(reloadedFade.intensityLevel, 2.5);
+        QCOMPARE(reloadedFade.distanceKm, 350.0);
+        QCOMPARE(reloadedFade.seconds, 900.0);
+        // 测站卡形态一样要落盘（否则重启后用户的选择被悄悄丢掉）。
+        QVERIFY(!reloaded.stackStationCards());
         // 恢复默认必须把震源推算一并还原（否则「恢复默认」会留下一个关不掉的旧阈值）。
         reloaded.resetToDefaults();
         QVERIFY(!reloaded.sourceEstimationEnabled());
@@ -1633,6 +1719,11 @@ private slots:
         QCOMPARE(reloaded.sourceEstimationTriggerFor("japan"), 2.5);
         QCOMPARE(reloaded.sourceEstimationMinStationsFor("japan"), 5);
         QVERIFY(reloaded.showEstimatedEpicenter());
+        QVERIFY2(reloaded.stackStationCards(), "恢复默认后测站卡片形态必须回到堆叠");
+        QCOMPARE(reloaded.waveFadeMode(), QStringLiteral("intensity"));
+        QCOMPARE(reloaded.waveFadeIntensity(), 1.0);
+        QCOMPARE(reloaded.waveFadeDistanceKm(), 1000);
+        QCOMPARE(reloaded.waveFadeSeconds(), 300);
         // 单区恢复默认：只清该区，其余区域与总开关不受影响。
         reloaded.setSourceEstimationMinStations("japan", 20);
         reloaded.setSourceEstimationMinStations("korea", 11);
