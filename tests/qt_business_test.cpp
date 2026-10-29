@@ -2094,6 +2094,49 @@ private slots:
             QCOMPARE(blur.count(), 1);
         }
 
+        // 历史震中：四个设置项同样各自一个信号，互不惊动；越界写回夹取后幂等。
+        {
+            QSignalSpy shown(&settings, &SettingsStore::showHistoryEpicenterChanged);
+            QSignalSpy mode(&settings, &SettingsStore::historyEpicenterModeChanged);
+            QSignalSpy countSpy(&settings, &SettingsStore::historyEpicenterCountChanged);
+            QSignalSpy hours(&settings, &SettingsStore::historyEpicenterHoursChanged);
+            QVERIFY(shown.isValid() && mode.isValid() && countSpy.isValid() && hours.isValid());
+            settings.setHistoryEpicenterCount(8);
+            QCOMPARE(countSpy.count(), 1);
+            QCOMPARE(mode.count(), 0);
+            QCOMPARE(hours.count(), 0);
+            QCOMPARE(shown.count(), 0);
+            // 越界值被夹住后写回同一个值 → 幂等，不再发信号。
+            settings.setHistoryEpicenterCount(9999);
+            QCOMPARE(settings.historyEpicenterCount(), 100);
+            QCOMPARE(countSpy.count(), 2);
+            settings.setHistoryEpicenterCount(9999);
+            QCOMPARE(countSpy.count(), 2);
+            settings.setHistoryEpicenterHours(9999);
+            QCOMPARE(settings.historyEpicenterHours(), 168);
+            QCOMPARE(hours.count(), 1);
+            QCOMPARE(countSpy.count(), 2);
+            settings.setHistoryEpicenterMode(QStringLiteral("time"));
+            QCOMPARE(settings.historyEpicenterMode(), QStringLiteral("time"));
+            QCOMPARE(mode.count(), 1);
+            // 未知值 → 默认 count：这一次是真的改值，必须发信号。
+            settings.setHistoryEpicenterMode(QStringLiteral("nonsense"));
+            QCOMPARE(settings.historyEpicenterMode(), QStringLiteral("count"));
+            QCOMPARE(mode.count(), 2);
+            // 再写一次同一个未知值：归一化后仍是 count，值没变 → 幂等静默。
+            settings.setHistoryEpicenterMode(QStringLiteral("nonsense"));
+            QCOMPARE(mode.count(), 2);
+            settings.setShowHistoryEpicenter(false);
+            QCOMPARE(shown.count(), 1);
+            QCOMPARE(mode.count(), 2);
+            settings.setShowHistoryEpicenter(true);
+            QCOMPARE(shown.count(), 2);
+            // 复原，免得影响后面的断言（本用例共用同一个 SettingsStore）。
+            settings.setHistoryEpicenterCount(1);
+            settings.setHistoryEpicenterHours(24);
+            settings.setHistoryEpicenterMode(QStringLiteral("count"));
+        }
+
         // 区域参数是复合键，四个字段共用一个信号。
         settings.setSourceEstimationTrigger(QStringLiteral("japan"), 3.5);
         QCOMPARE(regionParams.count(), 1);
@@ -2157,6 +2200,11 @@ private slots:
             QCOMPARE(settings.waveFadeDistanceKm(), 1000);
             QCOMPARE(settings.waveFadeSeconds(), 300);
             QCOMPARE(settings.waveFadeSettings().mode, WaveFadeMode::Intensity);
+            // 历史震中：默认开，但只显示最近 1 个（= 与改动前完全一致）；时间口径默认 24 h。
+            QVERIFY(settings.showHistoryEpicenter());
+            QCOMPARE(settings.historyEpicenterMode(), QStringLiteral("count"));
+            QCOMPARE(settings.historyEpicenterCount(), 1);
+            QCOMPARE(settings.historyEpicenterHours(), 24);
             QVERIFY(settings.showProvinceBorders());
             QVERIFY(settings.closeToTray());
             QVERIFY(settings.isStationSourceEnabled(QStringLiteral("kmoni")));
@@ -2218,6 +2266,11 @@ private slots:
             settings.setWaveFadeIntensity(2.5);
             settings.setWaveFadeDistanceKm(350);
             settings.setWaveFadeSeconds(900);
+            // 历史震中：两种口径的数值各存一份（切回来还在），这里同时改掉。
+            settings.setHistoryEpicenterCount(12);
+            settings.setHistoryEpicenterHours(6);
+            settings.setHistoryEpicenterMode(QStringLiteral("time"));
+            settings.setShowHistoryEpicenter(false);
         }
         SettingsStore reloaded;
         QVERIFY(reloaded.notifyEew());
@@ -2242,6 +2295,10 @@ private slots:
         QCOMPARE(reloaded.waveFadeIntensity(), 2.5);
         QCOMPARE(reloaded.waveFadeDistanceKm(), 350);
         QCOMPARE(reloaded.waveFadeSeconds(), 900);
+        QVERIFY(!reloaded.showHistoryEpicenter());
+        QCOMPARE(reloaded.historyEpicenterMode(), QStringLiteral("time"));
+        QCOMPARE(reloaded.historyEpicenterCount(), 12);
+        QCOMPARE(reloaded.historyEpicenterHours(), 6);
         // 折算成 core 层口径后，三个数值都要带过去（地图侧只读这一份）。
         const WaveFadeSettings reloadedFade = reloaded.waveFadeSettings();
         QCOMPARE(reloadedFade.mode, WaveFadeMode::Distance);
@@ -2266,6 +2323,10 @@ private slots:
         QCOMPARE(reloaded.waveFadeIntensity(), 1.0);
         QCOMPARE(reloaded.waveFadeDistanceKm(), 1000);
         QCOMPARE(reloaded.waveFadeSeconds(), 300);
+        QVERIFY2(reloaded.showHistoryEpicenter(), "恢复默认后历史震中必须回到开启");
+        QCOMPARE(reloaded.historyEpicenterMode(), QStringLiteral("count"));
+        QCOMPARE(reloaded.historyEpicenterCount(), 1);
+        QCOMPARE(reloaded.historyEpicenterHours(), 24);
         // 单区恢复默认：只清该区，其余区域与总开关不受影响。
         reloaded.setSourceEstimationMinStations("japan", 20);
         reloaded.setSourceEstimationMinStations("korea", 11);

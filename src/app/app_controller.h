@@ -81,6 +81,8 @@ class AppController : public QObject {
     /// 只读——切换主题请写 settings.themeMode。
     Q_PROPERTY(bool darkMode READ darkMode NOTIFY darkModeChanged)
     /// 地图上要画的那一个事件：有焦点用焦点，否则退化为最近一次（`history[0]`）。
+    /// `history_` 在**每次**入库后都保持「按发震时刻倒序」（见 upsertHistory），
+    /// 否则这里取到的会是上一次排序时的那一条 —— 地图画着一个不是最新的震中。
     /// 推算焦点期间为空 —— 此时地图只画推定震中（见 focusEstimate）。
     Q_PROPERTY(QVariant mapEvent READ mapEvent NOTIFY mapEventChanged)
     /// 当前是否有地图焦点：地图仅在有关注事件时自动取景，避免默认被「最近事件」抢镜。
@@ -126,6 +128,18 @@ class AppController : public QObject {
     /// `{ id, location, timeText, magnitudeText, depthText, distanceText, ..., sources: [...],
     ///    reports: [...], districts: [...] }`
     Q_PROPERTY(QVariantMap eventDetail READ eventDetail NOTIFY eventDetailChanged)
+    /// 地图上要画的历史震中（**只显示，不参与焦点 / 告警 / 波前**）。
+    ///
+    /// 元素是 `toMap` 的**精简版**：只带标记载荷真正会读的字段（id / 经纬度 / 震级 /
+    /// 地名 / 时刻 / 烈度与颜色 / 来源），不含 rawJson 这类大字段 —— 按时间口径一次
+    /// 可能就是上百个点，照搬全字段等于又造一遍 200×40 的 QVariant 树。
+    ///
+    /// 取数口径由 `SettingsStore::historyEpicenterMode` 决定（按数量 / 按时间），
+    /// **数据源是侧栏的历史目录**（`catalogEvents()`）：同一份上游报文经多路聚合源
+    /// 转送只出一个点，与用户看到的列表逐行一致。已经由当前事件标记画出来的那一个
+    /// （`displayedEvent()`）不在这里重复出现 —— 默认「最近 1 个」时因此一个点都不多余，
+    /// 地图与改动前完全一样。
+    Q_PROPERTY(QVariantList historyMarkers READ historyMarkers NOTIFY historyMarkersChanged)
 
 public:
     explicit AppController(QObject* parent = nullptr, bool startServices = true);
@@ -188,6 +202,13 @@ public:
     QVariantMap sourceEstimateInfo() const;
     QVariantMap sourceEstimateMarker() const;
     QVariantMap eventDetail() const { return eventDetailCache_; }
+    /// 历史上要画在地图上的震中（见 `historyMarkers` 属性的说明）。**缓存**：
+    /// 只有载荷内容真的变了才重建并通知（目录刷新是高频路径）。
+    QVariantList historyMarkers() const;
+
+    /// 仅供测试/诊断：上一次 `historyMarkers` 重建的耗时与点数（毫秒 / 个）。
+    /// 地图每次刷新都要跑这条路径，回归用它锁住「按时间口径的上百个点也不卡」。
+    Q_INVOKABLE double historyMarkersBuildMsForTest() const { return historyMarkersBuildMs_; }
 
     /// HUD 左右切换：在全部活动事件间循环（按发震时刻倒序，0 为最新）。
     Q_INVOKABLE void hudPrev();
@@ -253,6 +274,8 @@ signals:
     void centerMapRequested(double latitude, double longitude);
     /// 取消焦点（再次点击同一事件）：请求把镜头还原到默认视野。
     void resetMapRequested();
+    /// 历史震中载荷变化（条数、点位或设置口径任一变化）。
+    void historyMarkersChanged();
 
 private:
     void wire();
@@ -269,6 +292,9 @@ private:
     /// 同 id 就地更新或追加；避免重启后「DB 载入 + 首次目录轮询」在列表留下重复条目。
     /// 写入内存历史；返回持久化字段是否真的变化（未变则无需写库）。
     bool upsertHistory(const EarthquakeEvent& event);
+    /// 就地更新后发震时刻变了：把第 `index` 条挪回它该在的位置，维持「按发震时刻倒序」。
+    /// 这条不变量是 `displayedEvent()` 取 `history_.first()` 的前提（见 upsertHistory）。
+    void reorderHistory(int index);
     /// 门控**之前**把本帧的 `<provider>·<agency>` 标签并进同 id 的历史行。
     /// 另一路聚合源转送的同一份报文会被 `EventGate` 判 Duplicate 后直接 return，
     /// 不到 upsertHistory；只在这里补标签，正文一律不动。
@@ -298,6 +324,9 @@ private:
     void rebuildHistory();
     /// 地图当前显示的那个事件（焦点优先，否则最近一次）；无事件返回 nullptr。
     const EarthquakeEvent* displayedEvent() const;
+    /// `displayedEvent()` 的身份 + 影响画面的字段。用来判断「这一帧有没有换掉/改掉
+    /// 地图上画的那一个」，据此决定要不要发 `mapEventChanged`（见 handleEvent 目录分支）。
+    QString displayedSignature() const;
     /// manual=true 表示用户主动点击选中；false 表示实时预警自动接管。
     void setMapFocus(const EarthquakeEvent& event, bool manual);
     void clearMapFocus();
@@ -341,6 +370,17 @@ private:
     void updateWaveRadii();
     /// 隐藏并清零波前（半径 -1 + 透明度 0），只在确有变化时发通知。
     void clearWaveRadii();
+    /// 重建 `historyMarkersCache_` 并按需发 `historyMarkersChanged`（内容真的变了才发）。
+    /// 设置口径（开关 / 方式 / 数量 / 小时数）与历史目录，是本属性仅有的两个输入。
+    void refreshHistoryMarkers();
+    /// 置脏并安排一次 0 ms 合并重算：目录与焦点都是高频路径（预警高峰一秒好几条），
+    /// 逐条重算等于把 catalogEvents() 的归并跑成按报文频率。同一轮事件循环里只算一次。
+    void scheduleHistoryMarkersRefresh();
+    /// 按时间口径取数时需要「到点自动下线」：安排一次跨越最近一条边界时刻的刷新。
+    /// 只按时间口径跑（数量口径的集合不随时间变化），没有条目时不排。
+    void scheduleHistoryMarkerExpiry();
+    /// 一条历史震中的标记载荷（`toMap` 的精简版，见 Q_PROPERTY 说明）。
+    QVariantMap historyMarkerMap(const EarthquakeEvent& event) const;
     /// 安排一次区县烈度重算：合并 80 ms 内的多次事件变更，只算最后一��。
     void scheduleDistrictRefresh();
     /// 在当前焦点事件下派发一次区县烈度重算。计算本体跑在 worker 线程；已有任务在跑时
@@ -521,6 +561,8 @@ private:
     /// `history` 属性背后的缓存：`historyDirty_` 为真时才重建。
     mutable QVariantList historyCache_;
     mutable bool historyDirty_ = true;
+    /// 历史震中的 0 ms 合并定时器（见 scheduleHistoryMarkersRefresh）。
+    QTimer historyMarkersTimer_;
     /// 数据源状态合并定时器（见 scheduleStatusRefresh）。
     QTimer statusRefreshTimer_;
     /// 台站表变化后置脏：下一次 refreshStationSnapshot 连元数据一起替换。
@@ -543,6 +585,15 @@ private:
     QStringList detailSourceTags_;
     bool detailActive_ = false;
     QVariantMap eventDetailCache_;
+    /// `historyMarkers` 属性背后的缓存与「上一次重建的输入签名」。
+    ///
+    /// 目录刷新是高频路径（每条报文都会走），而 QML 侧只在内容变化时才该重绑：
+    /// 签名 = 口径 + 每个点的 id/坐标，二者都相同就不重建、不发信号。
+    mutable QVariantList historyMarkersCache_;
+    mutable QString historyMarkersSignature_;
+    mutable double historyMarkersBuildMs_ = 0.0;
+    /// 时间口径下最近一条的过期时刻；到点重算一次，让「按时间」的窗口真的会走。
+    QTimer historyMarkerExpiryTimer_;
     /// 详情页区县表的缓存：只有震级/深度/震中变了才重算（连发多报时每报都重算太浪费）。
     QString detailDistrictSignature_;
     QVariantList detailDistrictsCache_;

@@ -42,9 +42,9 @@ Item {
         cameraMotionTimer.restart();
     }
     // 相机一变就收起悬停浮层：它锚在屏幕坐标上，跟着镜头漂会与测站错位。
-    onCenterLatChanged: { noteCameraMoved(); stationHover.hide(); }
-    onCenterLonChanged: { noteCameraMoved(); stationHover.hide(); }
-    onZoomChanged: { noteCameraMoved(); stationHover.hide(); }
+    onCenterLatChanged: { noteCameraMoved(); stationHover.hide(); hideHistoryHover(); }
+    onCenterLonChanged: { noteCameraMoved(); stationHover.hide(); hideHistoryHover(); }
+    onZoomChanged: { noteCameraMoved(); stationHover.hide(); hideHistoryHover(); }
     /// 是否存在活动预警：空闲自动归位时优先回到预警震中而非我的位置。
     property bool warningActive: false
     property real userLat: 0.0
@@ -298,9 +298,25 @@ Item {
         cameraMove.start();
     }
 
+    /// 飞行补间（自动聚焦震中 / 复位）途中收到缩放：**不打断飞行**，只换落点 zoom。
+    ///
+    /// 落点中心仍是原来那个（震中取景中心），从当前这一帧的镜头接着飞过去。旧行为是
+    /// `cameraMove.stop()` 之后按光标锚点起一段新的「zoom」步进，于是镜头停在半路、
+    /// 落点变成与震中无关的中点 —— 用户看到的就是「缩放打断了聚焦动画」。滚轮在这里
+    /// 只表达「画面放大一点」，不是「别飞了」；滚完镜头照样落到震中。
+    ///
+    /// 剩余时间不足 `zoomDuration` 时补足：否则在落地前最后几十毫秒里还要吃掉一整级
+    /// 缩放，看起来是「猛地一缩」。连续滚几格时每格都走这条路径（仍是 flight 补间），
+    /// 所以不会把一次飞行切成几段动画。
+    function retargetFlightZoom(z) {
+        retargetCamera(cameraTargetLat, cameraTargetLon, z, zoomDuration);
+    }
+
     /// 补间途中改航：不打断动画，从当前位置用剩余时长飞向新目标。
-    function retargetCamera(lat, lon, z) {
-        const remaining = Math.max(80, cameraMove.duration * (1 - cameraProgress));
+    /// `minMs` 只给缩放改航用（见 `retargetFlightZoom`）；平移改航沿用默认的 80 ms 下界。
+    function retargetCamera(lat, lon, z, minMs) {
+        const floorMs = minMs === undefined ? 80 : minMs;
+        const remaining = Math.max(floorMs, cameraMove.duration * (1 - cameraProgress));
         cameraMove.stop();
         cameraTweenMode = "flight";
         cameraStartLat = centerLat;
@@ -579,6 +595,7 @@ Item {
             currentId !== root.pendingEventEndId) root.cancelEventEndReset();
         // 换了事件：悬停态不能跟着旧震中带过去（指针没动，热区却已挪到别处）。
         epicenterHover = false;
+        hideHistoryHover();
     }
     /// 当前（或目标）整数缩放层级：相机动画进行中取动画目标，否则取当前值。
     /// 以目标为基准，快速连续滚动时每一格都实打实 ±1，不会被进行中的补间吞掉。
@@ -586,6 +603,9 @@ Item {
 
     /// 滚轮/按钮缩放：每次动作按整数层级步进，并吸附到整数 z（对齐参考项目 Leaflet 的整数缩放）。
     /// 整数层级下瓦片以 1:1 像素渲染（tileScale == 1），不会因非整数倍拉伸而发虚或反复切层。
+    ///
+    /// **飞行途中不按光标锚点起新动画**：自动聚焦震中（或复位）的三段式补间还在跑时，
+    /// 缩放只改**落点 zoom**，镜头继续飞向原落点（震中取景中心）。见 `retargetFlightZoom`。
     function zoomAt(x, y, delta) {
         following = false;
         userMovedCamera = true;
@@ -593,6 +613,12 @@ Item {
         const level = zoomLevel;
         const z = clampZoom(level + delta);
         if (z === level) return;   // 已到缩放上下限，避免原地抖动
+        // 飞行补间进行中：改航而不是另起一段。此时缩放锚点没有意义 —— 镜头本来就
+        // 还没到落点，用户按住的地理位置在飞行途中也在动。
+        if (cameraMove.running && cameraTweenMode === "flight") {
+            retargetFlightZoom(z);
+            return;
+        }
         const oldSize = worldSize(zoom);
         const anchorX = (projX(centerLon, zoom) + x - width / 2) / oldSize;
         const anchorY = (projY(centerLat, zoom) + y - height / 2) / oldSize;
@@ -1231,12 +1257,15 @@ Item {
     EpicenterInfo {
         id: epicenterInfo
         theme: root.theme
-        shown: root.epicenterHover
+        // 两块内容共用这一个浮层：指针停在当前震中十字上显示它，停在某个历史震中点
+        // 上显示那一个。**同一时刻只显示一块** —— 两个信息块互相压住既看不清也会
+        // 谁都读不完整；指针位置决定看哪一个（见 mapMouseArea 的悬停判定）。
+        shown: root.historyHoverInfo !== null || root.epicenterHover
         backdropSource: mapRenderLayer
         backdropLive: root.cameraMoving
-        event: root.event
-        anchorX: root.hypocenterX
-        anchorY: root.hypocenterY
+        event: root.historyHoverInfo !== null ? root.historyHoverInfo : root.event
+        anchorX: root.historyHoverInfo !== null ? root.historyHoverAnchor.x : root.hypocenterX
+        anchorY: root.historyHoverInfo !== null ? root.historyHoverAnchor.y : root.hypocenterY
         viewportWidth: root.width
         viewportHeight: root.height
         // z:4 —— 与 markerLayer（z:3）同为 root 的兄弟，但标记层声明在后会压过 z 相同的
@@ -1265,6 +1294,109 @@ Item {
         csisColors: root.theme.csisColorBand
         kmaColors: root.theme.kmaColorBand
         kmaDotColors: root.theme.kmaDotColorBand
+    }
+
+    // ---- 历史震中（用户可配置：最近 N 个 / 最近 N 小时）-----------------------
+    // 载荷来自 `app.historyMarkers`（C++ 侧已按口径裁好、按发震时刻倒序，并剔掉当前
+    // 事件标记正在画的那一个）。这里只负责投影与命中，不重新做任何取数判断 ——
+    // 两端口径若各写一份必然漂，用户调了「最近 5 个」却画 6 个是最难查的那类 bug。
+    //
+    // 层级：声明在 markerLayer **之前**、测站层之后。测站是 C++ 批量绘制的兄弟项，
+    // z 只在同父兄弟之间比较，所以这一层也必须自己是一个兄弟。放在当前事件十字的
+    // 下面，最近一条震中就不会被一个历史点盖住。
+    //
+    // 性能：默认口径是「最近 1 个」，而那一个正是当前事件、已被 C++ 侧剔掉，
+    // 因此默认状态下 Repeater 的 model 长度为 0，画面与改动前完全一致。
+    readonly property bool historyMarkersEnabled: !!app.settings.showHistoryEpicenter
+    readonly property var historyMarkerList: root.historyMarkersEnabled ? app.historyMarkers : []
+    /// 历史点的纠偏后坐标，一次算好按 id 索引：与推定震中同一套理由（`shiftCoord`
+    /// 在国内要跨 C++ 边界做迭代换算，不能放进每个 delegate 的 x/y 绑定里）。
+    readonly property var historyShifted: {
+        const list = historyMarkerList;
+        const out = ({});
+        for (let i = 0; i < list.length; ++i) {
+            const m = list[i];
+            if (!m || m.latitude === undefined || m.longitude === undefined) continue;
+            out[m.id] = root.shiftCoord(Number(m.latitude), Number(m.longitude));
+        }
+        return out;
+    }
+    /// 指针下的历史震中下标（-1 = 没有）。复用震中悬停浮层（`EpicenterInfo`）：
+    /// 用户问的就是「这些点是什么」，同一个信息块，不必再造一张小卡片。
+    property int historyMarkerHoverIndex: -1
+    /// 当前悬停的历史震中载荷与锚点（`historyMarkerInfo()` 越界时返回 null）。
+    readonly property var historyHoverInfo: root.historyMarkerInfo(root.historyMarkerHoverIndex)
+    readonly property var historyHoverAnchor: root.historyMarkerScreen(root.historyMarkerHoverIndex)
+    function hideHistoryHover() { historyMarkerHoverIndex = -1; }
+    /// 指针最近一次已知位置（供去抖回调与数据刷新重查用）。
+    property point hoverPending: Qt.point(-1, -1)
+    /// 去抖回调：指针停稳后判定它落在哪个历史震中上。
+    /// 手势中、选点模式、相机移动时一律收起（与测站浮层同一套条件，见 stationHover.query）。
+    function updateHistoryHover(x: real, y: real): void {
+        if (!root.historyMarkersEnabled || root.gestureActive || root.cameraMoving
+            || root.pickingLocation) {
+            hideHistoryHover();
+            return;
+        }
+        historyMarkerHoverIndex = root.historyMarkerAt(x, y);
+    }
+    /// 命中半径（逻辑像素）：点位本身 6–12 px，视觉上给到 22 px 才好指。
+    readonly property real historyMarkerHitRadius: 22
+
+    /// 屏幕坐标 → 历史震中下标；未命中返回 -1。
+    ///
+    /// 纯算术 O(n)，与 `StationMapItem::stationAt` 同一套思路：指针停稳后才查一次，
+    /// 不逐像素、不重建任何东西。n 上限是「按时间一周」的目录长度（≤200）。
+    function historyMarkerAt(x: real, y: real): int {
+        const list = root.historyMarkerList;
+        let best = -1;
+        let bestDist = root.historyMarkerHitRadius;
+        for (let i = 0; i < list.length; ++i) {
+            const s = root.historyShifted[list[i].id];
+            if (!s) continue;
+            const dx = root.screenX(s.lon) - x;
+            const dy = root.screenY(s.lat) - y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist <= bestDist) { bestDist = dist; best = i; }
+        }
+        return best;
+    }
+    function historyMarkerInfo(index: int): var {
+        const list = root.historyMarkerList;
+        return index >= 0 && index < list.length ? list[index] : null;
+    }
+    function historyMarkerScreen(index: int): var {
+        const list = root.historyMarkerList;
+        if (index < 0 || index >= list.length) return ({ x: 0, y: 0 });
+        const s = root.historyShifted[list[index].id];
+        if (!s) return ({ x: 0, y: 0 });
+        return ({ x: root.screenX(s.lon), y: root.screenY(s.lat) });
+    }
+
+    Item {
+        id: historyMarkerLayer
+        objectName: "historyEpicenterLayer"
+        anchors.fill: parent
+        z: 3
+        visible: root.historyMarkersEnabled
+
+        /// 实际画出的个数（= 载荷长度）。回归与可访问性都读它。
+        readonly property int count: historyMarkerRepeater.count
+
+        Repeater {
+            id: historyMarkerRepeater
+            model: root.historyMarkerList
+            delegate: HistoryEpicenterMarker {
+                required property var modelData
+                required property int index
+                objectName: "historyEpicenterMarker-" + index
+                theme: root.theme
+                info: modelData
+                markerX: root.historyMarkerScreen(index).x
+                markerY: root.historyMarkerScreen(index).y
+                highlighted: root.historyMarkerHoverIndex === index
+            }
+        }
     }
 
     // ---- 震中 / 我的位置标记（必须压在测站层之上）--------------------------
@@ -1616,6 +1748,25 @@ Item {
         target: stationLayer
         function onStationsApplied() { stationHover.refresh(); }
     }
+    // 历史震中点变化（目录刷新 / 口径改动）后重查指针下那一个：浮层内容在 100 ms 级
+    // 更新，停在上一条的读数上会误导。沿用最后一次已知的指针位置，不重建任何图层。
+    Connections {
+        target: app
+        function onHistoryMarkersChanged() {
+            if (root.historyMarkerHoverIndex < 0) return;
+            if (root.hoverPending.x < 0) { root.hideHistoryHover(); return; }
+            root.updateHistoryHover(root.hoverPending.x, root.hoverPending.y);
+        }
+    }
+    // 关掉历史震中开关时浮层必须立刻收起：地图上已经没有可指的点。
+    Connections {
+        target: app.settings
+        function onShowHistoryEpicenterChanged() {
+            if (!app.settings.showHistoryEpicenter) root.hideHistoryHover();
+            else if (root.hoverPending.x >= 0)
+                root.updateHistoryHover(root.hoverPending.x, root.hoverPending.y);
+        }
+    }
     // 关闭测站图层时浮层必须立刻收起：此时地图上已经没有可指的点了。
     // 听逐项信号而不是聚合的 changed()：SettingsStore 的 changed() 任何设置项变化都会发，
     // 而这里只关心测站图层开关。
@@ -1630,7 +1781,12 @@ Item {
         objectName: "stationHoverTimer"
         // 指针停稳 90 ms 才查询：扫过地图时不会沿路闪出一串浮层。
         interval: 90
-        onTriggered: stationHover.query(stationHover.pending.x, stationHover.pending.y, true)
+        onTriggered: {
+            stationHover.query(stationHover.pending.x, stationHover.pending.y, true);
+            // 历史震中的悬停判定与测站共用这一个去抖计时器：两者都是「指针停稳后
+            // 才命中一次」的查询，分成两个计时器只会让浮层闪两下。
+            root.updateHistoryHover(root.hoverPending.x, root.hoverPending.y);
+        }
     }
 
     // 右上角：各测站源的实时最大值（仅显示，不参与预警）。默认收起时叠成一摞
@@ -1690,6 +1846,7 @@ Item {
             pressX = mouse.x;
             pressY = mouse.y;
             stationHover.hide();
+            root.hideHistoryHover();
             // 从按下的第一刻起就冻结程序化镜头：即便还没产生位移，新事件/波前跟随
             // 也不该在指针下把画面抽走。
             root.beginGesture();
@@ -1700,6 +1857,7 @@ Item {
             // 悬停：不按住时只登记指针位置，停稳后由 hoverTimer 查询一次。
             if (!pressed) {
                 stationHover.schedule(mouse.x, mouse.y);
+                root.hoverPending = Qt.point(mouse.x, mouse.y);
                 return;
             }
             // 拖动：1:1 跟手平移镜头。
@@ -1734,7 +1892,7 @@ Item {
         onReleased: root.endGesture()
         onCanceled: root.endGesture()
         // area 级 exited：指针离开地图（含移入浮层/工具条）时收起浮层。
-        onExited: stationHover.hide()
+        onExited: { stationHover.hide(); root.hideHistoryHover(); }
     }
 
     GlassCard {

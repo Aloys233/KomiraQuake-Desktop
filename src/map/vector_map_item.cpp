@@ -268,9 +268,18 @@ void VectorMapItem::setLodEnabled(bool v) {
 }
 
 void VectorMapItem::itemChange(ItemChange change, const ItemChangeData& value) {
-    if (change == ItemVisibleHasChanged && !value.boolValue) {
-        // 隐藏即释放：矢量叠加关掉后没必要常驻十几 MB，重新显示时下一帧重建即可。
-        dropCache();
+    if (change == ItemVisibleHasChanged) {
+        if (!value.boolValue) {
+            // 隐藏即释放：矢量叠加关掉后没必要常驻十几 MB，重新显示时下一帧重建即可。
+            dropCache();
+        } else {
+            // 重新显示**必须**主动要一帧。Qt 的 Visible 脏位不在 ContentUpdateMask 里
+            // （见 QQuickItemPrivate::ContentUpdateMask），只会走可见性/不透明度那条分支，
+            // 根本不会调 updatePaintNode —— 而 dropCache() 刚把位图扔掉，这一层若没人
+            // 再弄脏它就永远空白。开关矢量叠加正是这条路径。
+            dropCache();
+            update();
+        }
     }
     QQuickItem::itemChange(change, value);
 }
@@ -536,10 +545,24 @@ void VectorMapItem::onTierBuilt(const std::string& key, const LodTierPtr& built)
     // 新档位只是「更合适的精度」，不是「必须立刻重绘」：当前位图在几何上仍然正确
     // （缓存里的路径来自上一档，画出来只是略粗/略细）。相机静止时才值得换一张，
     // 缩放/拖动途中重绘等于给动画加卡顿，交给下一次自然重建即可。
-    if (cacheValid_ && cacheTier_ != built->tier && cameraAtRest()) {
+    //
+    // 例外：**当前什么都没有画**（cacheValid_ 为假）。那时不存在「换精度」，这一帧
+    // 就是这一层重新出现的唯一机会 —— 缩放/拖动中也要补。旧实现把补帧条件写成
+    // `cacheValid_ && …`，恰好在「缓存被丢掉 + 首档刚建好」时永远不补：切底图、
+    // 开关叠加后整层空白且再无任何东西会弄脏它（用户报的「矢量图卡住不动」）。
+    if (cacheTier_ != built->tier && (cacheValid_ ? cameraAtRest() : true)) {
         cacheValid_ = false;
         update();
     }
+}
+
+void VectorMapItem::dropStaleNode(QSGNode* oldNode) {
+    // 返回 nullptr 时 Qt **不会**替我们摘掉旧节点：它只把 itemPriv->paintNode 置空，
+    // 旧子树仍然挂在 childContainerNode 上继续参与渲染，而子节点核对只在
+    // ChildrenUpdateMask（ChildrenChanged/StackingChanged）时才做。于是「本帧留空」
+    // 实际效果是「把上一帧的画面钉在屏幕上」—— 相机再动也没有任何节点去更新它，
+    // 用户看到的就是矢量图卡住不动。必须自己删（QSGNode 析构会从父节点摘除）。
+    delete oldNode;
 }
 
 bool VectorMapItem::cameraAtRest() const {
@@ -963,10 +986,12 @@ QSGNode* VectorMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) 
                 },
                 Qt::QueuedConnection);
         }
+        dropStaleNode(oldNode);
         return nullptr;
     }
     if (!hasDrawableContent(state) || width() <= 0 || height() <= 0) {
         dropCache();
+        dropStaleNode(oldNode);
         return nullptr;
     }
 
@@ -1007,6 +1032,7 @@ QSGNode* VectorMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) 
             uploadedGeometryValid_ = false;
             drawnTiles_ = 0;
             submittedTriangles_ = 0;
+            dropStaleNode(oldNode);
             return nullptr;
         }
 
@@ -1019,6 +1045,7 @@ QSGNode* VectorMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) 
             return updateGpuNode(oldNode, state, lat, lon, zoom, gpuScale);
         }
         // 网格还在建：本帧留空（下一帧就好）。
+        dropStaleNode(oldNode);
         return nullptr;
     }
     gpuPathActive_ = false;
@@ -1056,6 +1083,7 @@ QSGNode* VectorMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) 
     LodTierPtr tier = resolveTier(layer, state.gcjShift, wantedTier);
     if (!tier) {
         // 该档位还在后台构建，且没有任何可退回的档位：本帧留空（下一帧就好）。
+        dropStaleNode(oldNode);
         return nullptr;
     }
 
@@ -1107,7 +1135,10 @@ QSGNode* VectorMapItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) 
     if (!textureValid_) {
         QSGTexture* texture =
             window()->createTextureFromImage(cache_, QQuickWindow::TextureHasAlphaChannel);
-        if (!texture) return nullptr;
+        if (!texture) {
+            dropStaleNode(oldNode);
+            return nullptr;
+        }
         texture->setFiltering(QSGTexture::Linear);
         texture->setMipmapFiltering(QSGTexture::None);
         node->setTexture(texture);

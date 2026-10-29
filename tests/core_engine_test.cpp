@@ -20,6 +20,7 @@
 #include "core/polygon_tessellator.h"
 #include "core/quake_calculator.h"
 #include "core/region_names.h"
+#include "core/render_backend_policy.h"
 #include "core/source_estimator.h"
 #include "core/sound_queue.h"
 #include "core/time_sync.h"
@@ -1345,6 +1346,36 @@ int main(int argc, char** argv) {
                 check(!c.label.empty() && !c.url.empty(), "update channels: candidate is describable");
             }
         }
+    }
+
+    // ---- 渲染后端决策 -----------------------------------------------------
+    // 回归：1.3.6 的 Nix 包在没有可用 EGL 的机器上会 SIGABRT。原因不是代码，
+    // 而是「拿不到 GL 上下文时 Qt 直接 qFatal」这条路径没有任何兜底。这里锁住
+    // 决策层：探测到 GL 就上硬件加速，探测不到必须退软件渲染（而不是让进程死）。
+    {
+        check(chooseRenderBackend(true) == RenderBackend::Hardware,
+              "render backend: usable GL keeps hardware scene graph");
+        check(chooseRenderBackend(false) == RenderBackend::Software,
+              "render backend: no GL falls back to software instead of aborting");
+        check(std::string(renderBackendName(RenderBackend::Hardware)) == "opengl"
+                  && std::string(renderBackendName(RenderBackend::Software)) == "software",
+              "render backend: names are stable for logging");
+
+        // 环境变量覆盖：大小写不敏感，拼错的值绝不能把用户锁在一条坏路径上。
+        const auto parse = [](const char* v) {
+            const std::size_t n = v ? std::char_traits<char>::length(v) : 0;
+            return parseRenderBackendOverride(v, int(n));
+        };
+        check(parse("software") == RenderBackendOverride::Software
+                  && parse("SOFTWARE") == RenderBackendOverride::Software,
+              "render backend: KOMIRA_RENDER_BACKEND=software (case-insensitive)");
+        check(parse("opengl") == RenderBackendOverride::OpenGl
+                  && parse("OpenGL") == RenderBackendOverride::OpenGl,
+              "render backend: KOMIRA_RENDER_BACKEND=opengl (case-insensitive)");
+        check(parse("") == RenderBackendOverride::Auto && parse(nullptr) == RenderBackendOverride::Auto
+                  && parse("nonsense") == RenderBackendOverride::Auto
+                  && parse("software ") == RenderBackendOverride::Auto,
+              "render backend: unknown/blank override means auto-detect");
     }
 
     std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL PASSED" : "FAILURES",

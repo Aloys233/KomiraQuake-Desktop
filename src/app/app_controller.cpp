@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 
@@ -437,6 +438,18 @@ AppController::AppController(QObject* parent, bool startServices)
         emit hudEventChanged();
     });
 
+    // 历史震中：目录/焦点变化后合并成一次重算（见 scheduleHistoryMarkersRefresh）。
+    historyMarkersTimer_.setSingleShot(true);
+    connect(&historyMarkersTimer_, &QTimer::timeout, this,
+            &AppController::refreshHistoryMarkers);
+
+    // 历史震中：按时间口径的窗口会自己往前走，到点重算一次让过期点下线
+    // （按数量口径不排，集合不随时间变化）。
+    historyMarkerExpiryTimer_.setSingleShot(true);
+    connect(&historyMarkerExpiryTimer_, &QTimer::timeout, this, [this]() {
+        refreshHistoryMarkers();
+    });
+
     // 数据源状态：250 ms 合并窗口。状态徽章与设置页只需人眼可辨的刷新率，
     // 而 WS 心跳/延迟更新是每帧一条。
     statusRefreshTimer_.setSingleShot(true);
@@ -455,6 +468,9 @@ AppController::AppController(QObject* parent, bool startServices)
     // 若等到第一条网络帧才填充，界面会先闪一下「空列表」再长出卡片。
     rebuildSources();
     rebuildStationCards();
+    // 历史震中同理：QML 首帧就会读 `app.historyMarkers`。启动时库里已回填的历史目录
+    // 必须已经算好，否则要等第一次目录刷新才出现。
+    refreshHistoryMarkers();
 }
 
 void AppController::scheduleStationIntensityRefresh() {
@@ -639,6 +655,15 @@ void AppController::wireSettings() {
     connect(settings_, &SettingsStore::waveFadeIntensityChanged, this, reloadWaveFade);
     connect(settings_, &SettingsStore::waveFadeDistanceKmChanged, this, reloadWaveFade);
     connect(settings_, &SettingsStore::waveFadeSecondsChanged, this, reloadWaveFade);
+
+    // ---- 2c. 历史震中：四个设置项只影响地图上的历史点，就地重算一次 ----
+    // 与波前同理：用户改完设置要立刻看见效果，而这条路径的输入只有设置与历史目录，
+    // 重算本身是几十微秒级（见 refreshHistoryMarkers 的签名早退）。
+    const auto reloadHistoryMarkers = [this]() { refreshHistoryMarkers(); };
+    connect(settings_, &SettingsStore::showHistoryEpicenterChanged, this, reloadHistoryMarkers);
+    connect(settings_, &SettingsStore::historyEpicenterModeChanged, this, reloadHistoryMarkers);
+    connect(settings_, &SettingsStore::historyEpicenterCountChanged, this, reloadHistoryMarkers);
+    connect(settings_, &SettingsStore::historyEpicenterHoursChanged, this, reloadHistoryMarkers);
 
     // ---- 3. 震源推算：只有它的参数/开关会作废旧解 ----
     const auto reloadEstimation = [this]() { sourceEstimation_->reloadSettings(); };
@@ -1084,6 +1109,20 @@ const EarthquakeEvent* AppController::displayedEvent() const {
     return nullptr;
 }
 
+QString AppController::displayedSignature() const {
+    // 「地图上画出来的那一个」的身份 + 会影响画面/取景的字段。只比 id 不够：同一场
+    // 地震的测定修正（震级、震中、深度）也必须让 QML 重画十字与波前。
+    const EarthquakeEvent* event = displayedEvent();
+    if (!event) return QString();
+    return QStringLiteral("%1|%2|%3|%4|%5|%6")
+        .arg(QString::fromStdString(event->identity()))
+        .arg(event->timestamp)
+        .arg(event->latitude, 0, 'f', 4)
+        .arg(event->longitude, 0, 'f', 4)
+        .arg(event->magnitude, 0, 'f', 1)
+        .arg(event->depth, 0, 'f', 0);
+}
+
 QVariant AppController::focusEstimate() const {
     if (focusEstimate_.isEmpty()) return QVariant();
     return focusEstimate_;
@@ -1473,6 +1512,9 @@ void AppController::setMapFocus(const EarthquakeEvent& event, bool manual) {
     scheduleDistrictRefresh();
     // 焦点只影响侧栏两行（旧的、新的）：走定向 dataChanged，不重建整表。
     syncEventModelFocus();
+    // 焦点变了 → 地图上「由事件标记画出的那一个」也变了，历史层要跟着挪一格：
+    // 新焦点从历史点里让出来，旧的那个补上去（否则数量口径会少画一个）。
+    scheduleHistoryMarkersRefresh();
     emit mapEventChanged();
     emit mapFocusChanged();
     emit hudEventChanged();
@@ -1986,6 +2028,9 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
             }
         }
         if (isAlertLevel(event.warningLevel)) event.warningLevel = WarningLevel::Watch;
+        // 「当前事件」的签名先记下来：这一帧可能把它整条换掉（history_ 表头换人）
+        // 或就地修正（同一 id、更晚的测定）。两种都必须通知 QML —— 见本段末尾。
+        const QString displayedBefore = displayedSignature();
         const bool changed = upsertHistory(event);
         if (changed) {
             // 落盘写的是**归并后的那一行**，不是这一帧：标签并集在 upsertHistory 里做，
@@ -2010,6 +2055,20 @@ void AppController::handleEvent(const EarthquakeEvent& incoming, bool replay, bo
             mapFocus_ = event;
             if (mapFocus_.reportTime <= 0) mapFocus_.reportTime = reportTime;
         }
+        // `history_` 变了就要重画地图，且**不能只靠 `scheduleDirectoryUiRefresh()`**：
+        // 那个定时器只刷侧栏行模型、详情页和 HUD，不发 `mapEventChanged`。旧实现在这条
+        // 路径上一声不吭，QML 的 `window.mapEvent` 绑定就一直停在旧事件上 —— 即使 C++ 侧
+        // 的 `history_.first()` 已经换人了，画面还是旧的那个（用户看到的正是这个）。
+        // 判据用签名比较而不是 `changed`：`changed==false` 只表示没有字段变化，不代表
+        // 「当前事件」没被这一帧牵动（表头换人往往伴随另一条记录入库）。
+        const QString displayedAfter = displayedSignature();
+        if (displayedAfter != displayedBefore) {
+            updateWaveTimer();
+            emit mapEventChanged();
+            scheduleHudRefresh();
+        }
+        // 历史震中层的输入就是 catalogEvents()：目录一动，那一格预算也要跟着挪。
+        scheduleHistoryMarkersRefresh();
         scheduleDirectoryUiRefresh();
         admit(event, AdmissionStatus::Applied);
         return;
@@ -2124,13 +2183,43 @@ bool AppController::upsertHistory(const EarthquakeEvent& event) {
         if (history_[i].id != merged.id) continue;
         for (const std::string& tag : history_[i].sourceTags) appendUniqueTag(merged.sourceTags, tag);
         if (sameStoredEvent(history_[i], merged)) return false;
+        // 就地替换也可能破坏「按发震时刻倒序」：测定修正会带来新的发震时刻，某一条
+        // 因此要挪位置。不挪的话表头可能仍是一条更老的记录（见下面的插入注释）。
+        const bool needsMove = history_[i].timestamp != merged.timestamp;
         history_[i] = std::move(merged);
         historyDirty_ = true;
+        if (needsMove) reorderHistory(i);
         return true;
     }
-    history_.push_back(std::move(merged));
+    // **插入位置按发震时刻倒序**，不是 `push_back`。
+    //
+    // `displayedEvent()` 直接取 `history_.first()`，而这条不变量原先只有
+    // `rebuildHistory()`（重启载入、改强度标准）在维护；运行期新到的目录事件全被堆到
+    // 表尾，于是地图上的红 X 一直画在**上一次排序时**最新的那一条上，真正最新的那场
+    // 反而被 `refreshHistoryMarkers()` 当成「当前事件」占掉数量口径的一格 —— 用户看到
+    // 的就是「设了显示 1 个，但显示的不是最新的那一个」，改一次设置（顺带触发
+    // `rebuildHistory()`）才会恢复。顺序必须在**每次入库后**都成立，不能靠别的路径补。
+    const auto pos = std::lower_bound(history_.begin(), history_.end(), merged.timestamp,
+                                      [](const EarthquakeEvent& e, long long stamp) {
+                                          return e.timestamp > stamp;
+                                      });
+    history_.insert(pos, std::move(merged));
     historyDirty_ = true;
+    // 与 rebuildHistory 的裁剪口径一致：长跑会话里目录可能几十条一轮地进来，
+    // 表长必须同样有界，不然「最多 200 条」只在重启那一刻成立。
+    while (history_.size() > 200) history_.removeLast();
     return true;
+}
+
+void AppController::reorderHistory(int index) {
+    if (index < 0 || index >= history_.size()) return;
+    EarthquakeEvent moved = std::move(history_[index]);
+    history_.removeAt(index);
+    const auto pos = std::lower_bound(history_.begin(), history_.end(), moved.timestamp,
+                                      [](const EarthquakeEvent& e, long long stamp) {
+                                          return e.timestamp > stamp;
+                                      });
+    history_.insert(pos, std::move(moved));
 }
 
 void AppController::noteHistorySourceTag(const EarthquakeEvent& event) {
@@ -2350,6 +2439,123 @@ void AppController::rebuildHistory() {
     emit mapEventChanged();
     historyDirty_ = true;
     emit historyChanged();
+    // 历史目录变了，地图上的历史震中点也要跟着变（合并到 0 ms，逐条报文不各算一次）。
+    scheduleHistoryMarkersRefresh();
+}
+
+QVariantList AppController::historyMarkers() const { return historyMarkersCache_; }
+
+void AppController::scheduleHistoryMarkersRefresh() {
+    // 0 ms 单次定时器：同一轮事件循环内的多次置脏只触发一次重建。
+    if (!historyMarkersTimer_.isActive()) historyMarkersTimer_.start(0);
+}
+
+QVariantMap AppController::historyMarkerMap(const EarthquakeEvent& event) const {
+    const IntensityStandard standard = settings_->intensityStandard() == 1
+        ? IntensityStandard::Jma : IntensityStandard::Csis;
+    QVariantMap m = toMap(event, standard);
+    // 标记载荷只保留浮层（`EpicenterInfo`）与图标会读的字段：距离、报次、级别、色值副本
+    // 这些对地图没有意义，留着会让一次目录刷新多建一半键值。
+    for (const char* key : {"source", "alertIssued", "distance", "distanceText", "hasDistance",
+                            "intensityIsLocal", "estimatedIntensity", "maxIntensity",
+                            "rawIntensity", "maxIntensityRaw", "listIntensity",
+                            "listIntensityLabel", "listIntensityColor", "levelTag", "levelCode",
+                            "reportNum", "isInfo", "isFinal", "isCanceled", "severityColor",
+                            "determinationText"}) {
+        m.remove(QLatin1String(key));
+    }
+    return m;
+}
+
+void AppController::refreshHistoryMarkers() {
+    if (!settings_) return;
+    QElapsedTimer buildClock;
+    buildClock.start();
+
+    const bool enabled = settings_->showHistoryEpicenter();
+    const QString mode = settings_->historyEpicenterMode();
+    const int wantCount = settings_->historyEpicenterCount();
+    const int hours = settings_->historyEpicenterHours();
+    const long long now = nowMs();
+    const long long windowMs = static_cast<long long>(hours) * 3600'000LL;
+
+    // 当前由事件标记画出来的那一个（焦点或最近一次事件）：历史层不再重复画。
+    // 数量口径把「它」算进用户设定的个数 —— 默认 1 个时因此一个新点都不多出来，
+    // 地图与改动前完全一样。
+    const EarthquakeEvent* displayed = displayedEvent();
+    const QString displayedId = displayed ? QString::fromStdString(displayed->identity()) : QString();
+
+    QVariantList out;
+    QString signature = QStringLiteral("%1|%2|%3|%4|%5")
+                            .arg(enabled ? 1 : 0)
+                            .arg(mode)
+                            .arg(wantCount)
+                            .arg(hours)
+                            .arg(displayedId);
+    if (enabled) {
+        // 按时间的口径不设个数上限（窗口本身就是上限）；按数量则要为已画出的那个留一格。
+        const int budget = mode == QLatin1String("time")
+                               ? std::numeric_limits<int>::max()
+                               : std::max(0, wantCount - (displayed ? 1 : 0));
+        // 默认情形（按数量 1 个、并且它正由事件标记画着）没有要画的历史点：直接跳过
+        // catalogEvents()。这条路径在每次目录刷新都会跑到，而它可以有几百条。
+        if (budget > 0) {
+            const auto catalog = catalogEvents();
+            for (const auto& entry : catalog) {
+                if (static_cast<int>(out.size()) >= budget) break;
+                // 与侧栏同口径：被逐源震级过滤挡住的目录不画（用户看不到的条目不该出现在地图上）。
+                if (!entry.passesInfoFilter) continue;
+                const EarthquakeEvent& event = entry.event;
+                const QString id = QString::fromStdString(event.identity());
+                if (!displayedId.isEmpty() && id == displayedId) continue;
+                if (mode == QLatin1String("time")) {
+                    // 发震时刻未知（<=0）的条目没有时间坐标，按时间口径直接不画。
+                    if (event.timestamp <= 0) continue;
+                    if (now - event.timestamp > windowMs) continue;
+                }
+                out.push_back(historyMarkerMap(event));
+                signature += QLatin1Char('|') + id + QLatin1Char('@')
+                             + QString::number(event.timestamp) + QLatin1Char(',')
+                             + QString::number(event.latitude, 'f', 4) + QLatin1Char(',')
+                             + QString::number(event.longitude, 'f', 4) + QLatin1Char(',')
+                             + QString::number(event.magnitude, 'f', 1);
+            }
+        }
+    }
+    historyMarkersBuildMs_ = static_cast<double>(buildClock.nsecsElapsed()) / 1e6;
+
+    const bool changed = signature != historyMarkersSignature_;
+    if (changed) {
+        historyMarkersSignature_ = signature;
+        historyMarkersCache_ = std::move(out);
+    }
+    // 时间口径的窗口会自己往前走：排一次「最早那条过期」的刷新，否则用户不动设置时
+    // 地图上的点会一直停在那里，直到下一次目录刷新才消失。
+    scheduleHistoryMarkerExpiry();
+    if (changed) emit historyMarkersChanged();
+}
+
+void AppController::scheduleHistoryMarkerExpiry() {
+    historyMarkerExpiryTimer_.stop();
+    if (!settings_ || !settings_->showHistoryEpicenter()) return;
+    if (settings_->historyEpicenterMode() != QLatin1String("time")) return;
+    const long long now = nowMs();
+    const long long windowMs =
+        static_cast<long long>(settings_->historyEpicenterHours()) * 3600'000LL;
+    long long soonest = 0;
+    for (const QVariant& value : std::as_const(historyMarkersCache_)) {
+        const QVariantMap marker = value.toMap();
+        const long long stamp = marker.value(QStringLiteral("timestamp")).toLongLong();
+        if (stamp <= 0) continue;
+        const long long expiry = stamp + windowMs;
+        if (expiry <= now) continue;
+        if (soonest == 0 || expiry < soonest) soonest = expiry;
+    }
+    if (soonest == 0) return;
+    // 至少 1 s：条目刚过期时重算会把它移出窗口，不会留下 0 ms 的死循环。
+    const long long delay = std::max<long long>(1000, soonest - now + 200);
+    historyMarkerExpiryTimer_.setInterval(static_cast<int>(std::min<long long>(delay, 3600'000LL)));
+    historyMarkerExpiryTimer_.start();
 }
 
 void AppController::refreshEventModel() {

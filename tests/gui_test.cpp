@@ -38,6 +38,7 @@
 // 放宽访问范围之处，其余生产头一律不改。
 #define private public
 #include "app/app_controller.h"
+#include "app/render_backend.h"
 #include "service/source_estimation_service.h"
 #include "service/alert_announcer.h"
 #include "service/tray_controller.h"
@@ -1171,11 +1172,265 @@ private slots:
         QVERIFY2(ok, "矢量层在缩放后与震中/定位标记错位");
     }
 
-    /// LOD 分档与缓存记忆：低缩放必须用粗档、拉近必须回到全精度，且隐藏时释放位图。
+    /// 切换底图 / 开关矢量叠加之后，矢量层必须继续跟着相机走。
     ///
-    /// 回归点（2026-10 矢量层重构）：全精度重绘在缓存尺寸下要 13–57 ms/次，LOD 是把它
-    /// 压到一帧预算内的关键手段。若以后有人把档位算错（例如忘了乘 dpr、或档位方向反了），
-    /// 属性断言仍是全绿、只有手感变差 —— 所以这里直接断言绘制实际采用的容差档。
+    /// 回归点（用户实测）：「切换底图或者开关矢量叠加都有很大概率会导致矢量图
+    /// 被固定在屏幕上卡住不动。」判据是**绘制结果**而不是属性：
+    /// VectorMapItem::screenPosForTest 给出「最近一帧真的画在屏幕上的投影」，
+    /// 与 QML 侧的 screenX/screenY 比对；一旦某一帧之后不再重绘，两者就会分家。
+    void vectorLayerKeepsFollowingCameraAfterBasemapToggle() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("VectorToggleFreezeTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("petal");
+        controller.settings()->setVectorOverlay(true);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        auto* world = window->findChild<QQuickItem*>("vectorWorldLayer");
+        auto* province = window->findChild<QQuickItem*>("vectorProvinceLayer");
+        QVERIFY(mapView && world && province);
+        QVERIFY2(world->property("ready").toBool(), "vector data (.kvb) failed to load");
+        QTest::qWait(300);
+
+        const bool softwareBackend =
+            window->rendererInterface()->graphicsApi() == QSGRendererInterface::Software;
+        auto qmlNum = [&](const char* fn, double arg) -> double {
+            double ret = qQNaN();
+            const bool ok = QMetaObject::invokeMethod(mapView, fn, Q_RETURN_ARG(double, ret),
+                                                      Q_ARG(double, arg));
+            return ok ? ret : qQNaN();
+        };
+        auto hasContent = [&](QQuickItem* layer) {
+            qint64 bytes = 0;
+            qint64 tris = 0;
+            QMetaObject::invokeMethod(layer, "cacheBytesForTest", Q_RETURN_ARG(qint64, bytes));
+            QMetaObject::invokeMethod(layer, "submittedTrianglesForTest", Q_RETURN_ARG(qint64, tris));
+            return softwareBackend ? bytes > 0 : tris > 0;
+        };
+        /// 当前真正在画的那一层：纯矢量底图看 world，栅格+叠加看 province（world 全透明）。
+        /// 栅格底图且叠加关闭时矢量层整体不可见，没有「该画出来」的内容，返回 nullptr。
+        auto drawnLayer = [&]() -> QQuickItem* {
+            if (mapView->property("vectorOnly").toBool()) return world;
+            return mapView->property("vectorActive").toBool() ? province : nullptr;
+        };
+        /// 最近一帧的绘制投影是否与 QML 投影同源（相差 > 1 px 即判定「卡住」）。
+        auto aligned = [&](QQuickItem* layer) -> bool {
+            for (const QPointF& p : {QPointF(116.4, 39.9), QPointF(121.5, 31.2)}) {
+                QPointF got;
+                QMetaObject::invokeMethod(layer, "screenPosForTest", Q_RETURN_ARG(QPointF, got),
+                                          Q_ARG(double, p.y()), Q_ARG(double, p.x()));
+                const double expX = qmlNum("screenX", p.x());
+                const double expY = qmlNum("screenY", p.y());
+                if (std::hypot(got.x() - expX, got.y() - expY) >= 1.0) return false;
+            }
+            return true;
+        };
+        auto dump = [&](const char* tag, QQuickItem* layer) {
+            qint64 pc = 0, rb = 0;
+            QMetaObject::invokeMethod(layer, "paintNodeCallsForTest", Q_RETURN_ARG(qint64, pc));
+            QMetaObject::invokeMethod(layer, "cacheRebuildsForTest", Q_RETURN_ARG(qint64, rb));
+            qWarning() << "vector-layer misaligned:" << tag << layer->objectName()
+                       << "layerCamera" << layer->property("centerLat").toDouble()
+                       << layer->property("centerLon").toDouble()
+                       << layer->property("zoom").toDouble()
+                       << "mapCamera" << mapView->property("centerLat").toDouble()
+                       << mapView->property("centerLon").toDouble()
+                       << mapView->property("zoom").toDouble()
+                       << "paintCalls" << pc << "rebuilds" << rb
+                       << "geomReady" << layer->property("geometryReady").toBool()
+                       << "visible" << layer->isVisible();
+        };
+
+        const char* basemaps[] = {"petal", "amap_vector", "vector", "osm"};
+        int step = 0;
+        for (int round = 0; round < 2; ++round) {
+            for (const char* bm : basemaps) {
+                controller.settings()->setBasemapId(QString::fromLatin1(bm));
+                controller.settings()->setVectorOverlay(round % 2 == 0);
+                QTest::qWait(100);
+                QQuickItem* layer = drawnLayer();
+                if (!layer) continue;   // 栅格底图 + 叠加关闭：这一轮没有矢量内容
+                // 切换后必须先恢复绘制内容（异步几何/网格重建），再检查是否跟随相机。
+                QVERIFY2(QTest::qWaitFor([&] { window->grabWindow(); return hasContent(layer); }, 8000),
+                         qPrintable(QStringLiteral("底图=%1 叠加=%2 层=%3 切换后没有重新画出内容")
+                                        .arg(QString::fromLatin1(bm))
+                                        .arg(round % 2 == 0)
+                                        .arg(layer->objectName())));
+                mapView->setProperty("centerLat", 30.0 + 0.4 * (step % 5));
+                mapView->setProperty("centerLon", 110.0 + 0.6 * (step % 4));
+                mapView->setProperty("zoom", 5.0 + 0.1 * (step % 3));
+                ++step;
+                bool ok = false;
+                for (int i = 0; i < 250 && !ok; ++i) {
+                    QTest::qWait(20);
+                    window->grabWindow();
+                    ok = aligned(layer);
+                }
+                if (!ok) {
+                    dump("misaligned", layer);
+                    dump("misaligned-other", layer == world ? province : world);
+                    QFAIL(qPrintable(QStringLiteral("底图=%1 叠加=%2 层=%3 相机移动后矢量层停在旧投影（卡住）")
+                                         .arg(QString::fromLatin1(bm))
+                                         .arg(round % 2 == 0)
+                                         .arg(layer->objectName())));
+                }
+            }
+        }
+    }
+
+    /// 回归：切底图 / 开关矢量叠加后，矢量层必须自己重新画出来。
+    ///
+    /// 用户报「切换底图或者开关矢量叠加都有很大概率会导致矢量图被固定在屏幕上卡住不动」。
+    /// 两个后果是同一类：**没有任何人再请求一帧**。样式/可见性一变就把离屏位图丢掉
+    /// （dropCache / invalidateRenderCache），那一帧 updatePaintNode 返回 nullptr，
+    /// 而新档位建好后 onTierBuilt 只在 `cacheValid_ && cameraAtRest()` 时补帧 ——
+    /// 此时 cacheValid_ 正是 false，于是这一层永远空白，直到某个与它无关的事件
+    /// 碰巧把它弄脏（用户看到的就是「卡住」）。
+    ///
+    /// 判据必须是像素：属性（fill/visible/geometryReady）全都正确，画面却是空的。
+    /// 抓帧只用 grabWindow()，它**不会**弄脏 item —— 补丁前 200 次抓帧都画不出来。
+    void vectorLayerRedrawsItselfAfterToggle() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("VectorToggleRedrawTest");
+        AppController controller(nullptr, false);
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setVectorOverlay(true);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* mapView = window->findChild<QQuickItem*>("mapView");
+        auto* world = window->findChild<QQuickItem*>("vectorWorldLayer");
+        auto* province = window->findChild<QQuickItem*>("vectorProvinceLayer");
+        QVERIFY(mapView && world && province);
+        QVERIFY2(world->property("ready").toBool(), "vector data (.kvb) failed to load");
+        // 先制造几帧相机变化把首次绘制顶出来（35/105/6.0 是 MapView 的默认值，
+        // 直接 set 等于空操作，不会弄脏任何 item）。
+        mapView->setProperty("zoom", 6.4);
+        QTest::qWait(120);
+        mapView->setProperty("zoom", 6.0);   // z6：省界区也参与绘制
+
+        // 陆地填充色（纯矢量底图下 world 层的不透明填充）。
+        const QColor land = world->property("fill").value<QColor>();
+        QVERIFY2(land.alpha() > 0, "矢量底图下世界层必须是可绘制的不透明填充");
+        auto landPixels = [&]() {
+            const QImage img = window->grabWindow();
+            int n = 0;
+            for (int y = img.height() / 5; y < img.height() * 4 / 5; y += 4) {
+                for (int x = img.width() / 10; x < img.width() / 2; x += 4) {
+                    const QColor c = img.pixelColor(x, y);
+                    if (std::abs(c.red() - land.red()) < 4 &&
+                        std::abs(c.green() - land.green()) < 4 &&
+                        std::abs(c.blue() - land.blue()) < 4) ++n;
+                }
+            }
+            return n;
+        };
+        // 只抓帧，绝不调 layer->update()：那会掩盖掉「没人要帧」这个缺陷本身。
+        auto waitLandPixels = [&](int atLeast, int ms) {
+            QElapsedTimer timer;
+            timer.start();
+            int last = 0;
+            while (timer.elapsed() < ms) {
+                QTest::qWait(20);
+                last = landPixels();
+                if (last >= atLeast) return last;
+            }
+            return last;
+        };
+
+        // 首帧可能还在异步建几何/网格（GPU 后端三角化更慢），此时先给一次真实的相机
+        // 微调把首帧顶出来 —— 本用例要证的是「切换之后还能不能自己画回来」，
+        // 不是「首帧多快」。
+        int drawn = waitLandPixels(500, 12000);
+        if (drawn < 500) {
+            mapView->setProperty("zoom", 6.02);
+            drawn = waitLandPixels(500, 12000);
+        }
+        if (drawn < 500) {
+            // 失败时把当前画面落到取证目录：属性全对、画面全空，是这条缺陷的典型形态。
+            const QString dir = qEnvironmentVariable("KOMIRA_EVIDENCE_DIR");
+            if (!dir.isEmpty())
+                window->grabWindow().save(dir + "/vector-toggle-red.png");
+        }
+        QVERIFY2(drawn >= 500, qPrintable(QStringLiteral("初始状态矢量层就没画出来：%1 px").arg(drawn)));
+
+        // ① 底图 矢量 → 栅格：world 层变全透明，陆地填充必须消失。
+        controller.settings()->setBasemapId("petal");
+        QTRY_VERIFY_WITH_TIMEOUT(landPixels() < drawn / 20, 8000);
+        QCOMPARE(world->property("fill").value<QColor>().alpha(), 0);
+
+        // ② 底图 栅格 → 矢量：必须自己画回来（本轮缺陷点）。
+        controller.settings()->setBasemapId("vector");
+        const int back = waitLandPixels(500, 8000);
+        QVERIFY2(back >= 500,
+                 qPrintable(QStringLiteral("切回矢量底图后卡住：屏幕上只剩 %1 px 陆地填充").arg(back)));
+
+        // ③ 栅格底图 + 叠加：省界层是这一场景下唯一的矢量内容，同样要能自己恢复。
+        controller.settings()->setBasemapId("petal");
+        QTRY_VERIFY_WITH_TIMEOUT(landPixels() < back / 20, 8000);
+        auto provinceInk = [&]() {
+            qint64 bytes = 0, tris = 0;
+            QMetaObject::invokeMethod(province, "cacheBytesForTest", Q_RETURN_ARG(qint64, bytes));
+            QMetaObject::invokeMethod(province, "submittedTrianglesForTest", Q_RETURN_ARG(qint64, tris));
+            return bytes > 0 || tris > 0;
+        };
+        // 只看像素与节点内容，**不调 layer->update()**：缺陷恰恰是「没人要帧」。
+        auto waitProvince = [&]() {
+            QElapsedTimer timer;
+            timer.start();
+            while (timer.elapsed() < 8000) {
+                QTest::qWait(20);
+                window->grabWindow();
+                if (province->isVisible() && provinceInk()) return true;
+            }
+            return false;
+        };
+        QVERIFY2(waitProvince(), "栅格底图 + 叠加模式下省界层从未画出内容");
+
+        // 关掉叠加：省界层隐藏、缓存释放。
+        controller.settings()->setVectorOverlay(false);
+        QTRY_VERIFY_WITH_TIMEOUT(!province->isVisible(), 3000);
+        // 再打开：必须自己重新补画（缺陷点：Visible 脏位不在 ContentUpdateMask 里，
+        // Qt 根本不会因此调 updatePaintNode，而缓存刚被 dropCache() 扔掉）。
+        controller.settings()->setVectorOverlay(true);
+        QVERIFY2(waitProvince(), "关掉再打开矢量叠加后省界层卡住（不再补画）");
+
+        // ④ 底图在 矢量 ↔ 栅格 之间来回切、叠加保持开着：省界层在两种模式下都可见
+        //    （只是 z 不同），每一轮切换后都必须重新画出来。
+        for (int i = 0; i < 3; ++i) {
+            controller.settings()->setBasemapId(i % 2 ? QStringLiteral("petal")
+                                                      : QStringLiteral("vector"));
+            QVERIFY2(waitProvince(),
+                     qPrintable(QStringLiteral("第 %1 次切底图后省界层卡住").arg(i + 1)));
+        }
+    }
+
     void vectorLodTiersAndCacheRelease() {
         QTemporaryDir isolated;
         QVERIFY(isolated.isValid());
@@ -3991,6 +4246,117 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(std::abs(map->property("centerLon").toDouble() - targetLon) < 8.0, 3000);
     }
 
+    /// 回归：自动聚焦震中的**飞行途中**滚轮/按钮缩放，不得打断这次飞行。
+    ///
+    /// 用户原话「在自动聚焦震中的时候，就是移动过去的时候，缩放地图会打断动画」。
+    /// 旧行为：`zoomAt` 无条件 `moveCamera(...)`，先 `cameraMove.stop()` 再按**光标锚点**
+    /// 另起一段 180 ms 的纯缩放 —— 镜头当场停在半路，落点变成「半路的中点」，震中永远
+    /// 没飞到。滚一格只该改「最后多大」，不该取消「镜头正飞过去」。
+    ///
+    /// 判据落在**落点**而不是某一帧：飞行途中缩放后 `cameraTargetLat/Lon` 必须仍是原来的
+    /// 震中取景中心（旧实现会被锚点算出的中点覆盖），随后镜头必须真的收敛到那里，
+    /// 且最终 zoom = 请求的那一级。
+    void zoomingDuringFocusFlightKeepsFlight() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("FlightZoomTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        QVERIFY(map);
+        QTest::qWait(400);
+
+        EarthquakeEvent a;
+        a.id = a.eventId = "FLIGHTZOOM-A";
+        a.timestamp = now;
+        a.latitude = 30.6;
+        a.longitude = 104.0;
+        a.magnitude = 5.0;
+        a.depth = 10.0;
+        a.rawIntensity = 3.0;
+        controller.handleEvent(a, false, false);
+        QTest::qWait(800);   // 等入场取景补间结束
+        QVERIFY(map->property("following").toBool());
+
+        // 切到远处事件 B：600 ms 飞行。等它飞到途中再滚一格。
+        EarthquakeEvent b = a;
+        b.id = b.eventId = "FLIGHTZOOM-B";
+        b.latitude = 38.0;
+        b.longitude = 140.0;
+        b.magnitude = 7.2;
+        b.depth = 320.0;
+        b.location = "日本本州东岸近海深源地震（超长地名用来撑高 HUD 卡片高度）";
+        controller.handleEvent(b, false, false);
+        QTest::qWait(180);
+        QVERIFY2(map->property("cameraTweenMode").toString() == QLatin1String("flight"),
+                 "前置条件：此刻应处于聚焦飞行（flight 补间）中");
+        const double targetLat = map->property("cameraTargetLat").toDouble();
+        const double targetLon = map->property("cameraTargetLon").toDouble();
+        const double targetZoom = map->property("cameraTargetZoom").toDouble();
+        const double lonBeforeZoom = map->property("centerLon").toDouble();
+        QVERIFY2(std::abs(lonBeforeZoom - targetLon) > 5.0, "前置条件：飞行途中镜头还没到落点");
+
+        // 飞行途中滚一格：只改落点 zoom。
+        QVERIFY(QMetaObject::invokeMethod(map, "zoomAt", Q_ARG(QVariant, 640), Q_ARG(QVariant, 420),
+                                          Q_ARG(QVariant, 1.0)));
+        // ① 飞行没被换掉：仍是 flight 补间，且落点还是原来的震中取景中心。
+        QCOMPARE(map->property("cameraTweenMode").toString(), QStringLiteral("flight"));
+        QVERIFY2(std::abs(map->property("cameraTargetLat").toDouble() - targetLat) < 1e-9,
+                 qPrintable(QStringLiteral("飞行途中缩放改掉了落点纬度：%1 -> %2")
+                                .arg(targetLat).arg(map->property("cameraTargetLat").toDouble())));
+        QVERIFY2(std::abs(map->property("cameraTargetLon").toDouble() - targetLon) < 1e-9,
+                 qPrintable(QStringLiteral("飞行途中缩放改掉了落点经度：%1 -> %2")
+                                .arg(targetLon).arg(map->property("cameraTargetLon").toDouble())));
+        // ② 落点 zoom 换成了请求的那一级。
+        const double wantZoom = std::min(18.0, std::round(targetZoom) + 1.0);
+        QVERIFY2(std::abs(map->property("cameraTargetZoom").toDouble() - wantZoom) < 1e-9,
+                 qPrintable(QStringLiteral("缩放没落到请求的层级：want=%1 got=%2")
+                                .arg(wantZoom).arg(map->property("cameraTargetZoom").toDouble())));
+        // ③ 镜头继续往落点飞（不是冻在半路，也不是瞬移过去）。
+        QList<double> lons;
+        for (int t = 0; t < 700; t += 20) {
+            lons.append(map->property("centerLon").toDouble());
+            QTest::qWait(20);
+        }
+        lons.append(map->property("centerLon").toDouble());
+        QVERIFY2(std::abs(lons.last() - targetLon) < 0.5,
+                 qPrintable(QStringLiteral("缩放后镜头没有飞到震中落点：%1 -> %2（落点 %3）")
+                                .arg(lonBeforeZoom).arg(lons.last()).arg(targetLon)));
+        double maxStep = 0.0;
+        int maxStepAt = 0;
+        for (int i = 1; i < lons.size(); ++i) {
+            const double step = std::abs(lons[i] - lons[i - 1]);
+            if (step > maxStep) { maxStep = step; maxStepAt = i * 20; }
+        }
+        const double remaining = std::abs(targetLon - lonBeforeZoom);
+        QVERIFY2(maxStep < remaining * 0.4,
+                 qPrintable(QStringLiteral("缩放后镜头瞬移（t=%1ms 单步 %2°，剩余 %3°）")
+                                .arg(maxStepAt).arg(maxStep, 0, 'f', 2).arg(remaining, 0, 'f', 1)));
+        // ④ 最终 zoom 就是请求的那一级，且补间已结束。
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(map->property("zoom").toDouble() - wantZoom) < 0.02, 2000);
+        QCOMPARE(map->property("cameraTweenMode").toString(), QStringLiteral("flight"));
+        // ⑤ 用户接管语义不变：滚轮仍把镜头归属交回用户（此后波前 tick 不得抢镜头）。
+        QVERIFY2(!map->property("following").toBool(), "滚轮缩放后仍应退出自动跟随");
+    }
+
     void settingsNavigationAndTheme() {
         QTemporaryDir isolated;
         QVERIFY(isolated.isValid());
@@ -5694,6 +6060,460 @@ private slots:
         QTRY_VERIFY(!info->isVisible());
     }
 
+    /// 历史震中：地图在「当前事件」的红色 X 之外，按用户设定的口径（最近 N 个 /
+    /// 最近 N 小时）画出历史目录里的地震。
+    ///
+    /// 用户原话：「允许用户自定义地图显示的历史震中，按照数量或者是按照时间显示」，
+    /// 并明确默认行为要「和现在一样」（只显示最近一个）。本用例锁住四件事：
+    ///   · 默认口径下地图上不多出一个点（当前事件那一个仍由事件标记画）；
+    ///   · 按数量：显示 N 个（含当前事件），且**只取历史目录**（同一份报文的多路聚合
+    ///     源不重复出点，与侧栏逐行一致）；
+    ///   · 按时间：只取窗口内的，窗口外的老事件不画，且改小时数立刻生效；
+    ///   · 悬停复用震中浮层（`EpicenterInfo`）显示那个历史点的地名。
+    void historyEpicentersFollowQuantityAndTimeSettings() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("HistoryEpicenterTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setVectorOverlay(false);
+        controller.settings()->setShowStationLayer(false);
+        controller.settings()->setEnableSoundAlert(false);
+
+        // 目录：五场地震，发震时刻依次往前推（间隔 2 h，最后一条 30 h 前）。
+        // 地点各不相同，按「哪个点被画出来」就能反推它取的是哪一条。
+        const auto makeQuake = [&](int index, long long ageMs, double lat, double lon,
+                                   double mag, const char* place) {
+            EarthquakeEvent e;
+            e.id = e.eventId = QStringLiteral("HIST-%1").arg(index).toStdString();
+            e.sourceProvider = "Wolfx";
+            e.sourceAgency = "CENC";
+            e.source = "中国地震台网";
+            e.sourceId = "wolfx";
+            e.timestamp = now - ageMs;
+            e.reportTime = e.timestamp;
+            e.latitude = lat;
+            e.longitude = lon;
+            e.depth = 10.0;
+            e.magnitude = mag;
+            e.location = place;
+            e.isInfo = true;
+            e.determination = "reviewed";
+            e.maxIntensityRaw = 4.0;
+            e.maxIntensityText = "IV";
+            controller.handleEvent(e, false, true);
+            return QString::fromStdString(e.identity());
+        };
+        const QString newest = makeQuake(0, 10 * 60'000LL, 30.0, 104.0, 6.1, "四川雅安");
+        makeQuake(1, 2 * 3600'000LL, 25.0, 102.0, 4.2, "云南昆明");
+        makeQuake(2, 4 * 3600'000LL, 35.0, 103.0, 3.5, "甘肃兰州");
+        makeQuake(3, 6 * 3600'000LL, 40.0, 110.0, 5.0, "内蒙古包头");
+        makeQuake(4, 30 * 3600'000LL, 45.0, 120.0, 4.8, "内蒙古东部");
+        QTest::qWait(120);
+        QCOMPARE(controller.eventModel()->rowCount(), 5);
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window && QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        auto* layer = window->findChild<QQuickItem*>("historyEpicenterLayer");
+        auto* cross = window->findChild<QQuickItem*>("hypocenterMarker");
+        QVERIFY(map && layer && cross);
+        // 取证视角：关掉跟随（新事件到达会让镜头自己飞回震中，取证图只拍得到那一个点），
+        // 取 z6 全国视野 —— 省界在 `provinceBorderMinZoom = 5` 以上才画，有底图轮廓才能
+        // 看出「历史点压在底图上」。z4 时矢量层的 LOD 档位尚未建好、首帧是空底图。
+        // z5 才装得下三条（30°N/104°E、25°N/102°E、35°N/103°E）；
+        // 省界在 `provinceBorderMinZoom = 5` 以上才画，正好有底图轮廓。
+        map->setProperty("following", false);
+        map->setProperty("centerLat", 31.0);
+        map->setProperty("centerLon", 106.0);
+        map->setProperty("zoom", 5.0);
+        QTest::qWait(400);
+
+        // ---- ① 默认：开，但只显示最近 1 个 —— 那一个就是当前事件，历史层 0 个点 ----
+        QVERIFY(controller.settings()->showHistoryEpicenter());
+        QCOMPARE(controller.settings()->historyEpicenterMode(), QStringLiteral("count"));
+        QCOMPARE(controller.settings()->historyEpicenterCount(), 1);
+        QCOMPARE(controller.property("historyMarkers").toList().size(), 0);
+        QCOMPARE(layer->property("count").toInt(), 0);
+        QVERIFY2(cross->isVisible(), "当前事件的红色 X 仍要画");
+
+        // ---- ② 按数量 3 个：当前事件 + 最近 2 条历史 = 历史层画 2 个点 ----
+        controller.settings()->setHistoryEpicenterCount(3);
+        QTRY_COMPARE(layer->property("count").toInt(), 2);
+        QTRY_COMPARE(controller.property("historyMarkers").toList().size(), 2);
+        {
+            const QVariantList markers = controller.property("historyMarkers").toList();
+            // 顺序是发震时刻倒序：紧接着的那一场在前。
+            QCOMPARE(markers.at(0).toMap().value("location").toString(),
+                     QStringLiteral("云南昆明"));
+            QCOMPARE(markers.at(1).toMap().value("location").toString(),
+                     QStringLiteral("甘肃兰州"));
+            // 当前事件不能重复出现在历史层里（否则同一个震中会有两个符号）。
+            for (const QVariant& value : markers)
+                QVERIFY(value.toMap().value("id").toString() != newest);
+            // 载荷是精简版：浮层要的字段都在，distance/rawJson 这类字段不在。
+            const QVariantMap first = markers.at(0).toMap();
+            QVERIFY(first.contains("latitude") && first.contains("longitude"));
+            QVERIFY(first.contains("timeText") && first.contains("magnitudeText"));
+            QVERIFY(!first.contains("distance"));
+            QVERIFY(!first.contains("rawJson"));
+        }
+
+        // 点位必须落在视口内，且**投影与命中互为逆运算**：把命中查询喂回点位自己的
+        // 屏幕坐标，必须原样命中同一个下标（错位比不画更糟）。
+        {
+            QVariant pos;
+            QVERIFY(QMetaObject::invokeMethod(map, "historyMarkerScreen", Q_RETURN_ARG(QVariant, pos),
+                                              Q_ARG(int, 1)));
+            const QVariantMap point = pos.toMap();
+            const double px = point.value("x").toDouble();
+            const double py = point.value("y").toDouble();
+            QVERIFY2(px > 0.0 && px < map->width(), "历史震中点水平越出视口");
+            QVERIFY2(py > 0.0 && py < map->height(), "历史震中点垂直越出视口");
+            int hit = -99;
+            QVERIFY(QMetaObject::invokeMethod(map, "historyMarkerAt", Q_RETURN_ARG(int, hit),
+                                              Q_ARG(double, px), Q_ARG(double, py)));
+            QCOMPARE(hit, 1);
+            // 远离任何点时命中 -1（不能把浮层挂在半空）。
+            int miss = -99;
+            QVERIFY(QMetaObject::invokeMethod(map, "historyMarkerAt", Q_RETURN_ARG(int, miss),
+                                              Q_ARG(double, px + 200.0), Q_ARG(double, py + 200.0)));
+            QCOMPARE(miss, -1);
+        }
+        // 取证前抖一下镜头：VectorMapItem 的首帧不建缓存（LOD 档位还在后台构建），
+        // 要等下一次相机变化才真正光栅化。不抖这一下，取证图就是一张空底图。
+        map->setProperty("centerLat", 35.6);
+        map->setProperty("centerLat", 35.0);
+        QVERIFY2(QTest::qWaitFor([&] {
+                     const QImage frame = window->grabWindow();
+                     if (frame.isNull()) return false;
+                     // 矢量层是低饱和灰白配色：靠「明显暗于背景的像素占比」判断它画出来了
+                     // （与 vectorBasemapSuppressesRasterTiles 同一套口径）。
+                     int ink = 0;
+                     int total = 0;
+                     for (int y = frame.height() / 4; y < frame.height() * 3 / 4; y += 3) {
+                         for (int x = frame.width() / 10; x < frame.width() / 2; x += 3) {
+                             ++total;
+                             if (qGray(frame.pixel(x, y)) < 150) ++ink;
+                         }
+                     }
+                     return total > 0 && double(ink) / total > 0.002;
+                 }, 15000),
+                 "矢量底图没有画出内容，取证图不可信");
+        QTest::qWait(200);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/72-history-epicenters-count.png"));
+
+        // ---- ③ 按时间：24 h 窗口里 4 场（另一场在 30 h 前） ----
+        controller.settings()->setHistoryEpicenterMode(QStringLiteral("time"));
+        controller.settings()->setHistoryEpicenterHours(24);
+        QTRY_COMPARE(controller.property("historyMarkers").toList().size(), 3);
+        QTRY_COMPARE(layer->property("count").toInt(), 3);
+        for (const QVariant& value : controller.property("historyMarkers").toList()) {
+            QVERIFY(value.toMap().value("location").toString() != QStringLiteral("内蒙古东部"));
+        }
+        // 缩到 5 h：只剩 2 h / 4 h 那两场。
+        controller.settings()->setHistoryEpicenterHours(5);
+        QTRY_COMPARE(controller.property("historyMarkers").toList().size(), 2);
+        // 放大到一周：30 h 前那场回来。
+        controller.settings()->setHistoryEpicenterHours(168);
+        QTRY_COMPARE(controller.property("historyMarkers").toList().size(), 4);
+        bool sawOldest = false;
+        for (const QVariant& value : controller.property("historyMarkers").toList()) {
+            if (value.toMap().value("location").toString() == QStringLiteral("内蒙古东部"))
+                sawOldest = true;
+        }
+        QVERIFY2(sawOldest, "168 h 窗口必须包含 30 h 前那一场");
+        // 时间口径的四个点跨 20 个纬度，取证时拉到 z5 才装得下。
+        map->setProperty("following", false);
+        map->setProperty("centerLat", 35.0);
+        map->setProperty("centerLon", 110.0);
+        map->setProperty("zoom", 5.0);
+        QTest::qWait(400);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/72b-history-epicenters-time.png"));
+
+        // ---- ④ 悬停：复用震中浮层，内容是该历史点的地名 ----
+        // 先把镜头拉远到全国视野：z6 下「云南昆明」已经出画，指针根本碰不到那个点。
+        map->setProperty("centerLat", 33.0);
+        map->setProperty("centerLon", 108.0);
+        map->setProperty("zoom", 4.0);
+        QTest::qWait(200);
+        auto* info = window->findChild<QQuickItem*>("epicenterInfo");
+        QVERIFY(info);
+        {
+            QVariant pos;
+            QVERIFY(QMetaObject::invokeMethod(map, "historyMarkerScreen", Q_RETURN_ARG(QVariant, pos),
+                                              Q_ARG(int, 0)));
+            const QVariantMap point = pos.toMap();
+            const QPointF scene = map->mapToScene(QPointF(point.value("x").toDouble(),
+                                                          point.value("y").toDouble()));
+            QTest::mouseMove(window, QPoint(2, 2));
+            QTest::qWait(30);
+            QTest::mouseMove(window, scene.toPoint());
+            QTRY_VERIFY_WITH_TIMEOUT(info->isVisible(), 1500);
+            QCOMPARE(info->property("event").toMap().value("location").toString(),
+                     QStringLiteral("云南昆明"));
+            // 移开指针要收起（浮层不是常驻标签）。
+            QTest::mouseMove(window, QPoint(2, 2));
+            QTRY_VERIFY(!info->isVisible());
+        }
+
+        // ---- ⑤ 关掉开关：一个历史点都不画（当前事件的 X 仍在） ----
+        controller.settings()->setShowHistoryEpicenter(false);
+        QTRY_COMPARE(layer->property("count").toInt(), 0);
+        QVERIFY(cross->isVisible());
+        QVERIFY(!layer->isVisible());
+        controller.settings()->setShowHistoryEpicenter(true);
+        QTRY_COMPARE(layer->property("count").toInt(), 4);
+
+        // ---- ⑥ 设置页：开关 / 方式下拉 / 两条滑杆都接到设置项上 ----
+        window->setProperty("showSettings", true);
+        auto* page = window->findChild<QQuickItem*>("settingsPage");
+        QVERIFY(page);
+        QTRY_VERIFY(clickByName(window, "settingsNav-map"));
+        QTRY_COMPARE(page->property("currentSection").toInt(), 2);
+        auto* scroll = window->findChild<QQuickItem*>("settingsScroll");
+        QVERIFY(scroll);
+        const auto scrollTo = [&](QQuickItem* item) {
+            QVERIFY(item);
+            const QPointF inFlick =
+                item->mapToItem(scroll, QPointF(item->width() / 2, item->height() / 2));
+            scroll->setProperty("contentY",
+                                scroll->property("contentY").toReal() + inFlick.y()
+                                    - scroll->height() * 0.45);
+            QTest::qWait(120);
+        };
+        auto* combo = findVisualItem(window, "historyEpicenterModeCombo");
+        auto* countSlider = findVisualItem(window, "historyEpicenterCountSlider-control");
+        auto* hoursSlider = findVisualItem(window, "historyEpicenterHoursSlider-control");
+        auto* toggle = findVisualItem(window, "historyEpicenterSwitch");
+        QVERIFY(combo && countSlider && hoursSlider && toggle);
+        scrollTo(toggle);
+        QTest::qWait(150);
+        QVERIFY(window->grabWindow().save(evidenceDirectory(window)
+                                          + "/72c-settings-history-epicenter.png"));
+        scrollTo(combo);
+        // 当前是「按时间」：时间滑杆可用，数量滑杆灰掉。
+        QTRY_VERIFY(hoursSlider->isEnabled());
+        QVERIFY(!countSlider->isEnabled());
+        QCOMPARE(combo->property("currentIndex").toInt(), 1);
+        // 在下拉上真的选「按数量」：设置跟着变，可用的滑杆也跟着换。
+        QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, 0));
+        QTRY_COMPARE(controller.settings()->historyEpicenterMode(), QStringLiteral("count"));
+        QTRY_VERIFY(countSlider->isEnabled());
+        QTRY_VERIFY(!hoursSlider->isEnabled());
+        // 反向：外部改设置，下拉与开关都要跟上（Binding，不是被拖断的字面绑定）。
+        controller.settings()->setHistoryEpicenterMode(QStringLiteral("time"));
+        QTRY_COMPARE(combo->property("currentIndex").toInt(), 1);
+        controller.settings()->setShowHistoryEpicenter(false);
+        QTRY_VERIFY(!toggle->property("checked").toBool());
+        controller.settings()->setShowHistoryEpicenter(true);
+        QTRY_VERIFY(toggle->property("checked").toBool());
+        // 恢复默认：数量回到 1，地图上不再多出历史点。
+        controller.settings()->resetToDefaults();
+        QTRY_COMPARE(controller.settings()->historyEpicenterCount(), 1);
+        QTRY_COMPARE(controller.settings()->historyEpicenterMode(), QStringLiteral("count"));
+        QTRY_COMPARE(layer->property("count").toInt(), 0);
+
+        // ---- ⑦ 上百个点也不卡：按时间一周口径下，重建一次的耗时必须有界 ----
+        // 「按时间」不设条数上限，真实目录能有上百条；这条路径每次目录刷新都会跑，
+        // 所以它必须是 O(n) 的轻量拼装，而不是又走一遍全字段 toMap。
+        for (int i = 0; i < 120; ++i) {
+            EarthquakeEvent bulk;
+            bulk.id = bulk.eventId = QStringLiteral("BULK-%1").arg(i).toStdString();
+            bulk.sourceProvider = "Wolfx";
+            bulk.sourceAgency = "CENC";
+            bulk.source = "中国地震台网";
+            bulk.sourceId = "wolfx";
+            bulk.timestamp = now - (5 + i) * 60'000LL;
+            bulk.reportTime = bulk.timestamp;
+            bulk.latitude = 22.0 + (i % 20) * 0.6;
+            bulk.longitude = 100.0 + (i % 18) * 0.7;
+            bulk.depth = 10.0;
+            bulk.magnitude = 2.5 + (i % 7) * 0.4;
+            bulk.location = QStringLiteral("批量台网 %1").arg(i).toStdString();
+            bulk.isInfo = true;
+            bulk.determination = "reviewed";
+            controller.handleEvent(bulk, false, true);
+        }
+        controller.settings()->setHistoryEpicenterMode(QStringLiteral("time"));
+        controller.settings()->setHistoryEpicenterHours(168);
+        QTest::qWait(120);
+        const int bulkCount = controller.property("historyMarkers").toList().size();
+        QVERIFY2(bulkCount >= 120, qPrintable(
+            QStringLiteral("按时间口径应画出全部历史点，实测 %1").arg(bulkCount)));
+        double buildMs = -1.0;
+        QVERIFY(QMetaObject::invokeMethod(&controller, "historyMarkersBuildMsForTest",
+                                          Q_RETURN_ARG(double, buildMs)));
+        QVERIFY2(buildMs >= 0.0 && buildMs < 40.0,
+                 qPrintable(QStringLiteral("%1 个历史震中的重建耗时 %2 ms，超出预算")
+                                .arg(bulkCount).arg(buildMs)));
+        // 点位多了以后命中仍然正确：随便取一个下标，喂回它自己的屏幕坐标必须命中自己。
+        for (const int probe : {0, bulkCount / 2, bulkCount - 1}) {
+            QVariant pos;
+            QVERIFY(QMetaObject::invokeMethod(map, "historyMarkerScreen",
+                                              Q_RETURN_ARG(QVariant, pos), Q_ARG(int, probe)));
+            const QVariantMap point = pos.toMap();
+            int hit = -99;
+            QVERIFY(QMetaObject::invokeMethod(map, "historyMarkerAt", Q_RETURN_ARG(int, hit),
+                                              Q_ARG(double, point.value("x").toDouble()),
+                                              Q_ARG(double, point.value("y").toDouble())));
+            QCOMPARE(hit, probe);
+        }
+    }
+
+    /// 回归：地图「当前事件」那一个必须永远是最新的那一场，而且**不必碰任何设置**。
+    ///
+    /// 用户原话：「检查历史震中设置，我发现现在我选择的显示一个，但是显示的不是最新的
+    /// 一个地震事件」，随后补充「重新改下设置倒是恢复正常了」。
+    ///
+    /// 根因：`displayedEvent()` 直接取 `history_.first()`，而「按发震时刻倒序」这条不变量
+    /// 只有 `rebuildHistory()` 在维护；目录路径的 `upsertHistory()` 只做 `push_back`，
+    /// 于是运行期新到的目录事件全被堆到表尾，红 X 一直画在**上一次排序时**最新的那一条
+    /// 上（通常是启动时载入的那条）。真正最新的那场在 `catalogEvents()` 里排第一、又被
+    /// 当成「当前事件」占掉数量口径的那一格（预算 `wantCount - 1`），历史层一个点都不多画
+    /// —— 画面上正是「只有一个标记，但不是最新的那一个」。改设置会走
+    /// `applySourceSettings → recomputeEvents → rebuildHistory` 重新排一次序，所以能「恢复
+    /// 正常」，缺陷只在「长时间不碰设置」时显形。
+    ///
+    /// 本用例锁四件事：
+    ///   · `history_` 的倒序不变量：运行期新事件必须插到表头，不必等重启或改设置；
+    ///   · 表头换人时必须重发 `mapEventChanged`，否则 QML 的 `window.mapEvent` 绑定停在
+    ///     旧事件上（C++ 算对了，画面仍是旧的）；
+    ///   · 数量口径 1 个时历史层必须是空集：既不能把最新那场降级成历史点，也不能让老的
+    ///     那场继续占着「当前事件」的位置；
+    ///   · 表头那一条被就地修正（同一 id、更晚的测定）时，画面也要跟着发通知。
+    void mapShowsNewestCatalogEventWithoutTouchingSettings() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("NewestMapEventTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setVectorOverlay(false);
+        controller.settings()->setShowStationLayer(false);
+        controller.settings()->setEnableSoundAlert(false);
+        // 用户当时的设置：按数量 1 个（那一个就是当前事件），历史层因此应当是空集。
+        QCOMPARE(controller.settings()->historyEpicenterMode(), QStringLiteral("count"));
+        QCOMPARE(controller.settings()->historyEpicenterCount(), 1);
+
+        // 目录事件按「先老后新」逐条喂进来 —— 正是启动回填 + 后续轮询的真实顺序。
+        const auto makeQuake = [&](int index, long long ageMs, double lat, double lon, double mag,
+                                   const char* place) {
+            EarthquakeEvent e;
+            e.id = e.eventId = QStringLiteral("NEWEST-%1").arg(index).toStdString();
+            e.sourceProvider = "Wolfx";
+            e.sourceAgency = "CENC";
+            e.source = "中国地震台网";
+            e.sourceId = "wolfx";
+            e.timestamp = now - ageMs;
+            e.reportTime = e.timestamp;
+            e.latitude = lat;
+            e.longitude = lon;
+            e.depth = 10.0;
+            e.magnitude = mag;
+            e.location = place;
+            e.isInfo = true;
+            e.determination = "reviewed";
+            e.maxIntensityRaw = 4.0;
+            e.maxIntensityText = "IV";
+            controller.handleEvent(e, false, true);
+            return QString::fromStdString(e.identity());
+        };
+        // 历史层实际画出来的地名（顺序 = 发震时刻倒序，与侧栏一致）。
+        const auto markerText = [&]() {
+            QStringList out;
+            for (const QVariant& value : controller.property("historyMarkers").toList())
+                out << value.toMap().value("location").toString();
+            return out.join(QLatin1Char(','));
+        };
+        QSignalSpy mapEventSpy(&controller, &AppController::mapEventChanged);
+        QSignalSpy markersSpy(&controller, &AppController::historyMarkersChanged);
+
+        // ---- ① 先只有一场：它就是最新的，地图画它（前提自检） ----
+        const QString older = makeQuake(0, 6 * 360'000LL, 25.0, 102.0, 4.2, "云南昆明");
+        // 等历史震中的 0 ms 合并定时器跑完，后面每一步都从「已结算」的状态出发。
+        QTest::qWait(60);
+        QCOMPARE(controller.mapEvent().toMap().value("id").toString(), older);
+        QCOMPARE(controller.property("historyMarkers").toList().size(), 0);
+
+        // ---- ② 运行期新到一场更晚的：红 X 必须立刻换到它身上 ----
+        // 这一步刻意不碰任何设置项（用户改设置才能恢复，正是缺陷的指纹）。
+        mapEventSpy.clear();
+        const QString newest = makeQuake(1, 10 * 60'000LL, 30.0, 104.0, 6.1, "四川雅安");
+        QVERIFY2(QString::fromStdString(controller.history_.first().identity()) == newest,
+                 "新到的目录事件没有落到 history_ 表头：displayedEvent() 仍会取到旧事件");
+        QCOMPARE(controller.mapEvent().toMap().value("id").toString(), newest);
+        QVERIFY2(mapEventSpy.count() >= 1,
+                 "目录新事件接管「当前事件」时必须重发 mapEventChanged，否则 QML 绑定停在旧事件上");
+        // 数量口径 1 个：当前事件只画红 X，历史层必须是空集。
+        QTRY_COMPARE(controller.property("historyMarkers").toList().size(), 0);
+
+        // ---- ③ 口径 3 个：当前事件 + 历史 2 个里只存在的一条 ----
+        controller.settings()->setHistoryEpicenterCount(3);
+        QTRY_COMPARE(markerText(), QStringLiteral("云南昆明"));
+
+        // ---- ④ 再来一场更晚的：当前事件跟着换，被顶下来的那场补进历史层 ----
+        mapEventSpy.clear();
+        markersSpy.clear();
+        const QString newer = makeQuake(2, 60'000LL, 35.0, 103.0, 5.0, "甘肃兰州");
+        QCOMPARE(controller.mapEvent().toMap().value("id").toString(), newer);
+        QVERIFY2(mapEventSpy.count() >= 1, "表头换人时必须重发 mapEventChanged");
+        QTRY_COMPARE(markerText(), QStringLiteral("四川雅安,云南昆明"));
+        QVERIFY2(markersSpy.count() >= 1, "被顶下来的那场要补进历史层，必须重发 historyMarkersChanged");
+        // 当前事件不能同时出现在历史层里（否则同一个震中会有两个符号）。
+        for (const QVariant& value : controller.property("historyMarkers").toList())
+            QVERIFY(value.toMap().value("id").toString() != newer);
+
+        // ---- ⑤ 表头那一条被就地修正（同一 id、更晚的测定）：画面也要跟着发通知 ----
+        // 只改内容不改时刻，上面「表头换人」的判据不成立 —— 必须单独覆盖，否则用户看到
+        // 的仍是修正前的震级/震中。
+        mapEventSpy.clear();
+        {
+            EarthquakeEvent revised;
+            revised.id = revised.eventId = "NEWEST-2";
+            revised.sourceProvider = "Wolfx";
+            revised.sourceAgency = "CENC";
+            revised.source = "中国地震台网";
+            revised.sourceId = "wolfx";
+            revised.timestamp = now - 60'000LL;
+            revised.reportTime = revised.timestamp;
+            revised.latitude = 35.0;
+            revised.longitude = 103.0;
+            revised.depth = 10.0;
+            revised.magnitude = 5.5;
+            revised.location = "甘肃兰州";
+            revised.isInfo = true;
+            revised.determination = "reviewed";
+            revised.maxIntensityRaw = 4.0;
+            revised.maxIntensityText = "IV";
+            controller.handleEvent(revised, false, true);
+        }
+        QCOMPARE(controller.mapEvent().toMap().value("magnitudeText").toString(),
+                 QStringLiteral("5.5"));
+        QVERIFY2(mapEventSpy.count() >= 1,
+                 "当前事件被就地修正时也必须重发 mapEventChanged（震级/震中都变了）");
+        // 表头的内容修正不能把行序弄丢：它仍是最新的一条，历史层不含它。
+        QTRY_COMPARE(markerText(), QStringLiteral("四川雅安,云南昆明"));
+    }
+
     /// P/S 波前的「消失条件」可自定义：按烈度（默认）/ 按距离 / 按时间。
     ///
     /// 三种口径共用同一条渐隐曲线（前 95% 不透明、最后 5% 归零），差别只在「走到哪算消失」。
@@ -7170,6 +7990,37 @@ private slots:
         QVERIFY2(span > 0.01,
                  qPrintable(QStringLiteral("跟随期 zoom 几乎未变（%1），判据没有真正生效")
                                 .arg(span)));
+    }
+
+    /// 回归：1.3.6 的 Nix 包在没有可用 EGL 的机器上 SIGABRT（Sentry 事件 2b12ecd0）。
+    /// 根因是 Qt 在**没有任何槽**连着 QQuickWindow::sceneGraphError 时会 qFatal ——
+    /// 整个进程连同托盘、提示音、预警逻辑一起被带走。这里锁住兜底本身：先挂兜底、
+    /// 再加载窗口，加载出来的每个窗口都必须已经挂上（且只挂一次）。
+    void sceneGraphErrorGuardAttachedToEveryLoadedWindow() {
+        const int before = komira::sceneGraphErrorGuardCount();
+
+        QQmlApplicationEngine engine;
+        komira::attachSceneGraphErrorHandler(&engine); // 必须早于 load：Qt 在首次渲染时才判
+        engine.loadData(QByteArrayLiteral(R"QML(
+import QtQuick
+import QtQuick.Window
+Window {
+    width: 320; height: 240
+    visible: false
+    Rectangle { anchors.fill: parent; color: "transparent" }
+}
+)QML"));
+        QCOMPARE(engine.rootObjects().size(), 1);
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+
+        QCOMPARE(komira::sceneGraphErrorGuardCount(), before + 1);
+        QVERIFY2(window->property("_komiraSceneGraphGuarded").toBool(),
+                 "根窗口没有挂上 sceneGraphError 兜底 —— Qt 会退回 qFatal");
+
+        // 幂等：再挂一次不该重复连接（否则同一个错误会被上报两次、退出两次）。
+        komira::attachSceneGraphErrorHandler(&engine);
+        QCOMPARE(komira::sceneGraphErrorGuardCount(), before + 1);
     }
 };
 QTEST_MAIN(GuiTest)

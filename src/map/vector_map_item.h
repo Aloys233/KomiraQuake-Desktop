@@ -358,6 +358,8 @@ private:
     LodTierPtr resolveTier(const std::string& layer, bool gcj, int wanted);
     /// 相机是否停在整数层级（静止）。换 LOD 档位只在静止时做，避免缩放动画中途重绘。
     bool cameraAtRest() const;
+    /// 「本帧无可绘制内容」时清掉上一帧的节点：返回 nullptr 不会让 Qt 摘掉旧子树。
+    static void dropStaleNode(QSGNode* oldNode);
     /// 本层当前是否有任何可绘制内容（空层跳过：区县层无着色、叠加模式下的世界层）。
     static bool hasDrawableContent(const RenderState& state);
     /// 释放离屏位图与其纹理引用。

@@ -134,6 +134,8 @@ qt_add_executable(komiraquake WIN32
 
     # app
     src/app/app_controller.cpp
+    src/app/render_backend.h
+    src/app/render_backend.cpp
 
     # map
     src/map/vector_map_item.cpp
@@ -199,6 +201,7 @@ set(KOMIRA_QML_FILES
     qml/EstimateMarker.qml
     qml/HypocenterCross.qml
     qml/EpicenterInfo.qml
+    qml/HistoryEpicenterMarker.qml
     qml/StationTooltip.qml
     qml/SettingsPage.qml
     qml/settings/AppearanceSection.qml

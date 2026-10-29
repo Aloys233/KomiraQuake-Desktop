@@ -40,6 +40,15 @@ public:
     Q_PROPERTY(int waveFadeDistanceKm READ waveFadeDistanceKm WRITE setWaveFadeDistanceKm NOTIFY waveFadeDistanceKmChanged)
     /// 时间口径的消失时长（秒，30–3600）。默认 300。
     Q_PROPERTY(int waveFadeSeconds READ waveFadeSeconds WRITE setWaveFadeSeconds NOTIFY waveFadeSecondsChanged)
+    /// 在上一次事件的红色 X 之外，把历史目录里的地震也画到地图上（默认开，但默认只
+    /// 显示「最近 1 个」= 与改动前完全一样）。
+    Q_PROPERTY(bool showHistoryEpicenter READ showHistoryEpicenter WRITE setShowHistoryEpicenter NOTIFY showHistoryEpicenterChanged)
+    /// 历史震中的取数口径：`count`（默认，最近 N 个）/ `time`（最近 N 小时内的全部）。
+    Q_PROPERTY(QString historyEpicenterMode READ historyEpicenterMode WRITE setHistoryEpicenterMode NOTIFY historyEpicenterModeChanged)
+    /// 数量口径的个数（1–100）。默认 1。
+    Q_PROPERTY(int historyEpicenterCount READ historyEpicenterCount WRITE setHistoryEpicenterCount NOTIFY historyEpicenterCountChanged)
+    /// 时间口径的小时数（1–168）。默认 24。**与数量口径的数值互不改写**。
+    Q_PROPERTY(int historyEpicenterHours READ historyEpicenterHours WRITE setHistoryEpicenterHours NOTIFY historyEpicenterHoursChanged)
     Q_PROPERTY(int intensityStandard READ intensityStandard WRITE setIntensityStandard NOTIFY intensityStandardChanged)
     Q_PROPERTY(double localIntensityFilter READ localIntensityFilter WRITE setLocalIntensityFilter NOTIFY localIntensityFilterChanged)
     Q_PROPERTY(bool enableWarnings READ enableWarnings WRITE setEnableWarnings NOTIFY enableWarningsChanged)
@@ -235,6 +244,46 @@ public:
     void setStackStationCards(bool v) { set("stackStationCards", v); }
     bool showWavefront() const { return s_.value("showWavefront", true).toBool(); }
     void setShowWavefront(bool v) { set("showWavefront", v); }
+
+    // ---- 地图上的历史震中 --------------------------------------------------------
+    //
+    // 除当前焦点/最近一次事件的红色 X 之外，地图还可以把历史目录里的地震逐个画出来。
+    // 「画几个」有两种口径，与波前消失一样**各存一份、互不改写**（切回来数值还在）：
+    //   count（默认）  最近的 N 个（1–100）
+    //   time           最近 N 小时内的全部（1–168 h）
+    //
+    // 默认 count = 1：外观与改动前一致 —— 唯一那个点正是「最近一次事件」，由当前事件
+    // 标记负责画，历史层不重复画（见 AppController::historyMarkers）。历史点只是地图
+    // 参照，不参与焦点、不画波前、不产生任何提醒。
+
+    /// 是否在地图上显示历史震中。
+    bool showHistoryEpicenter() const { return s_.value("showHistoryEpicenter", true).toBool(); }
+    void setShowHistoryEpicenter(bool v) { set("showHistoryEpicenter", v); }
+
+    static constexpr const char* kDefaultHistoryEpicenterMode = "count";
+
+    QString historyEpicenterMode() const {
+        const QString mode = s_.value("historyEpicenterMode", kDefaultHistoryEpicenterMode).toString();
+        // 未知值（手改配置 / 旧版本残留）回落到按数量，不让地图突然什么都画不出来。
+        if (mode == QLatin1String("count") || mode == QLatin1String("time")) return mode;
+        return QString::fromLatin1(kDefaultHistoryEpicenterMode);
+    }
+    void setHistoryEpicenterMode(const QString& v) {
+        const QString mode = (v == QLatin1String("time")) ? v
+                                                          : QString::fromLatin1(kDefaultHistoryEpicenterMode);
+        set("historyEpicenterMode", mode);
+    }
+    /// 数量口径的个数。上限 100 与历史库保留量级（约 200 条）对齐：再大也画不满。
+    int historyEpicenterCount() const {
+        return std::clamp(s_.value("historyEpicenterCount", 1).toInt(), 1, 100);
+    }
+    void setHistoryEpicenterCount(int v) { set("historyEpicenterCount", std::clamp(v, 1, 100)); }
+    /// 时间口径的小时数。上限一周（168 h）：目录只保留最近 200 条，再长的窗口里
+    /// 老条目会随目录淘汰而忽隐忽现，不如不给。
+    int historyEpicenterHours() const {
+        return std::clamp(s_.value("historyEpicenterHours", 24).toInt(), 1, 168);
+    }
+    void setHistoryEpicenterHours(int v) { set("historyEpicenterHours", std::clamp(v, 1, 168)); }
 
     // ---- P/S 波前「什么时候消失」------------------------------------------------
     //
@@ -630,6 +679,10 @@ signals:
     void waveFadeIntensityChanged();
     void waveFadeDistanceKmChanged();
     void waveFadeSecondsChanged();
+    void showHistoryEpicenterChanged();
+    void historyEpicenterModeChanged();
+    void historyEpicenterCountChanged();
+    void historyEpicenterHoursChanged();
     void silentStartChanged();
     void simulatedUrlChanged();
     void sourceEstimationEnabledChanged();

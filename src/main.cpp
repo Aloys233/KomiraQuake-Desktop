@@ -11,6 +11,7 @@
 #include <QStandardPaths>
 
 #include "app/app_controller.h"
+#include "app/render_backend.h"
 #include "app/version.h"
 #include "service/sentry_service.h"
 #include "service/tray_controller.h"
@@ -72,6 +73,11 @@ int main(int argc, char* argv[]) {
     QCoreApplication::setApplicationVersion(QStringLiteral(KOMIRA_VERSION));
     QGuiApplication::setApplicationDisplayName(QStringLiteral("KomiraQuake - 地震预警"));
 
+    // 场景图后端必须在 QML 引擎加载前定下来。探不到 GL 就退软件渲染：
+    // 否则 Qt 的 QQuickWindow 会 qFatal，整个进程（提示音、托盘、预警逻辑）
+    // 被 SIGABRT 直接带走，用户看到的只是「点了没反应/闪退」。
+    komira::configureRenderBackend();
+
     // Crashpad 需要在业务对象和 QML 创建前启动；应用元数据必须先设置，
     // 这样 database path 会落到稳定的 CacheLocation。
     komira::SentryService::initializeEarly();
@@ -87,6 +93,9 @@ int main(int argc, char* argv[]) {
     komira::configureNativeUi(engine);
     engine.rootContext()->setContextProperty(QStringLiteral("app"), &controller);
     engine.setNetworkAccessManagerFactory(new TileNetworkAccessManagerFactory);
+    // 探测说 GL 能用，窗口的可见表面仍可能建不出来（探测用的是离屏表面）。
+    // 没有槽连着 sceneGraphError 时 Qt 直接 qFatal，故必须提前挂好。
+    komira::attachSceneGraphErrorHandler(&engine);
 
     QObject::connect(
         &engine, &QQmlApplicationEngine::objectCreationFailed, &app,

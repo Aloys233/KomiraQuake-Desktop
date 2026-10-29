@@ -155,6 +155,74 @@ Column {
         }
     }
 
+    // ---- 历史震中 ------------------------------------------------------------
+    // 地图在「最近一次事件」的红叉之外，还能把历史目录里的地震逐个画出来。
+    // 两种口径（个数 / 时长）**各存一份、互不改写**：切回上次用过的口径时数值还在，
+    // 与波前消失条件同一套约定。默认「最近 1 个」= 外观与改动前完全一致
+    // （那一个就是当前事件本身，历史层不会重复画）。
+    SettingsSection {
+        width: parent.width; theme: root.theme; title: "历史震中"; iconName: "map-pin"
+        GlassSwitch {
+            objectName: "historyEpicenterSwitch"
+            width: parent.width; theme: root.theme
+            text: "在地图上显示历史震中"
+            description: "除当前事件外，把最近的地震也标在地图上。默认只显示最近一个。"
+            checked: app.settings.showHistoryEpicenter
+            onToggled: app.settings.showHistoryEpicenter = checked
+        }
+
+        Column {
+            width: parent.width; spacing: 10
+            enabled: app.settings.showHistoryEpicenter
+            Text {
+                text: "显示方式"
+                color: root.theme.textPrimary
+                font.pixelSize: 14
+            }
+            GlassComboBox {
+                id: historyModeCombo
+                objectName: "historyEpicenterModeCombo"
+                width: parent.width; theme: root.theme
+                Accessible.name: "历史震中显示方式"
+                model: ["按数量", "按时间"]
+                readonly property var ids: ["count", "time"]
+                // 与波前口径下拉同理：用 Binding 而不是字面绑定，用户选择写 currentIndex
+                // 会断开字面绑定，「恢复默认」就推不动它了。
+                Binding {
+                    target: historyModeCombo
+                    property: "currentIndex"
+                    value: Math.max(0, historyModeCombo.ids.indexOf(app.settings.historyEpicenterMode))
+                    restoreMode: Binding.RestoreBindingOrValue
+                }
+                onActivated: index => app.settings.historyEpicenterMode = ids[index]
+            }
+        }
+
+        SettingSlider {
+            objectName: "historyEpicenterCountSlider"
+            width: parent.width; theme: root.theme
+            title: "显示个数"
+            valueText: app.settings.historyEpicenterCount + " 个"
+            description: "包含当前事件在内，地图上一共几个震中。1 = 与改动前一样。"
+            from: 1; to: 50; stepSize: 1
+            value: app.settings.historyEpicenterCount
+            active: app.settings.showHistoryEpicenter && app.settings.historyEpicenterMode === "count"
+            onMoved: value => app.settings.historyEpicenterCount = Math.round(value)
+        }
+
+        SettingSlider {
+            objectName: "historyEpicenterHoursSlider"
+            width: parent.width; theme: root.theme
+            title: "显示时长"
+            valueText: app.settings.historyEpicenterHours + " 小时"
+            description: "该时长内发生过的地震都标出来，条数不设上限。"
+            from: 1; to: 168; stepSize: 1
+            value: app.settings.historyEpicenterHours
+            active: app.settings.showHistoryEpicenter && app.settings.historyEpicenterMode === "time"
+            onMoved: value => app.settings.historyEpicenterHours = Math.round(value)
+        }
+    }
+
     SettingsSection {
         width: parent.width; theme: root.theme; title: "测站卡片"; iconName: "activity"
         // 右上角那组「各源当前最大值」卡的形态。两种形态显示的信息完全一样，
