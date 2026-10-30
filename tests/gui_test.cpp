@@ -4092,6 +4092,121 @@ private slots:
                                 .arg(map->property("centerLon").toDouble()).arg(hypoLon)));
     }
 
+    /// 回归：刚发生地震、地图正在移动时，新事件不得把预警卡片和 P/S 波前一起抹掉。
+    ///
+    /// 现场（用户报「刚刚发生地震，地图正在移动就直接把预警卡片和 PS 波卡没了」）：
+    /// 焦点从事件 A 换到**刚发生**的事件 B 时，B 的发震时刻就是此刻，走时表反解出的
+    /// P/S 半径都是 0 km（10 km 深的 P 波要 1.78 s、S 波要 3.01 s 才离开震中），
+    /// 于是 `updateWaveRadii()` 把两条半径都记成 -1 —— 这与「A 的波前走完了」形状完全
+    /// 相同。旧的 `onWaveRadiiChanged` 只看「半径归零」就认定结束：`following` 被关掉、
+    /// `wavesFinished()` 被发出，主窗口把 `wavesDoneId` 锁成 B 的 id，HudCard 与
+    /// WarningHud 双双收起；2 分钟后还会顺势 `resetView()` 把镜头抽走。
+    ///
+    /// 现在判据是「同一场 + 已经出发过」（与 Android 的 `shouldFinishWavesForFocus` 同源），
+    /// 本用例锁住三条：① 换到刚发生的事件时不得解除跟随、两张卡片必须还在；
+    /// ② B 的波前该自己长出来（不是被这次误判掐死）；③ 波前真的走完时旧语义仍然成立
+    /// （跟随解除、主 HUD 收起）。
+    void newEventRightAfterQuakeKeepsHudAndWaves() {
+        QTemporaryDir isolated;
+        QVERIFY(isolated.isValid());
+        qputenv("XDG_DATA_HOME", isolated.path().toUtf8());
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated.path());
+        QCoreApplication::setOrganizationName("KomiraQuakeTest");
+        QCoreApplication::setApplicationName("FreshEventWaveTest");
+        AppController controller(nullptr, false);
+        long long now = 1'800'000'000'000LL;
+        controller.nowProvider_ = [&] { return now; };
+        controller.settings()->setBasemapId("vector");
+        controller.settings()->setShowStationLayer(false);
+        controller.settings()->setEnableSoundAlert(false);
+        controller.settings()->setEnableWarnings(true);
+        controller.settings()->setLocalIntensityFilter(0.0);
+        controller.setManualLocation(30.9, 104.3, "测试定位");
+
+        QQmlApplicationEngine engine;
+        configureNativeUi(engine);
+        engine.rootContext()->setContextProperty("app", &controller);
+        engine.load(QUrl(QStringLiteral("qrc:/qt/qml/KomiraQuake/Main.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto* map = window->findChild<QQuickItem*>("mapView");
+        auto* hud = window->findChild<QQuickItem*>("hudCard");
+        auto* warningHud = window->findChild<QQuickItem*>("warningHud");
+        auto* pWave = window->findChild<QQuickItem*>("pWaveRing");
+        QVERIFY(map && hud && warningHud && pWave);
+        QTest::qWait(400);
+
+        // ---- 前置：事件 A 已是活动焦点，波前已出现且处于跟随状态 ----
+        EarthquakeEvent a;
+        a.id = a.eventId = "WAVE-A";
+        a.sourceProvider = "Wolfx"; a.sourceAgency = "CENC"; a.source = "中国地震台网";
+        a.timestamp = now - 40'000;
+        a.latitude = 30.0; a.longitude = 104.0;
+        a.depth = 10.0; a.magnitude = 7.5; a.location = "四川雅安";
+        controller.handleEvent(a, false, false);
+        QTest::qWait(900);   // 等入场取景补间结束
+        QVERIFY2(controller.property("wavePKm").toDouble() > 0.0, "前置条件失败：A 的波前没出现");
+        QVERIFY(map->property("wavesShown").toBool());
+        QVERIFY(map->property("following").toBool());
+        QVERIFY(hud->isVisible());
+        QVERIFY(warningHud->isVisible());
+
+        // ---- 现场：B 刚刚发生（发震时刻 = 此刻），焦点切换，相机开始飞 ----
+        // 这一帧按走时表反解得到 P=S=0 km，控制器把两条半径记成 -1。
+        EarthquakeEvent b;
+        b.id = b.eventId = "WAVE-B";
+        b.sourceProvider = "Wolfx"; b.sourceAgency = "CENC"; b.source = "中国地震台网";
+        b.timestamp = now;
+        b.latitude = 35.0; b.longitude = 110.0;
+        b.depth = 10.0; b.magnitude = 6.0; b.location = "山西临汾";
+        controller.handleEvent(b, false, false);
+        QTest::qWait(120);   // 入场补间进行中
+        QCOMPARE(controller.property("wavePKm").toDouble(), -1.0);
+        QCOMPARE(controller.property("waveEventId").toString(),
+                 QString::fromStdString(b.identity()));
+        qWarning("DBG wavesShown=%d wavesEventId=%s waveEventId=%s doneId=%s following=%d",
+                 map->property("wavesShown").toBool(),
+                 qPrintable(map->property("wavesEventId").toString()),
+                 qPrintable(controller.property("waveEventId").toString()),
+                 qPrintable(window->property("wavesDoneId").toString()),
+                 map->property("following").toBool());
+        QVERIFY2(!controller.property("waveStarted").toBool(),
+                 "新事件的波前不该被记成「已经出发过」");
+        QVERIFY2(hud->isVisible(), "刚发生地震、地图正在移动：主 HUD 不得被收起");
+        QVERIFY2(warningHud->isVisible(), "刚发生地震、地图正在移动：预警卡不得被收起");
+        QVERIFY2(map->property("following").toBool(),
+                 "换到刚发生的事件时不得解除跟随（跟随被解除 → 波前也不再逐帧取景）");
+
+        // ---- B 的波前自己长出来（旧实现在这里已经把它判成「结束」了） ----
+        // 刻意**不**手工调 updateWaveRadii：这一段的唯一驱动力是控制器那个 16 ms 波前
+        // 定时器。旧实现看到两条半径都是 -1 就把它停掉（还发了一次 wavesFinished），
+        // 于是一场刚发生的地震此后永远不会再长出波前 —— 屏幕上就是「波卡没了」。
+        now += 3'000;
+        QTRY_VERIFY_WITH_TIMEOUT(controller.property("wavePKm").toDouble() > 0.0, 3000);
+        QVERIFY2(controller.property("waveStarted").toBool(), "B 的波前必须记成已出发");
+        QTRY_VERIFY_WITH_TIMEOUT(pWave->isVisible(), 2000);
+        QVERIFY2(hud->isVisible(), "B 的波前长出来后 HUD 必须仍在");
+        QVERIFY2(warningHud->isVisible(), "B 的波前长出来后预警卡必须仍在");
+
+        // ---- ③ 真正走完时旧语义不退化：跟随解除、状态复位 ----
+        controller.settings()->setWaveFadeMode(QStringLiteral("distance"));
+        controller.settings()->setWaveFadeDistanceKm(50);   // 消失边界收到 50 km
+        // 再往前走一段：半径越过 50 km，两条一起淡到 0（半径记 -1）。
+        now += 20'000;
+        controller.updateWaveRadii();
+        QCOMPARE(controller.property("wavePKm").toDouble(), -1.0);
+        QTRY_VERIFY_WITH_TIMEOUT(!map->property("following").toBool(), 2000);
+        QVERIFY2(!map->property("wavesShown").toBool(), "真正走完后 wavesShown 必须复位");
+        // 主 HUD 这次仍显示：本场是「达成本地门槛 + 有倒计时」的受保护预警，
+        // `hasProtectedWarning` 明确要求它不得被收起（与波前是否走完无关）。
+        QVERIFY(hud->isVisible());
+        QVERIFY(warningHud->isVisible());
+    }
+
     /// 回归：按住地图拖动期间，新事件到达不得抢走镜头。
     ///
     /// 曾经新事件聚焦直接写 center/zoom，会与拖拽逐帧抢同一组属性，手感上就是

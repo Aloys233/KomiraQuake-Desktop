@@ -108,6 +108,24 @@ class AppController : public QObject {
     Q_PROPERTY(double wavePOpacity READ wavePOpacity NOTIFY waveRadiiChanged)
     Q_PROPERTY(double waveSOpacity READ waveSOpacity NOTIFY waveRadiiChanged)
     Q_PROPERTY(double waveSFillOpacity READ waveSFillOpacity NOTIFY waveRadiiChanged)
+    /// 这一批波前半径**画的是谁的焦点**：事件焦点为 `identity()`，推算焦点为
+    /// `"estimate"`，无焦点时为空串。与半径同一条通知。
+    ///
+    /// QML 必须靠它区分下面两件形状完全一样、含义却相反的事：
+    ///   · 这场事件的波前走完/淡出/事件结束 —— 该解除跟随、该让 HUD 收起；
+    ///   · **刚换到另一场事件**，而新事件的波前还没长出来 —— 走时表反解在发震最初
+    ///     一两秒就是 0 km（10 km 深的 P 波要 1.8 s 才离开震中），此刻什么都不该结束。
+    /// 只看「半径归零」会把切换当成结束：`following` 被关掉、`wavesFinished` 被发出，
+    /// 主窗口据此锁住 HUD。用户看到的就是「刚刚发生地震，地图正在移动，
+    /// 预警卡片和 P/S 波前一起没了」。判据与 Android 的 `shouldFinishWavesForFocus` 同源。
+    Q_PROPERTY(QString waveEventId READ waveEventId NOTIFY waveRadiiChanged)
+    /// 当前焦点的波前**是否已经长出来过**（半径 > 0 过至少一次）。
+    ///
+    /// 与 `waveEventId` 一起构成「半径归零是什么意思」的判据：
+    /// `waveStarted == false` 时半径为 -1 只表示「还没到出发时刻」，不是「走完了」。
+    /// 10 km 深的 P 波要 1.8 s 才离开震中，S 波要 3.0 s，这段时间里半径按走时表反解
+    /// 就是 0 km（jma2001 在 `seconds <= times.front()` 处 clamp 到 `distances.front()`）。
+    Q_PROPERTY(bool waveStarted READ waveStarted NOTIFY waveRadiiChanged)
     /// 区县名 -> CSIS 烈度原始值，供矢量地图按烈度给区县面填色。
     Q_PROPERTY(QVariantMap districtIntensity READ districtIntensity NOTIFY districtIntensityChanged)
     /// 实时测站震度的**快照对象**（**仅显示，不参与预警**）：合并各测站源，地图项直接读
@@ -196,6 +214,9 @@ public:
     double wavePOpacity() const { return wavePOpacity_; }
     double waveSOpacity() const { return waveSOpacity_; }
     double waveSFillOpacity() const { return waveSFillOpacity_; }
+    /// 这批波前归属的焦点（见 `waveEventId` 属性的说明）。
+    QString waveEventId() const { return waveEventId_; }
+    bool waveStarted() const { return waveStarted_; }
     QVariantMap districtIntensity() const { return districtIntensity_; }
     QObject* stationSnapshot() const { return stationSnapshot_; }
     QVariantList stationSources() const;
@@ -370,6 +391,15 @@ private:
     void updateWaveRadii();
     /// 隐藏并清零波前（半径 -1 + 透明度 0），只在确有变化时发通知。
     void clearWaveRadii();
+    /// 当前焦点的标签：事件焦点为 `identity()`，推算焦点为 `"estimate"`，无焦点为空串。
+    /// `updateWaveRadii()` 每帧写进 `waveEventId_`，QML 靠它区分「换事件」与「走完了」。
+    QString waveFocusKey() const;
+    /// 把 `waveFocusKey()` 同步进 `waveEventId_`；真要换焦点时复位 `waveStarted_`。
+    /// 返回 true 表示焦点键变了（调用方需要发 `waveRadiiChanged`）。
+    bool syncWaveFocusKey();
+    /// 这批波前是否确实走完了（可以停表）：**已经出发过**且两条半径都不可画。
+    /// 只判「半径归零」会把新事件的头一两秒（走时表反解 = 0 km）当成结束。
+    bool wavesSettled() const;
     /// 重建 `historyMarkersCache_` 并按需发 `historyMarkersChanged`（内容真的变了才发）。
     /// 设置口径（开关 / 方式 / 数量 / 小时数）与历史目录，是本属性仅有的两个输入。
     void refreshHistoryMarkers();
@@ -624,6 +654,11 @@ private:
     double waveSOpacity_ = 0.0;
     /// S 波径向渐变填充的不透明度（仅影响半径内非零）。
     double waveSFillOpacity_ = 0.0;
+    /// 这批半径归属的焦点（`waveEventId` 的存储）。`clearWaveRadii()` 也**不清空**它：
+    /// 它记录的是「上一次算出来的是谁」，供 QML 判定「半径归零是否等于这场事件结束」。
+    QString waveEventId_;
+    /// 这批半径是否已经真正出发过（见 `waveStarted` 属性）。换焦点时随 `waveEventId_` 一起复位。
+    bool waveStarted_ = false;
     /// 波前「影响半径」缓存：只随焦点的震级/深度**与消失口径**变化而失效
     /// （见 updateWaveRadii）。
     double waveCacheMagnitude_ = -1.0;

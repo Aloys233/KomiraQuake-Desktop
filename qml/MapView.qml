@@ -493,6 +493,17 @@ Item {
 
     /// 波前（P/S）是否出现过。用于识别"波前消失"的瞬间并自动回到默认视野。
     property bool wavesShown: false
+    /// 这批波前属于哪一场事件（= `app.waveEventId` 在出现时的值）。
+    ///
+    /// 半径归零有两种成因，形状完全相同、含义完全相反，必须分开：
+    ///   · 这场事件的波前走完/淡出/事件结束 —— 该解除跟随、该让 HUD 收起；
+    ///   · **刚换到另一场事件**，而新事件的波前还没长出来 —— 走时表反解在发震最初
+    ///     一两秒就是 0 km（10 km 深的 P 波要 1.78 s、S 波要 3.01 s 才离开震中）。
+    /// 没有这一格时，第二种会被当成第一种：`following` 被关掉、`wavesFinished` 被发出，
+    /// 主窗口据此锁住 HUD —— 而相机此时正为新事件做入场补间，用户看到的就是
+    /// 「刚刚发生地震，地图正在移动，预警卡片和 P/S 波前一起没了」。
+    /// 判据与 Android 的 `shouldFinishWavesForFocus` 同一口径。
+    property string wavesEventId: ""
     /// 波前/事件结束后保留当前镜头一段时间，避免刚结束就把用户视野拉走。
     readonly property int eventEndResetMs: 2 * 60 * 1000
     property string pendingEventEndId: ""
@@ -538,7 +549,13 @@ Item {
                 root.cancelEventEndReset();
                 if (!root.wavesShown) {
                     root.wavesShown = true;
+                    // 记下这批波前是谁的：归零时要先问「还是不是这一场」。
+                    root.wavesEventId = app.waveEventId;
                     root.wavesStarted();
+                } else if (root.wavesEventId !== app.waveEventId) {
+                    // 波前一直没灭但焦点换了（换事件时半径都是正值也会发生）：
+                    // 这批半径换了主人，跟上它，别让归零归到上一场头上。
+                    root.wavesEventId = app.waveEventId;
                 }
                 // 推算焦点：相机跟着虚线波前走（与事件跟随同一节奏），否则波前几秒
                 // 就会跑出按不确定度取景的视野。
@@ -555,10 +572,22 @@ Item {
                 root.frameEvent(false);
                 return;
             }
-            // 波前全部消失（走完/淡出/事件结束）。仍聚焦（app.hasMapFocus）说明是自然结束而非
-            // 用户取消焦点：若之前在跟随震中，立即取消跟随，延迟 2 分钟回到默认镜头。
-            // 用户手动操作过镜头（following=false）时不抢镜头。
+            // 半径全为 -1。-1 有两种来源，先分清是哪一种：
+            //   · 这批波前还没出发（`app.waveStarted === false`，发震最初一两秒）——
+            //     不是结束，什么都不做，等它长出来；
+            //   · 这批波前归属的焦点已经不是当前焦点（换事件，新事件的半径还没算）——
+            //     也不是结束；只把 `wavesShown` 交给新焦点，等新事件的波前出现。
+            // 只有「同一场、且已经出发过」才是真的走完。
             if (!root.wavesShown) return;
+            if (root.wavesEventId !== app.waveEventId || !app.waveStarted) {
+                // 换了事件：这批还没出现过的半径不算「出现过」，等它自己长出来再报
+                // `wavesStarted`；`wavesShown` 保持 true 会让下一次出现漏掉这次通知。
+                if (root.wavesEventId !== app.waveEventId) {
+                    root.wavesShown = false;
+                    root.wavesEventId = app.waveEventId;
+                }
+                return;
+            }
             root.wavesShown = false;
             if (!app.hasMapFocus) return;
             if (root.following) {

@@ -1744,13 +1744,34 @@ void AppController::updateWaveTimer() {
 }
 
 void AppController::clearWaveRadii() {
-    if (wavePKm_ == -1.0 && waveSKm_ == -1.0) return;
+    const bool keyChanged = syncWaveFocusKey();
+    const bool valuesChanged = !(wavePKm_ == -1.0 && waveSKm_ == -1.0);
     wavePKm_ = -1.0;
     waveSKm_ = -1.0;
     wavePOpacity_ = 0.0;
     waveSOpacity_ = 0.0;
     waveSFillOpacity_ = 0.0;
-    emit waveRadiiChanged();
+    // 焦点键变了也要发通知：QML 只有拿到新键才能判定「这一次归零不是上一场结束」。
+    if (valuesChanged || keyChanged) emit waveRadiiChanged();
+}
+
+bool AppController::syncWaveFocusKey() {
+    const QString key = waveFocusKey();
+    if (key == waveEventId_) return false;
+    waveEventId_ = key;
+    // 换了焦点就是新的一批半径：还没出发过。走时表在发震最初一两秒反解出的就是 0 km
+    // （10 km 深时 P 波要 1.78 s、S 波要 3.01 s 才离开震中），这一段必须能与
+    // 「上一场走完了」区分开 —— 见 QML 的 `onWaveRadiiChanged`。
+    waveStarted_ = false;
+    return true;
+}
+
+QString AppController::waveFocusKey() const {
+    // 与 `toMap` 里的 `id`（= identity()）逐字一致：QML 的 `hudEvent.id`、
+    // `activeWarning.id` 都用同一个键，主窗口据此判断「收起 HUD 的那一场」是不是当前这一场。
+    if (!focusEstimate_.isEmpty()) return QStringLiteral("estimate");
+    if (hasMapFocus_) return QString::fromStdString(mapFocus_.identity());
+    return QString();
 }
 
 void AppController::updateWaveRadii() {
@@ -1758,6 +1779,9 @@ void AppController::updateWaveRadii() {
         clearWaveRadii();
         return;
     }
+    // 焦点键先同步：换事件/换推定解时这一帧就算出的半径恰好与上一帧相同（典型：两边
+    // 都还没到出发时刻，都是 -1），也必须让 QML 看见新键，否则它会认定「上一场走完了」。
+    const bool keyChanged = syncWaveFocusKey();
 
     // 波前来源：推算焦点用推定震源的震级/深度/反推时刻；否则用焦点事件。
     // 半径只依赖这三个量，地图侧只需知道画在哪里 —— 中心由 QML 的焦点标记决定。
@@ -1842,10 +1866,16 @@ void AppController::updateWaveRadii() {
     // S 波径向渐变填充与描边共用同一条曲线（峰值 0.25），所以三种口径下填充的
     // 消失时机与描边严格一致 —— 旧实现是两条独立公式，切换口径时很容易只改到一条。
     const double sFill = sKm > 0.0 ? WaveFade::fillOpacity(progressOf(sKm)) : 0.0;
+    // 「这批半径出发过没有」：一旦某帧出现过正半径就保持为真，直到换焦点才复位。
+    // QML 用它区分「还没到出发时刻（0 km）」与「已经走完（-1）」—— 两者在半径上是
+    // 同一个 -1，混用就会把新事件的起跳瞬间当成上一场结束。
+    const bool startedChanged = !waveStarted_ && pKm > 0.0;
+    if (startedChanged) waveStarted_ = true;
     // 只有真正变化的字段才值得发通知：QML 侧的绑定（含 Behavior 动画）据此重算。
     if (pKm == wavePKm_ && sKm == waveSKm_ && pOpacity == wavePOpacity_
-        && sOpacity == waveSOpacity_ && sFill == waveSFillOpacity_) {
-        if (wavePKm_ < 0.0 && waveSKm_ < 0.0) waveTimer_.stop();
+        && sOpacity == waveSOpacity_ && sFill == waveSFillOpacity_
+        && !startedChanged && !keyChanged) {
+        if (wavesSettled()) waveTimer_.stop();
         return;
     }
     wavePKm_ = pKm;
@@ -1854,7 +1884,17 @@ void AppController::updateWaveRadii() {
     waveSOpacity_ = sKm > 0.0 ? sOpacity : 0.0;
     waveSFillOpacity_ = sFill;
     emit waveRadiiChanged();
-    if (wavePKm_ < 0.0 && waveSKm_ < 0.0) waveTimer_.stop();
+    if (wavesSettled()) waveTimer_.stop();
+}
+
+bool AppController::wavesSettled() const {
+    // 两条半径都「不可画」有两种成因，只有一种能停表：
+    //   · 已经出发过又归零（淡出/越量程/事件结束）—— 确实没有后续了；
+    //   · **还没出发**（新事件的头一两秒，走时表反解就是 0 km）—— 后续正要来。
+    // 旧实现只判前者，于是「刚刚发生地震」那一帧就把 16 ms 定时器停掉：此后没有任何
+    // 东西把它重新拉起来，P/S 波前要等到下一份报文才可能出现 —— 屏幕上就是
+    // 「刚发生地震、波前不见了」。同理，`wavesFinished` 也只在真正走完时才该发出。
+    return waveStarted_ && wavePKm_ < 0.0 && waveSKm_ < 0.0;
 }
 
 void AppController::requestLocation() { location_->requestCurrentPosition(); }
