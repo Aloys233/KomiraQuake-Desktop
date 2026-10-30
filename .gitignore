@@ -36,3 +36,9 @@ Thumbs.db
 
 # 本地基准/冒烟运行留下的隔离数据目录（.bench/）
 .bench/
+
+# CI 里下载的 Qt 符号包 / 安装树 / 收集出来的调试符号目录
+qt-debug/
+stage/
+native-pdb/
+native-debug/

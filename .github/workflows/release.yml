@@ -62,21 +62,31 @@ jobs:
       - name: Build
         run: cmake --build build
 
-      - name: Upload Linux native debug information to Sentry
-        env:
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          SENTRY_ORG: "4511504349396992"
-          SENTRY_PROJECT: "4512246266789888"
+      # Qt 的 .so 是 strip 过的（只留 .gnu_debuglink），DWARF 全在单独的
+      # lib/Qt6*.debug 里，官方把它拆成 debug_info 模块（qtbase / qtdeclarative /
+      # qtsvg / qttools）+ 每个附加模块的 <module>.debug_information。只传
+      # build/komiraquake 时，Sentry 上的 Linux 事件就会显示
+      # "missing (libQt6Core.so.6, libQt6Qml.so.6)" —— 与 Windows 同一个病。
+      - name: Install Qt debug information (debug symbols)
         run: |
-          if [ -z "${SENTRY_AUTH_TOKEN:-}" ]; then
-            echo "SENTRY_AUTH_TOKEN 未配置，不能发布没有 native symbols 的版本" >&2
-            exit 1
-          fi
-          npx --yes @sentry/cli@latest upload-dif \
-            --org "$SENTRY_ORG" \
-            --project "$SENTRY_PROJECT" \
-            build/komiraquake
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --user \
+            "aqtinstall==3.3.0" "py7zr==1.1.0"
+          export PATH="$HOME/.local/bin:$PATH"
+          python3 -m aqt install-qt linux desktop 6.8.3 linux_gcc_64 \
+            --outputdir qt-debug --noarchives \
+            -m debug_info qtmultimedia.debug_information qtwebsockets.debug_information
+          debug_root="$PWD/qt-debug/6.8.3/gcc_64"
+          for probe in lib/Qt6Core.debug lib/Qt6Qml.debug; do
+            if [ ! -f "$debug_root/$probe" ]; then
+              echo "Qt debug symbols 未安装到 $debug_root（缺 $probe）" >&2
+              exit 1
+            fi
+          done
+          echo "KOMIRA_QT_DEBUG_ROOT=$debug_root" >> "$GITHUB_ENV"
 
+      # AppDir 才是用户实际拿到的那份布局 —— 但 Qt 库、插件与 QML 运行时模块
+      # 是 linuxdeploy --plugin qt 之后才收进来的，所以符号收集必须排在打包后面。
       - name: Stage install tree (AppDir)
         run: DESTDIR="$PWD/AppDir" cmake --install build
 
@@ -105,6 +115,72 @@ jobs:
           tools/linuxdeploy --appdir AppDir --plugin qt --output appimage
           mv ./*.AppImage "dist/KomiraQuake-${VERSION}-linux-x64.AppImage"
           ls -lh dist/
+
+      - name: Collect Qt debug symbols for shipped binaries
+        run: |
+          set -euo pipefail
+          if [ -z "${KOMIRA_QT_DEBUG_ROOT:-}" ] || [ ! -d "$KOMIRA_QT_DEBUG_ROOT" ]; then
+            echo "KOMIRA_QT_DEBUG_ROOT 未设置或不存在，Qt 符号无法上传" >&2
+            exit 1
+          fi
+          # 按 build id 建索引：Qt 的符号文件名（Qt6Core.debug / qxcb.debug）
+          # 与 ELF 名（libQt6Core.so.6 / libqxcb.so）不同名，只能靠 build id 对齐。
+          # 注意必须用「符号文件自己的」build id —— .so 里的 .gnu_debuglink
+          # 指的是文件名，而 Sentry 只认 build id。
+          declare -A by_id=()
+          while IFS= read -r -d '' f; do
+            id="$(readelf -n "$f" 2>/dev/null | awk '/Build ID/ {print $3; exit}')"
+            if [ -n "$id" ]; then
+              by_id["$id"]="$f"
+            fi
+          done < <(find "$KOMIRA_QT_DEBUG_ROOT" -name '*.debug' -print0)
+          echo "Qt 符号索引：${#by_id[@]} 个 build id"
+
+          mkdir -p native-debug
+          copied=0
+          missing=()
+          # 只看随包的动态库（Qt 的 .so 与其插件）—— 可执行文件里没有 Qt 的代码，
+          # komiraquake 自己的符号由 build/komiraquake 那份直接上传。
+          while IFS= read -r -d '' lib; do
+            id="$(readelf -n "$lib" 2>/dev/null | awk '/Build ID/ {print $3; exit}')"
+            if [ -z "$id" ]; then
+              continue
+            fi
+            if [ -n "${by_id[$id]:-}" ]; then
+              cp -f "${by_id[$id]}" native-debug/
+              copied=$((copied + 1))
+            else
+              missing+=("$(basename "$lib")")
+            fi
+          done < <(find "$PWD/AppDir" -type f \( -name '*.so' -o -name '*.so.*' \) -print0)
+
+          echo "已收集 Qt 符号：$(find native-debug -name '*.debug' | wc -l) 个文件，命中 $copied 个随包库"
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::warning::有 ${#missing[@]} 个随包库没有对应 Qt 符号（前 10 个：${missing[*]:0:10}）"
+          fi
+          # 关键判据：崩溃栈里出现的就是这两个库。
+          for required in Qt6Core.debug Qt6Qml.debug; do
+            if [ ! -f "native-debug/$required" ]; then
+              echo "缺少关键 Qt 符号 $required，Sentry 仍无法解析 Qt 帧" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload Linux native debug information to Sentry
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: "4511504349396992"
+          SENTRY_PROJECT: "4512246266789888"
+        run: |
+          if [ -z "${SENTRY_AUTH_TOKEN:-}" ]; then
+            echo "SENTRY_AUTH_TOKEN 未配置，不能发布没有 native symbols 的版本" >&2
+            exit 1
+          fi
+          npx --yes @sentry/cli@latest upload-dif \
+            --org "$SENTRY_ORG" \
+            --project "$SENTRY_PROJECT" \
+            build/komiraquake \
+            native-debug
 
       # deb 由 AppDir 打包：Qt 依赖已随 linuxdeploy 收进 /opt/komiraquake，
       # 因此不依赖发行版 Qt 版本（项目要求 Qt >= 6.5，各 LTS 发行版都还没提供）。
@@ -180,6 +256,35 @@ jobs:
       - name: Build
         run: cmake --build build
 
+      # Qt 的 DLL 自身不含调试符号：官方把 PDB 单独发成 debug_info 包
+      # （qtbase / qtdeclarative / qtsvg / qttools）+ 每个附加模块的
+      # <module>.debug_information。install-qt-action 只装运行时，不装它，
+      # 于是 Sentry 只能显示 "missing (Qt6Core.dll, Qt6Qml.dll)"。
+      # --noarchives 表示不再重复下载常规 Qt 包，只取符号。
+      - name: Install Qt debug information (PDB)
+        shell: pwsh
+        run: |
+          # py7zr 与 install-qt-action 里 pin 的版本保持一致：更新的 py7zr 在
+          # Windows 上会报 Bad7zFile（该 action 的 py7zrversion 注释即为此事）。
+          python -m pip install --disable-pip-version-check "aqtinstall==3.3.0" "py7zr==1.1.0"
+          python -m aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 `
+            --outputdir qt-debug --noarchives `
+            -m debug_info qtmultimedia.debug_information qtwebsockets.debug_information
+          $pdbRoot = Join-Path $PWD 'qt-debug\6.8.3\msvc2022_64'
+          foreach ($probe in @('bin\Qt6Core.pdb', 'bin\Qt6Qml.pdb')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $pdbRoot $probe))) {
+              throw "Qt debug information 未安装到 $pdbRoot（缺 $probe）"
+            }
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "KOMIRA_QT_PDB_ROOT=$pdbRoot"
+
+      # 安装树就是用户实际拿到的那份文件布局（windeployqt 收集 Qt DLL、
+      # 插件与 QML 运行时模块），Sentry 需要的是其中每个模块对应的 PDB。
+      # 必须给绝对路径：Qt 的 deploy 脚本以 QT_DEPLOY_PREFIX 为基准算目标目录，
+      # 相对路径会被解析成 build/ 下的子目录。
+      - name: Stage install tree
+        run: cmake --install build --prefix "$env:GITHUB_WORKSPACE\stage"
+
       - name: Upload Windows native debug information to Sentry
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
@@ -200,11 +305,55 @@ jobs:
               throw "未找到 Windows native debug information 文件: $debugFile"
             }
           }
+
+          # 只上传「安装树里真实存在的模块」对应的 PDB：Qt 的 debug_info 包
+          # 里同时有 release（Qt6Core.pdb）与 debug（Qt6Cored.pdb）两套，
+          # 3.2 GB 全传是浪费，发出去的 DLL 只有 release 那套。
+          $pdbRoot = $env:KOMIRA_QT_PDB_ROOT
+          if ([string]::IsNullOrWhiteSpace($pdbRoot) -or -not (Test-Path -LiteralPath $pdbRoot)) {
+            throw "KOMIRA_QT_PDB_ROOT 未设置或不存在，Qt 符号无法上传"
+          }
+          $stageRoot = Join-Path $PWD 'stage'
+          $extraPdbDir = Join-Path $PWD 'native-pdb'
+          New-Item -ItemType Directory -Force -Path $extraPdbDir | Out-Null
+
+          # 按基名建索引（Qt 的 PDB 名与 DLL 同名），避免逐文件递归扫 3 GB。
+          $pdbIndex = @{}
+          Get-ChildItem -LiteralPath $pdbRoot -Recurse -File -Filter '*.pdb' | ForEach-Object {
+            $pdbIndex[$_.Name] = $_.FullName
+          }
+          $shipped = Get-ChildItem -LiteralPath $stageRoot -Recurse -File |
+            Where-Object { $_.Extension -in @('.dll', '.exe') }
+          $copied = 0
+          $missing = @()
+          foreach ($binary in $shipped) {
+            $pdbName = [System.IO.Path]::GetFileNameWithoutExtension($binary.Name) + '.pdb'
+            if ($pdbIndex.ContainsKey($pdbName)) {
+              Copy-Item -LiteralPath $pdbIndex[$pdbName] -Destination $extraPdbDir -Force
+              $copied++
+            } elseif ($binary.BaseName -like 'Qt6*' -or $binary.BaseName -like 'qml*') {
+              # 只有 Qt 自己的模块才要求有符号；mingw/第三方 DLL 不强求。
+              $missing += $binary.Name
+            }
+          }
+          Write-Host "Qt PDB 已收集 $copied 个（安装树内二进制 $($shipped.Count) 个）"
+          if ($missing.Count -gt 0) {
+            $head = ($missing | Select-Object -First 10) -join ', '
+            Write-Warning "有 $($missing.Count) 个 Qt 模块没有对应 PDB（前 10 个：$head）"
+          }
+          # 关键判据：崩溃栈里出现的就是这两个模块，缺了等于没修。
+          foreach ($required in @('Qt6Core.pdb', 'Qt6Qml.pdb')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $extraPdbDir $required))) {
+              throw "缺少关键 Qt 符号 $required，Sentry 仍无法解析 Qt 帧"
+            }
+          }
+
           npx --yes @sentry/cli@latest upload-dif `
             --org $env:SENTRY_ORG `
             --project $env:SENTRY_PROJECT `
             build\komiraquake.exe `
-            build\komiraquake.pdb
+            build\komiraquake.pdb `
+            $extraPdbDir
 
       - name: Build installer
         working-directory: build
