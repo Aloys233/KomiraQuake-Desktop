@@ -427,6 +427,14 @@ void SourceEstimationService::runEstimation() {
         config.minStations = std::max(1, region.minStations);
         config.useQuietStations = region.quietEvidence;
         config.clusterRadiusKm = static_cast<double>(region.clusterRadiusKm);
+        // 多解迟滞：把上一帧发布的解喂回求解器，让「同一片触发区」在势均力敌时守住。
+        // 不加这条，四川主震与云南一场小震同时存在时，最强簇会随逐帧噪声来回换人，
+        // 地图上的震中在几百公里间每秒跳一次（用户报的现象）。
+        if (region.estimate.valid) {
+            config.preferLatitude = region.estimate.latitude;
+            config.preferLongitude = region.estimate.longitude;
+            config.preferRadiusKm = kPreferRadiusKm;
+        }
         configs[i] = config;
     }
     // 日本区额外收集**到时观测**：首次越阈时刻当作 P 波到时，交给到时反演。
@@ -512,11 +520,45 @@ void SourceEstimationService::applyBatch(const EstimateBatch& batch) {
         SourceEstimate estimate = batch.estimates[i];
         // 日本区：到时解优先。它带发震时刻与 P/S 相位数，且深度是可辨识的
         // （强度场里「深一点的近震」和「浅一点的远震」几乎同解）。
-        // 只在到时解成立且不弱于强度解时替换，避免早期只有一两个到时站反而更差。
-        if (region.region == SourceRegion::Japan && batch.arrival.valid) {
-            SourceEstimate arrivalEstimate = ArrivalEstimator::toSourceEstimate(batch.arrival);
-            if (!estimate.valid || arrivalEstimate.usedStationCount >= 3) {
-                estimate = arrivalEstimate;
+        if (region.region == SourceRegion::Japan) {
+            const bool publishedArrival =
+                region.estimate.valid
+                && region.estimate.method.rfind("arrival_time", 0) == 0;
+            if (batch.arrival.valid) {
+                const SourceEstimate arrivalEstimate =
+                    ArrivalEstimator::toSourceEstimate(batch.arrival);
+                // 日本区每帧同时有强度解与到时解，弱证据下两者能差出上百公里；而「到时解
+                // 成不成立」取决于触发站数在 `minStations`（默认 5）上下抖动。之前只要到时解
+                // 有 ≥3 站就无条件替换，于是发布的那条路每帧换人 —— 地图上的震中来回跳，
+                // 下游再把每次跳变当成新事件把报次清零，卡片就一直停在「第 1 报」。
+                if (!estimate.valid) {
+                    // 强度解不成立（站太少 / 无梯度）：只剩到时解可用。
+                    estimate = arrivalEstimate;
+                } else if (publishedArrival) {
+                    // 已经在到时路上：继续用它，只有它退化成「站数很少的弱解」而强度解
+                    // 仍然完整时才回退——否则一次 3 站粗解会把路线锁死到事件结束。
+                    const bool arrivalDegraded =
+                        arrivalEstimate.provisional && !estimate.provisional
+                        && arrivalEstimate.usedStationCount < kArrivalFallbackStations;
+                    if (!arrivalDegraded) estimate = arrivalEstimate;
+                } else if (arrivalEstimate.usedStationCount >= 3) {
+                    // 在强度路上：到时解有足够站就切过去（到时带发震时刻，且深度可辨识）。
+                    estimate = arrivalEstimate;
+                }
+            } else if (publishedArrival && estimate.valid) {
+                // 上一帧发的是到时解，这一帧到时解不成立（尾段触发站在门槛上下抖动）。
+                // 两条路在弱证据下能差出上百公里，所以：
+                //   · 强度解和上一帧的解接近（≤ kPathHoldKm）→ 直接用它，位置不会跳；
+                //   · 强度解离得很远但证据很硬（≥10 站且不是粗解）→ 这是另一场事件，
+                //     让它接管（位移会超过 kEventJumpKm，报次按新事件从头开始，正确）；
+                //   · 其余情况 → 按「本帧无解」处理，交给下面的保持窗口继续沿用上一帧的
+                //     到时解。拿一个偏出上百公里的弱强度解顶替，就是用户看到的那种跳变。
+                const double distance = QuakeCalculator::haversineDistance(
+                    region.estimate.latitude, region.estimate.longitude, estimate.latitude,
+                    estimate.longitude);
+                const bool strongEvidence =
+                    !estimate.provisional && estimate.usedStationCount >= 10;
+                if (distance > kPathHoldKm && !strongEvidence) estimate.valid = false;
             }
         }
         if (!estimate.valid) {
@@ -542,11 +584,13 @@ void SourceEstimationService::applyBatch(const EstimateBatch& batch) {
                            || std::fabs(best.latitude - region.estimate.latitude) > 1e-6
                            || std::fabs(best.longitude - region.estimate.longitude) > 1e-6;
         if (fresh && region.sessionStartedMs <= 0) region.sessionStartedMs = now;
-        // 结果位置大幅跳变（> 60 km）时视为新的一次事件，重置「首次给出」计时与报次。
+        // 结果位置大幅跳变时视为新的一次事件，重置「首次给出」计时与报次。
+        // 判据是 kEventJumpKm（见头文件）：60 km 太小，求解器正常游走（稀疏台网可达
+        // 40 km）就会越过它，于是报次被噪声清零并把卡片打回「第 1 报」。
         if (region.estimate.valid
             && QuakeCalculator::haversineDistance(region.estimate.latitude,
                                                   region.estimate.longitude, best.latitude,
-                                                  best.longitude) > 60.0) {
+                                                  best.longitude) > kEventJumpKm) {
             region.sessionStartedMs = now;
             region.reportNum = 0;
             region.reportBase = SourceEstimate{};

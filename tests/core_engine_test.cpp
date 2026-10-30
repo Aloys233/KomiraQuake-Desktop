@@ -765,6 +765,166 @@ int main(int argc, char** argv) {
                   "source estimate: stronger cluster wins");
         }
 
+        // 连带触发（两片有感区被单链聚类串成一簇）不得产出「远端退化」解。
+        //
+        // 强度残差在「离所有触发站都很远」的方向上会单调变好（各站距离趋同，log 项
+        // 退化成常数平移），实测川滇两片 0.6° 网格触发区一起喂进去，解会跑到青海
+        // 1187 km 外、反演出 M8.9，残差反而从 1.59 降到 0.93 —— 这就是「震中突然
+        // 跑到别的地方」的机制之一。判据：最近的触发站也比重证据半径还远时必须无解。
+        {
+            const auto add = [](double clat, double clon, double magnitude, double y0,
+                                double y1, double x0, double x1,
+                                std::vector<StationObservation>* out) {
+                for (double y = y0; y <= y1 + 1e-9; y += 0.6) {
+                    for (double x = x0; x <= x1 + 1e-9; x += 0.6) {
+                        StationObservation s;
+                        s.latitude = y;
+                        s.longitude = x;
+                        s.family = IntensityFamily::Csis;
+                        s.intensity = SourceEstimator::predictedIntensity(
+                            IntensityFamily::Csis, magnitude,
+                            QuakeCalculator::haversineDistance(clat, clon, y, x), 10.0);
+                        out->push_back(s);
+                    }
+                }
+            };
+            std::vector<StationObservation> chain;
+            add(30.2, 104.3, 6.3, 28.4, 32.0, 102.5, 106.1, &chain);   // 四川
+            add(26.0, 100.6, 6.2, 24.5, 27.5, 99.1, 102.1, &chain);    // 云南
+            const SourceEstimate chained = SourceEstimator::estimate(chain, cfg);
+            if (chained.valid) {
+                check(chained.nearestStationKm <= cfg.quietRadiusKm,
+                      "source estimate: never publishes a solution far outside the network");
+                check(QuakeCalculator::haversineDistance(chained.latitude, chained.longitude,
+                                                         30.2, 104.3) < 400.0
+                          || QuakeCalculator::haversineDistance(chained.latitude,
+                                                                chained.longitude, 26.0, 100.6)
+                                 < 400.0,
+                      "source estimate: chained trigger area stays near one real epicentre");
+            } else {
+                check(true, "source estimate: chained trigger area rejects the far-field degenerate");
+            }
+            // 同样的场只留一片（四川）时必须正常出解，且就在真值附近 —— 上面那条拒绝
+            // 不能把正常解一起拒绝掉。
+            std::vector<StationObservation> onlySichuan;
+            add(30.2, 104.3, 6.3, 28.4, 32.0, 102.5, 106.1, &onlySichuan);
+            const SourceEstimate single = SourceEstimator::estimate(onlySichuan, cfg);
+            check(single.valid, "source estimate: single trigger area still solves");
+            check(QuakeCalculator::haversineDistance(single.latitude, single.longitude, 30.2,
+                                                     104.3) < 60.0,
+                  "source estimate: single trigger area lands on the real epicentre");
+        }
+
+        // 多解迟滞：两片势均力敌的触发区（各 25 站、置信度差 < 0.02）并存时，
+        // 没有偏好的求解器会随逐帧噪声在两地之间来回跳。带上「上一帧解」的偏好后
+        // 必须守住同一片 —— 这正是服务层喂 `preferLatitude/Longitude` 的原因。
+        {
+            std::vector<StationObservation> twoPieces;
+            for (double y = 29.2; y <= 31.2 + 1e-9; y += 0.5) {
+                for (double x = 103.3; x <= 105.3 + 1e-9; x += 0.5) {
+                    StationObservation s;
+                    s.latitude = y;
+                    s.longitude = x;
+                    s.family = IntensityFamily::Csis;
+                    s.intensity = SourceEstimator::predictedIntensity(
+                        IntensityFamily::Csis, 6.4,
+                        QuakeCalculator::haversineDistance(30.2, 104.3, y, x), 10.0);
+                    twoPieces.push_back(s);
+                }
+            }
+            for (double y = 24.0; y <= 26.0 + 1e-9; y += 0.5) {
+                for (double x = 100.0; x <= 102.0 + 1e-9; x += 0.5) {
+                    StationObservation s;
+                    s.latitude = y;
+                    s.longitude = x;
+                    s.family = IntensityFamily::Csis;
+                    s.intensity = SourceEstimator::predictedIntensity(
+                        IntensityFamily::Csis, 6.3,
+                        QuakeCalculator::haversineDistance(25.0, 101.0, y, x), 10.0);
+                    twoPieces.push_back(s);
+                }
+            }
+            // 逐帧抖动（真实强度场的常态）：0.25 的强度噪声就足以让最强簇换人。
+            unsigned seed = 20240601u;
+            const auto jitter = [&seed]() {
+                seed = seed * 1103515245u + 12345u;
+                return (static_cast<double>((seed >> 16) & 0x7fff) / 32767.0 - 0.5) * 0.5;
+            };
+            SourceEstimatorConfig free = cfg;
+            SourceEstimatorConfig locked = cfg;
+            locked.preferLatitude = 30.2;
+            locked.preferLongitude = 104.3;
+            locked.preferRadiusKm = 120.0;
+            int freeHops = 0;
+            int lockedHops = 0;
+            bool freeHave = false;
+            bool lockedHave = false;
+            double freeLat = 0.0;
+            double freeLon = 0.0;
+            double lockedLat = 0.0;
+            double lockedLon = 0.0;
+            for (int frame = 0; frame < 24; ++frame) {
+                std::vector<StationObservation> noisy = twoPieces;
+                for (StationObservation& s : noisy) s.intensity += jitter();
+                const SourceEstimate a = SourceEstimator::estimate(noisy, free);
+                const SourceEstimate b = SourceEstimator::estimate(noisy, locked);
+                if (a.valid) {
+                    if (freeHave
+                        && QuakeCalculator::haversineDistance(freeLat, freeLon, a.latitude,
+                                                              a.longitude)
+                               > 200.0) {
+                        ++freeHops;
+                    }
+                    freeLat = a.latitude;
+                    freeLon = a.longitude;
+                    freeHave = true;
+                }
+                if (b.valid) {
+                    if (lockedHave
+                        && QuakeCalculator::haversineDistance(lockedLat, lockedLon, b.latitude,
+                                                              b.longitude)
+                               > 200.0) {
+                        ++lockedHops;
+                    }
+                    lockedLat = b.latitude;
+                    lockedLon = b.longitude;
+                    lockedHave = true;
+                }
+            }
+            check(lockedHave, "source estimate: hysteresis keeps publishing");
+            check(lockedHops == 0,
+                  "source estimate: hysteresis holds one cluster across noisy frames");
+            check(QuakeCalculator::haversineDistance(lockedLat, lockedLon, 30.2, 104.3) < 120.0,
+                  "source estimate: hysteresis keeps the preferred cluster");
+            // 偏好不能把「明显更好的新簇」按下去：锁在四川时给一片只有云南的场，
+            // 云南的簇必须照样胜出（迟滞只影响势均力敌的情形）。
+            {
+                std::vector<StationObservation> onlyYunnan;
+                for (double y = 24.0; y <= 26.0 + 1e-9; y += 0.5) {
+                    for (double x = 100.0; x <= 102.0 + 1e-9; x += 0.5) {
+                        StationObservation s;
+                        s.latitude = y;
+                        s.longitude = x;
+                        s.family = IntensityFamily::Csis;
+                        s.intensity = SourceEstimator::predictedIntensity(
+                            IntensityFamily::Csis, 6.3,
+                            QuakeCalculator::haversineDistance(25.0, 101.0, y, x), 10.0);
+                        onlyYunnan.push_back(s);
+                    }
+                }
+                const SourceEstimate moved = SourceEstimator::estimate(onlyYunnan, locked);
+                check(moved.valid, "source estimate: hysteresis still solves a new field");
+                check(QuakeCalculator::haversineDistance(moved.latitude, moved.longitude, 25.0,
+                                                         101.0) < 60.0,
+                      "source estimate: hysteresis does not lock out a clearly better cluster");
+            }
+            // 未配置偏好（默认）时保持纯函数语义：同一帧两次调用结果必须一致。
+            const SourceEstimate repeatA = SourceEstimator::estimate(twoPieces, cfg);
+            const SourceEstimate repeatB = SourceEstimator::estimate(twoPieces, cfg);
+            check(repeatA.latitude == repeatB.latitude && repeatA.longitude == repeatB.longitude,
+                  "source estimate: default config stays deterministic (no hidden preference)");
+        }
+
         // 远场未触发站不得污染本地求解：追加一大批 2000 km 外的"未触发"站，
         // 解必须保持不动（负证据只取候选附近）。
         {

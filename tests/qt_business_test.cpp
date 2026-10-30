@@ -1531,6 +1531,118 @@ private slots:
         QCOMPARE(regions[0].toMap().value("visible").toBool(), false);
     }
 
+    /// 日本区两条路（强度场 / 到时反演）在弱证据下会给出相距上百公里的解，而「到时解
+    /// 成不成立」取决于触发站数在 `minStations` 上下抖动。用户报的「发了很多报后震中
+    /// 跳走、报次回到第 1 报并一直停在 1」正是这条链路：每帧换路 → 每次换路都被判成
+    /// 新事件 → 报次清零。本用例钉住三件事：
+    ///   ① 换路不再让发布位置在两条路之间来回跳；
+    ///   ② 报次在事件存续期间单调增长，不会被打回「第 1 报」；
+    ///   ③ 到时解真的消失了（尾段）时不会拿偏出上百公里的强度解顶替。
+    void sourceEstimationJapanPathSwapDoesNotResetReports() {
+        QSettings().clear();
+        SettingsStore settings;
+        settings.setSourceEstimationEnabled(true);
+        settings.setSourceEstimationRegionEnabled("japan", true);
+        settings.setSourceEstimationMinStations("japan", 5);
+        settings.setSourceEstimationTrigger("japan", 2.5);
+        settings.setSourceEstimationClusterRadius("japan", 200);
+
+        SourceEstimationService service(&settings);
+        long long now = origin;
+        service.setNowProvider([&] { return now; });
+        service.ticker_.stop();
+
+        // 北海道 M6.2 / 深 40 km 的合成强度场：只留下越过阈值的站，正是事件中后段
+        // 真实 Kmoni 台网的形态（本州东侧那一圈）。
+        const double eqLat = 43.1;
+        const double eqLon = 142.4;
+        const double depthKm = 40.0;
+        struct Local {
+            double lat;
+            double lon;
+            double intensity;
+            double travelSeconds;
+        };
+        std::vector<Local> stations;
+        for (double lat = 30.0; lat <= 45.5 + 1e-9; lat += 0.15) {
+            for (double lon = 128.5; lon <= 146.0 + 1e-9; lon += 0.15) {
+                const double distance = QuakeCalculator::haversineDistance(eqLat, eqLon, lat, lon);
+                if (distance > 500.0) continue;
+                const double intensity = SourceEstimator::predictedIntensity(
+                    IntensityFamily::Jma, 6.2, distance, depthKm);
+                if (intensity < 2.5) continue;
+                stations.push_back({lat, lon, intensity,
+                                    std::sqrt(distance * distance + depthKm * depthKm) / 6.0});
+            }
+        }
+        QVERIFY(stations.size() >= 8);
+
+        const long long eqOrigin = origin - 120'000;
+        // 逐帧投喂：先让所有站都到波（建立 firstTriggerMs），再逐帧制造「到时站数在门槛
+        // 上下抖动」——偶数帧只留 4 个站在阈上，正是尾段的真实形态。
+        // 同时给每帧加一点强度抖动：真实 Kmoni 每秒都在变，解因此会刷新报次；
+        // 抖动必须小到不影响位置，才能把「位置稳定」与「报次递增」两件事分开检验。
+        unsigned jitterSeed = 20240601u;
+        const auto jitter = [&jitterSeed]() {
+            jitterSeed = jitterSeed * 1103515245u + 12345u;
+            return (static_cast<double>((jitterSeed >> 16) & 0x7fff) / 32767.0 - 0.5) * 0.30;
+        };
+        int maxReport = 0;
+        int resets = 0;
+        double minX = 0.0;
+        double maxX = 0.0;
+        bool havePos = false;
+        for (int frame = 0; frame < 20; ++frame) {
+            now += 1000;
+            std::vector<StationSnapshot::Entry> tick;
+            tick.reserve(stations.size());
+            for (std::size_t i = 0; i < stations.size(); ++i) {
+                StationSnapshot::Entry e;
+                e.lat = stations[i].lat;
+                e.lon = stations[i].lon;
+                // 首帧把所有站都点亮一次，让 service 记下 firstTriggerMs；
+                // 之后的偶数帧只留前 4 个高值（模拟尾段只有少数站还在阈上）。
+                const bool lit = frame == 0 || (frame % 2 == 1) || i < 4;
+                const double value = stations[i].intensity + jitter();
+                e.raw = lit ? value : 0.0;
+                tick.push_back(e);
+            }
+            service.ingestObservations(tick);
+            service.runEstimation();
+            if (service.watcher_.isRunning()) service.watcher_.waitForFinished();
+            QCoreApplication::processEvents();
+
+            const SourceEstimate& est = service.regionState(SourceRegion::Japan).estimate;
+            if (!est.valid) continue;
+            const int report = service.info().value("regions").toList()[1].toMap()
+                                   .value("reportNum").toInt();
+            if (report < maxReport) ++resets;
+            maxReport = std::max(maxReport, report);
+            const double x = QuakeCalculator::haversineDistance(est.latitude, est.longitude,
+                                                                eqLat, eqLon);
+            if (!havePos) {
+                minX = maxX = x;
+                havePos = true;
+            } else {
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+            }
+        }
+
+        QVERIFY2(havePos, "日本区必须出解");
+        // ① 发布位置不再随换路来回跳：整段事件的解应当稳定在真值附近。
+        QVERIFY2(maxX < 150.0,
+                 qPrintable(QStringLiteral("解最远离真值 %1 km（换路导致的大幅跳变）").arg(maxX)));
+        QVERIFY2(maxX - minX < 150.0,
+                 qPrintable(QStringLiteral("解在事件内摆了 %1 km").arg(maxX - minX)));
+        // ② 报次单调，不会被打回「第 1 报」。
+        QCOMPARE(resets, 0);
+        // 只在「到时站够 5 个」的那些帧才会推进报次（其余帧沿用上一帧的解，报次冻结），
+        // 20 帧里一半是 4 站帧，所以门槛取 6 而不是 10。
+        QVERIFY2(maxReport >= 6,
+                 qPrintable(QStringLiteral("事件存续期间只报到了第 %1 报").arg(maxReport)));
+    }
+
     void sourceEstimationRegionsAreIndependent() {
         QSettings().clear();
         SettingsStore settings;

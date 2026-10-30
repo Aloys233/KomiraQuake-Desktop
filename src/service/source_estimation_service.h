@@ -189,6 +189,30 @@ private:
     static constexpr double kReportLocationDeg = 1e-3;
     static constexpr double kReportDepthKm = 1.0;
     static constexpr double kReportMagnitude = 0.1;
+    /// 多解迟滞半径（km）：新一帧的解若落在上一帧解的这么大范围内，视作「同一片触发区」，
+    /// 求解器给该簇一点加成，避免两片势均力敌的触发区随噪声互相顶掉。
+    /// 与下面的 `kEventJumpKm` 同一量级：判「还是同一场」与判「换了一场」用同一把尺。
+    static constexpr double kPreferRadiusKm = 120.0;
+    /// 「换了一场地震」的判据（km）：解的位移超过它才重置报次与首次给出计时。
+    ///
+    /// 之前是 60 km，比求解器在**正常**情况下的帧间游走还小（密集台网实测 8–24 km，
+    /// 稀疏台网可达 40 km），于是仅仅因为噪声就会把报次清零；清零点又恰好和地图标记
+    /// 重合，用户看到的就是「震中跳走 + 报次回到第 1 报」。
+    static constexpr double kEventJumpKm = 200.0;
+    /// 日本区「强度解 ↔ 到时解」换路的站数门槛。
+    ///
+    /// 两条路在弱证据下能差出上百公里，而无条件替换会让发布位置每帧换人（尾段触发站
+    /// 在 `minStations` 上下抖动时尤其明显）。规则：
+    ///   · 强度路 → 到时路：到时解有 ≥3 站就切（到时带发震时刻、深度可辨识）；
+    ///   · 已在到时路：一直留着，只有它退化成「< 3 站的弱解」而强度解仍完整时才回退。
+    /// 3 站是「能定出位置」的下限，也是 `applyBatch` 里原本替换条件用的同一个数。
+    static constexpr int kArrivalFallbackStations = 3;
+    /// 日本区「到时解消失时能不能拿强度解顶替」的距离上限（km）。
+    ///
+    /// 顶替点离上一帧的解超过它，就说明两条路给出的根本不是一个地方；此时只有证据很硬
+    /// （≥10 站且非粗解）才允许接管，否则沿用上一帧的解等下一帧。取 60 km：与两条路在
+    /// 同一场事件里的正常分歧（实测中位 1–13 km、弱证据时可达 40 km）留一档余量。
+    static constexpr double kPathHoldKm = 60.0;
 };
 
 } // namespace komira

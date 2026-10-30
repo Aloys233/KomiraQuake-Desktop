@@ -196,10 +196,11 @@ double depthPenalty(double depthKm, const SourceEstimatorConfig& config) {
 }
 
 /// 极坐标粗扫：以触发站加权质心为极点，环数与环向点数受配置约束。
-/// 返回扫描到的最优候选（尚未细化）。
+/// 返回扫描到的最优候选（尚未细化）；`outRadiusDeg` 回填外层实际用的扫描半径，
+/// 供 `refineLocation` 用同一个圆盘做边界（两个盘一致，粗扫的边界才有意义）。
 Candidate scanLocation(const std::vector<StationObservation>& triggered,
                        const std::vector<StationObservation>& quiet, double depthKm,
-                       const SourceEstimatorConfig& config) {
+                       const SourceEstimatorConfig& config, double* outRadiusDeg = nullptr) {
     // 加权质心：强度越高权重越大（截断，避免单个饱和站拉偏）。
     double weightSum = 0.0;
     double latSum = 0.0;
@@ -226,6 +227,7 @@ Candidate scanLocation(const std::vector<StationObservation>& triggered,
     const double extent = std::max(maxLat - minLat, maxLon - minLon);
     const double radius = clamp(extent + config.searchPaddingDeg, config.minSearchRadiusDeg,
                                 config.maxSearchRadiusDeg);
+    if (outRadiusDeg) *outRadiusDeg = radius;
 
     // 环向点数按周长与步长求；总点数受 maxScanPoints 约束（大范围时自动降密）。
     const double penalty = depthPenalty(depthKm, config);
@@ -257,12 +259,35 @@ Candidate scanLocation(const std::vector<StationObservation>& triggered,
 }
 
 /// 模式搜索细化：单步最优方向 + 失败折半。比再扫一层细网格便宜，且不会被粗网格锁死。
+///
+/// `boundRadiusDeg` 是粗扫用的极坐标半径。细化**必须**受同一个半径约束：模式搜索是
+/// 单调下坡，而强度残差这个目标在「离所有触发站都很远」的方向上会单调变好（见
+/// `solveCluster` 里远端退化检测的注释），没有边界时细化会一路走到几百公里外的海上，
+/// 给出一个残差极低、却离所有台站都上千公里的解。
 Candidate refineLocation(const std::vector<StationObservation>& triggered,
                          const std::vector<StationObservation>& quiet, Candidate best,
-                         double depthKm, double initialStepDeg,
+                         double depthKm, double initialStepDeg, double boundRadiusDeg,
                          const SourceEstimatorConfig& config) {
     const double penalty = depthPenalty(depthKm, config);
     double step = std::max(initialStepDeg, config.refineFloorDeg);
+    // 细化允许走的范围 = 粗扫圆盘（以同一加权质心为心）。粗扫本身就在这个盘里选点，
+    // 细化若不受同一约束，粗扫的边界就形同虚设。
+    double centerLat = 0.0;
+    double centerLon = 0.0;
+    {
+        double weightSum = 0.0;
+        double latSum = 0.0;
+        double lonSum = 0.0;
+        for (const StationObservation& s : triggered) {
+            const double w = clamp(s.intensity - config.triggerLevel + 0.5, 0.05, 20.0);
+            weightSum += w;
+            latSum += s.latitude * w;
+            lonSum += s.longitude * w;
+        }
+        centerLat = latSum / weightSum;
+        centerLon = lonSum / weightSum;
+    }
+    const double limitKm = boundRadiusDeg * 111.32;
     for (int iteration = 0; iteration < config.maxRefineSteps; ++iteration) {
         bool improved = false;
         const double cosLat = std::max(kMinCosLat, std::cos(best.latitude * kPi / 180.0));
@@ -275,6 +300,7 @@ Candidate refineLocation(const std::vector<StationObservation>& triggered,
             const double lat = best.latitude + move[0];
             const double lon = best.longitude + move[1];
             if (lat < -85.0 || lat > 85.0 || lon < -180.0 || lon > 180.0) continue;
+            if (fastDistanceKm(centerLat, centerLon, lat, lon) > limitKm) continue;
             const Candidate candidate = score(triggered, quiet, lat, lon, depthKm, config, penalty);
             if (candidate.loss < moved.loss) moved = candidate;
         }
@@ -569,9 +595,10 @@ SourceEstimate solveCluster(const std::vector<StationObservation>& triggered,
     // 连续扫会过拟合，故先用粗扫挑深度，再只对该深度做一次位置细化。
     Candidate best;
     double bestDepth = config.depthCandidatesKm.empty() ? 10.0 : config.depthCandidatesKm.front();
+    double scanRadiusDeg = config.minSearchRadiusDeg;
     for (double depth : config.depthCandidatesKm) {
         if (depth < 0.0) continue;
-        const Candidate candidate = scanLocation(used, quietUsed, depth, config);
+        const Candidate candidate = scanLocation(used, quietUsed, depth, config, &scanRadiusDeg);
         if (candidate.loss < best.loss) {
             best = candidate;
             bestDepth = depth;
@@ -581,10 +608,9 @@ SourceEstimate solveCluster(const std::vector<StationObservation>& triggered,
     // 初始步长取粗扫最内环的半径量级；细化会自行折半。
     const double coarseStep = std::max(config.refineFloorDeg,
                                        std::min(config.scanStepDeg, 0.25));
-    best = refineLocation(used, quietUsed, best, bestDepth, coarseStep, config);
+    best = refineLocation(used, quietUsed, best, bestDepth, coarseStep, scanRadiusDeg, config);
     result.depthKm = bestDepth;
 
-    result.valid = true;
     result.latitude = best.latitude;
     result.longitude = best.longitude;
     result.rmsIntensity = best.rms;
@@ -600,6 +626,17 @@ SourceEstimate solveCluster(const std::vector<StationObservation>& triggered,
     result.nearestStationKm = std::isfinite(nearest) ? nearest : 0.0;
     result.meanDistanceKm = distanceSum / static_cast<double>(used.size());
     result.azimuthGapDeg = azimuthGap(best.latitude, best.longitude, used);
+
+    // 远端退化：解被推到离所有触发站都上千公里的地方时，强度残差会「变好」——
+    // 所有站的距离几乎相等，log 项就成了一个常数平移，Huber 残差自然很小。
+    // 那不是震源，是目标函数的一个**退化极小**（实测：川滇两片触发区被单链聚类串成
+    // 一簇喂进来，解会跑到青海 1187 km 外，M 反演出 8.9，残差反而从 1.59 降到 0.93）。
+    //
+    // 判据用「最近的触发站也比重证据半径还远」：本服务的触发站都在陆地上、震中就在
+    // 有感区内部，一个离所有触发站都超过 `quietRadiusKm`（默认 400 km）的解一定不是
+    // 真的震源 —— 那是上面那条退化链。此时该簇判为无解，服务层保留上一帧的解。
+    if (result.nearestStationKm > config.quietRadiusKm) return result;
+    result.valid = true;
 
     // 边界贴靠：最佳解落在搜索框（触发站包络 + padding）的一次扫描步长内。
     double minLat = used.front().latitude;
@@ -940,8 +977,20 @@ SourceEstimate SourceEstimator::estimate(const std::vector<StationObservation>& 
         if (canPublish) ++publishable;
         // 选簇规则：优先「够得着发布门槛」的簇，其次比置信度，再比支撑站数。
         // 用组合键而不是先筛后比，是为了在全部簇都不够门槛时仍能报出最有希望的那个。
-        const double key = (canPublish ? 1000.0 : 0.0) + candidate.confidence * 100.0 +
-                           std::min(99.0, static_cast<double>(cluster.size()) / 10.0);
+        //
+        // 迟滞（`preferRadiusKm > 0`）：落在上一帧解附近的簇额外加成 `preferBonus`。
+        // 两片可比的有感区并存时，两簇的置信度只差千分之几，逐帧噪声就足以让最强簇
+        // 每次换人。加成本身不改变「谁更可信」的排序，只把「势均力敌」判成「保持原解」。
+        double affinity = 0.0;
+        if (config.preferRadiusKm > 0.0 && canPublish) {
+            const double d = QuakeCalculator::haversineDistance(
+                config.preferLatitude, config.preferLongitude, candidate.latitude,
+                candidate.longitude);
+            if (d <= config.preferRadiusKm) affinity = config.preferBonus;
+        }
+        const double key = (canPublish ? 1000.0 : 0.0) + candidate.confidence * 100.0
+                           + affinity * 100.0
+                           + std::min(99.0, static_cast<double>(cluster.size()) / 10.0);
         if (key > bestKey) {
             bestKey = key;
             best = candidate;
